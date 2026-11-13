@@ -49,7 +49,7 @@
       "supports_reasoning_effort_updates": false,
       "node_repl_auto_review_required": false,
       "node_repl_disabled": false,
-      "auto_compact_token_limit": 524288
+      "auto_compact_token_limit": 300000
     }
   ]
 }

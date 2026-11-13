@@ -830,6 +830,9 @@ def extract_part_marker(part: Dict[str, Any]) -> Optional[str]:
     """Compute the deterministic prompt placeholder marker for a multimodal content part."""
     kind = str(part.get("type") or "").lower()
     if kind in {"image_url", "input_image", "image"}:
+        original = part.get("_bridge_image_marker")
+        if isinstance(original, str) and re.fullmatch(r"\[Image attachment [a-f0-9]{20}\]", original):
+            return original
         if kind == "image" and isinstance(part.get("source"), dict):
             src = part["source"]
             token = src.get("file_id") or src.get("url") or src.get("data") or ""
@@ -937,24 +940,55 @@ def _resolve_reference_or_bytes(
     return mime, cat, norm_raw, safe_name, val
 
 
+def historical_image_markers(messages: Sequence[ChatMessage]) -> set[str]:
+    """Only image inputs since the last assistant turn are pending visual evidence."""
+    last_assistant = max((i for i, message in enumerate(messages) if message.role == "assistant"), default=-1)
+    historical, pending = set(), set()
+    for i, message in enumerate(messages):
+        if not isinstance(message.content, list):
+            continue
+        for part in message.content:
+            if isinstance(part, dict) and str(part.get("type") or "").lower() in {"image_url", "input_image", "image"}:
+                marker = extract_part_marker(part)
+                if marker:
+                    (historical if i <= last_assistant else pending).add(marker)
+    # A newly supplied copy is an explicit request to inspect that image again.
+    return historical - pending
+
+
+def reference_historical_images(prompt: str, markers: set[str]) -> str:
+    """Change only the wire prompt; canonical history must stay stable for slot matching."""
+    return re.sub(
+        r"\[Image attachment [a-f0-9]{20}\]",
+        lambda match: ("[Historical image reference " + match[0][18:-1] +
+                       "; not attached this turn. Reopen with a declared client tool if pixels are needed.]"
+                       if match[0] in markers else match[0]),
+        prompt,
+    )
+
+
 def collect_attachments(
     messages: Sequence[ChatMessage],
     file_store: Optional[FileStore] = None,
     callback_base_url: str = "",
     image_output_dir: Optional[Path] = None,
+    pending_images_only: bool = False,
 ) -> List[Dict[str, Any]]:
     """Extract, validate, and prepare all multimodal attachments referenced in `messages`."""
     attachments: List[Dict[str, Any]] = []
     seen_markers: set[str] = set()
     total_bytes = 0
+    last_assistant = max((i for i, message in enumerate(messages) if message.role == "assistant"), default=-1)
 
-    for message in messages:
+    for index, message in enumerate(messages):
         if not isinstance(message.content, list):
             continue
         for part in message.content:
             if not isinstance(part, dict):
                 continue
             kind = str(part.get("type") or "").lower()
+            if pending_images_only and index <= last_assistant and kind in {"image_url", "input_image", "image"}:
+                continue
             if kind not in {
                 "image_url", "input_image", "image",
                 "file", "input_file", "document",
@@ -1063,7 +1097,6 @@ def collect_attachments(
             else:
                 saved = file_store.save(norm_raw, filename=safe_name, declared_mime=mime, purpose="bridge_staging")
                 entry["file_id"] = saved["id"]
-                entry["_path"] = saved["path"]
                 entry["fetch_url"] = f"{callback_base_url.rstrip('/')}/api/bridge/attachments/{saved['id']}"
             attachments.append(entry)
 
@@ -1101,7 +1134,7 @@ def compact_messages_for_store(messages: Sequence[Dict[str, Any]], file_store: O
                         fid = file_store.save(raw, filename=att["name"], declared_mime=att["mime_type"], purpose="response_cache")["id"]
                     cat = att["category"]
                     if cat == "image":
-                        new_parts.append({"type": "image_url", "image_url": {"url": fid}})
+                        new_parts.append({"type": "image_url", "image_url": {"url": fid}, "_bridge_image_marker": att["id"]})
                     elif cat == "audio":
                         new_parts.append({"type": "input_audio", "file_id": fid, "filename": att["name"]})
                     elif cat == "video":

@@ -15,18 +15,22 @@ def tools(name='functions.exec_command'):
 
 
 def call(cmd='cat README.md', name='functions.exec_command'):
-    return '[TOOL_CALL]' + json.dumps({'name': name, 'arguments': {'cmd': cmd}}) + '[/TOOL_CALL]'
+    return '```codex_tool_call\n' + json.dumps({'name': name, 'arguments': {'cmd': cmd}}) + '\n```\n'
 
 
 def test_duplicate_queries_only_in_same_read_batch():
     assert len(parse_assistant_output(call() + call(), tools()).tool_calls) == 1
-    assert len(parse_assistant_output(call('printf changed >> data') * 2, tools()).tool_calls) == 2
-    assert len(parse_assistant_output(call('sed -i x file') * 2, tools()).tool_calls) == 2
-    assert len(parse_assistant_output(call() + call('touch file') + call(), tools()).tool_calls) == 3
+    with pytest.raises(ToolProtocolError):
+        parse_assistant_output(call('printf changed >> data') * 2, tools())
+    with pytest.raises(ToolProtocolError):
+        parse_assistant_output(call('sed -i x file') * 2, tools())
+    with pytest.raises(ToolProtocolError):
+        parse_assistant_output(call() + call('touch file') + call(), tools())
     assert len(parse_assistant_output(call('nl -ba "some file.py" | sed -n \'1,100p\'') * 2, tools()).tool_calls) == 1
     assert len(parse_assistant_output(call('cat a') + call('cat b'), tools()).tool_calls) == 2
-    malformed = '[TOOL_CALL]{"name":"functions.exec_command","arguments":[]}[/TOOL_CALL]'
-    assert len(parse_assistant_output(malformed, tools()).tool_calls) == 1
+    malformed = '```codex_tool_call\n{"name":"functions.exec_command","arguments":[]}\n```\n'
+    with pytest.raises(ToolProtocolError):
+        parse_assistant_output(malformed, tools())
 
 
 @pytest.mark.parametrize('width', [1, 7, 1000])
@@ -87,7 +91,7 @@ def test_read_thread_limits_are_documented_and_normalized_before_delivery():
     spec[0]['function']['parameters']['properties'] = {'threadId': {'type':'string'}, 'turnLimit': {'type':'integer'}, 'maxOutputCharsPerItem': {'type':'integer'}}
     instructions = build_tool_system_instructions(spec)
     assert 'maximum' in instructions and '20000' in instructions
-    raw = '[TOOL_CALL]' + json.dumps({'name':'mcp__codex_app.read_thread', 'arguments':{'threadId':'test','turnLimit':20,'maxOutputCharsPerItem':30000}}) + '[/TOOL_CALL]'
+    raw = '```codex_tool_call\n' + json.dumps({'name':'mcp__codex_app.read_thread', 'arguments':{'threadId':'test','turnLimit':20,'maxOutputCharsPerItem':30000}}) + '\n```\n'
     args = json.loads(parse_assistant_output(raw, spec).tool_calls[0]['function']['arguments'])
     assert args == {'threadId':'test','turnLimit':10,'maxOutputCharsPerItem':20000}
 
@@ -125,3 +129,47 @@ def test_real_responses_round_trip_preserves_incremental_web_history():
         assert result.status_code == 200
         assert '[Conversation History]' not in commands[-1]['prompt']
         assert '[Tool Calling Protocol]' not in commands[-1]['prompt']
+
+
+@pytest.mark.parametrize('width', [1, 5, 1024])
+def test_fenced_suggested_questions_and_adjoined_tool_close_never_break(width):
+    adjoined = (
+        '正在读取配置。\n[[section:读取配置文件]]\n'
+        '\u0060\u0060\u0060codex_tool_call\n'
+        + json.dumps({'name': 'functions.exec_command', 'arguments': {'cmd': 'rg -n "foo" src | sed -n "1,20p"'}})
+        + '\n\u0060\u0060\u0060\u0060\u0060\u0060suggested_questions\n{"questions":["Next?"],"type":"followup"}\n\u0060\u0060\u0060'
+    )
+    processor = ToolStreamProcessor(tools())
+    emitted = []
+    for i in range(0, len(adjoined), width):
+        emitted.extend(processor.feed(adjoined[i : i + width]))
+    tail, parsed = processor.finalize()
+    assert ''.join(emitted + tail).strip() == '正在读取配置。'
+    assert len(parsed.tool_calls) == 1
+    assert 'suggested_questions' not in (parsed.content or '')
+
+    prose_with_fenced_sq = (
+        '检查完毕。\n\n\u0060\u0060\u0060suggested_questions\n{"questions":["Q1?","Q2?"],"type":"followup"}\n\u0060\u0060\u0060\n'
+    )
+    p2 = ToolStreamProcessor([])
+    out2 = []
+    for i in range(0, len(prose_with_fenced_sq), width):
+        out2.extend(p2.feed(prose_with_fenced_sq[i : i + width]))
+    t2, parsed2 = p2.finalize()
+    assert ''.join(out2 + t2).strip() == parsed2.content == '检查完毕。'
+
+
+def test_parallel_safe_read_pipelines_and_multi_object_fence():
+    multi_obj = (
+        '\u0060\u0060\u0060codex_tool_call\n'
+        + json.dumps({'name': 'functions.exec_command', 'arguments': {'cmd': 'git status --short && rg --files work'}})
+        + '\n'
+        + json.dumps({'name': 'functions.exec_command', 'arguments': {'cmd': "nl -ba README.md | sed -n '1,40p' 2>/dev/null"}})
+        + '\n\u0060\u0060\u0060\n'
+    )
+    parsed = parse_assistant_output(multi_obj, tools())
+    assert len(parsed.tool_calls) == 2
+    with pytest.raises(ToolProtocolError):
+        parse_assistant_output(call('git status') + call('git checkout main'), tools())
+    instructions = build_tool_system_instructions(tools())
+    assert 'RFC 8259' in instructions and 'Markdown backslash escaping' in instructions

@@ -3,6 +3,7 @@ import base64
 from contextlib import contextmanager
 from pathlib import Path
 import json
+import re
 import tempfile
 import threading
 
@@ -38,8 +39,14 @@ def _browser_ctx(app, replies):
             try:
                 for reply in replies:
                     command = ws.receive_json()
-                    while command.get('type') == 'cancel_request':
+                    chunks = {}
+                    while command.get('type') in {'cancel_request', 'execute_prompt_chunk'}:
+                        if command['type'] == 'execute_prompt_chunk':
+                            chunks[command['chunk_index']] = command['data']
                         command = ws.receive_json()
+                    if command.get('chunked'):
+                        assert len(chunks) == command['total_chunks']
+                        command['prompt'] = ''.join(chunks[i] for i in range(command['total_chunks']))
                     commands.append(command)
                     event = {'type': 'request_complete', 'reply': reply} if isinstance(reply, str) else reply
                     ws.send_json({**event, 'request_id': command['request_id']})
@@ -51,6 +58,10 @@ def _browser_ctx(app, replies):
         thread.join(timeout=3)
         assert not thread.is_alive(), 'unconsumed browser commands'
         assert not errors
+
+
+def wire_results(prompt):
+    return [json.loads(match[1]) for match in re.finditer(r"(?m)^`{3}codex_tool_result\n([^\n]*)\n`{3}(?:$|\n)", prompt)]
 
 
 def packets(text):
@@ -73,7 +84,7 @@ def test_responses_text_stream_and_default_model():
 
 def test_custom_patch_namespace_and_tool_result():
     patch = '*** Begin Patch\n*** Add File: note.txt\n+hello\n*** End Patch'
-    reply = '[TOOL_CALL]' + json.dumps({'name': 'functions.apply_patch', 'arguments': {'input': patch}}) + '[/TOOL_CALL]'
+    reply = '```codex_tool_call\n' + json.dumps({'name': 'functions.apply_patch', 'arguments': {'input': patch}}) + '\n```\n'
     tools = [{'type': 'namespace', 'name': 'functions', 'tools': [{'type': 'custom', 'name': 'apply_patch', 'description': 'Apply patch'}]}]
     with browser([reply, 'verified']) as (client, commands):
         events = packets(client.post('/v1/responses', json={'input': 'write a note', 'tools': tools, 'stream': True}).text)
@@ -86,11 +97,11 @@ def test_custom_patch_namespace_and_tool_result():
             'input': [{'type': 'custom_tool_call_output', 'call_id': call['call_id'], 'output': 'Success. note.txt created.'}]})
         assert result.status_code == 200
         assert 'Success. note.txt created.' in commands[-1]['prompt']
-        assert 'call_id="' + call['call_id'] + '"' in commands[-1]['prompt']
+        assert any(result['call_id'] == call['call_id'] for result in wire_results(commands[-1]['prompt']))
 
 
 def test_parallel_function_calls_keep_ids_and_arguments():
-    reply = ''.join('[TOOL_CALL]' + json.dumps({'name': 'read_file', 'arguments': {'path': path}}) + '[/TOOL_CALL]' for path in ['a', 'b'])
+    reply = ''.join('```codex_tool_call\n' + json.dumps({'name': 'read_file', 'arguments': {'path': path}}) + '\n```\n' for path in ['a', 'b'])
     with browser([reply]) as (client, _):
         events = packets(client.post('/v1/responses', json={'input': 'read both', 'stream': True,
             'tools': [{'type': 'function', 'name': 'read_file', 'parameters': {'type': 'object'}}]}).text)
@@ -199,7 +210,7 @@ def test_image_generation_returns_real_bytes_and_downloadable_file():
 def test_responses_native_image_tool_executes_in_bridge():
     raw = render_spark_icon_png(16)
     image = 'data:image/png;base64,' + base64.b64encode(raw).decode()
-    call = '[TOOL_CALL]{"name":"bridge_image_generation","arguments":{"prompt":"a star"}}[/TOOL_CALL]'
+    call = '```codex_tool_call\n{"name":"bridge_image_generation","arguments":{"prompt":"a star"}}\n```\n'
     with browser([call, {'type': 'request_complete', 'reply': '', 'output_images': [{'data_url': image}]}]) as (client, commands):
         events = packets(client.post('/v1/responses', json={'input': 'make a star', 'tools': [{'type': 'image_generation'}], 'stream': True}).text)
         assert events[-1]['type'] == 'response.completed'
@@ -236,7 +247,7 @@ def test_web_marker_filter_never_changes_tool_arguments_or_json_values():
     from tool_calling import ToolStreamProcessor
     tools = [{"type": "function", "function": {"name": "write_file", "parameters": {"type": "object"}}}]
     original = {"name": "write_file", "arguments": {"content": "[[section:Literal]]\nkeep this"}}
-    raw = "[[section:Calling tool]][TOOL_CALL]" + json.dumps(original) + "[/TOOL_CALL]"
+    raw = "[[section:Calling tool]]```codex_tool_call\n" + json.dumps(original) + "\n```\n"
     processor = ToolStreamProcessor(tools)
     for piece in raw:
         processor.feed(piece)

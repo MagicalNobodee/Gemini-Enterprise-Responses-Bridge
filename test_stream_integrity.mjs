@@ -43,11 +43,12 @@ assert.equal(thought.networkText, 'public answer');
 console.log('PASS: complete, truncated, dropped streams and thought subtree isolation');
 
 const snapshot = job();
-const tool = '[TOOL_CALL]{"name":"exec_command","arguments":{"cmd":"cat a"}}[/TOOL_CALL]';
+const framed = (value, fence='```') => fence+'codex_tool_call\n'+JSON.stringify(value)+'\n'+fence;
+const tool=framed({name:'exec_command',arguments:{cmd:'cat a'}});
 state.parsePacket({groundedContent:{content:{text:tool}}}, snapshot);
-state.parsePacket({summaryText:'\n[TOOL_CALL] { "arguments": {"cmd":"cat a"}, "name":"exec_command" } [/TOOL_CALL]\n'}, snapshot);
+state.parsePacket({summaryText:'\n```codex_tool_call\n { "arguments": {"cmd":"cat a"}, "name":"exec_command" } \n```\n'}, snapshot);
 assert.equal(snapshot.networkText, tool, 'formatted final snapshots must not execute the same command twice');
-state.parsePacket({summaryText:'[TOOL_CALL]{"name":"exec_command","arguments":{"cmd":"cat  a"}}[/TOOL_CALL]'}, snapshot);
+state.parsePacket({summaryText:framed({name:'exec_command',arguments:{cmd:'cat  a'}})}, snapshot);
 assert.ok(snapshot.networkText.includes('cat  a'), 'spaces inside command strings must not be erased');
 const increments = job();
 state.parsePacket({groundedContent:{content:{text:'ha'}}}, increments);
@@ -61,9 +62,9 @@ console.log('PASS: formatted snapshots, unchanged command strings, repeated delt
 const nestedSnapshot = job();
 const nestedValue = '[TOOL_CALL]{"name":"inner","arguments":{}}[/TOOL_CALL]';
 const nestedTool = {name:'exec_command', arguments:{cmd:nestedValue}};
-const nestedRaw = '[TOOL_CALL]' + JSON.stringify(nestedTool) + '[/TOOL_CALL]';
+const nestedRaw = framed(nestedTool);
 state.parsePacket({groundedContent:{content:{text:nestedRaw}}}, nestedSnapshot);
-state.parsePacket({summaryText:'[TOOL_CALL]\n' + JSON.stringify(nestedTool, null, 2) + '\n[/TOOL_CALL]'}, nestedSnapshot);
+state.parsePacket({summaryText:'```codex_tool_call\n' + JSON.stringify(nestedTool, null, 2) + '\n```'}, nestedSnapshot);
 assert.equal(nestedSnapshot.networkText, nestedRaw, 'markers inside command strings must not defeat snapshot deduplication');
 console.log('PASS: nested protocol strings in final snapshots');
 
@@ -82,10 +83,12 @@ vm.runInContext(fs.readFileSync(new URL('./page-driver.js', import.meta.url), 'u
 assert.notEqual(sandbox.fetch, oldFetch);
 let nativeCalls = 0;
 const requestJob = job();
+const realCheckChatRpc = state.checkChatRpc;
 state.getActiveJob = () => requestJob;
 state.checkChatRpc = () => true;
 state.nativeFetch = async () => {nativeCalls += 1;throw new TypeError('dropped headers');};
 await assert.rejects(sandbox.fetch('https://vertexaisearch.cloud.google.com/chat', {method:'POST', body:'{}'}), /dropped headers/);
+state.checkChatRpc = realCheckChatRpc;
 assert.equal(nativeCalls, 1);
 assert.equal(requestJob.submissionStarted, true);
 assert.ok(requestJob.networkError);
@@ -94,12 +97,71 @@ console.log('PASS: upgraded network hooks, one native request, early submission 
 const decoratedSnapshot = job();
 const streamedWithPreamble = '正在检查文件。\n\n' + tool;
 state.parsePacket({groundedContent:{content:{text:streamedWithPreamble}}}, decoratedSnapshot);
-state.parsePacket({summaryText:'[[section:检查]]正在检查文件。\n\n[TOOL_CALL] { "arguments": {"cmd":"cat a"}, "name":"exec_command" } [/TOOL_CALL]\n[[suggested_questions]]\n下一步？'}, decoratedSnapshot);
-assert.equal((decoratedSnapshot.networkText.match(/\[TOOL_CALL\]/g) || []).length, 1, 'decorated final snapshots must not duplicate tool calls or preamble');
+state.parsePacket({summaryText:'[[section:检查]]正在检查文件。\n\n```codex_tool_call\n { "arguments": {"cmd":"cat a"}, "name":"exec_command" } \n```\n[[suggested_questions]]\n下一步？'}, decoratedSnapshot);
+assert.equal((decoratedSnapshot.networkText.match(/codex_tool_call/g) || []).length, 1, 'decorated final snapshots must not duplicate tool calls or preamble');
 
 const suffixSnapshot = job();
 state.parsePacket({groundedContent:{content:{text:streamedWithPreamble}}}, suffixSnapshot);
-state.parsePacket({summaryText:'正在检查文件。\n\n[TOOL_CALL] { "arguments": {"cmd":"cat a"}, "name":"exec_command" } [/TOOL_CALL]\n已完成检查。'}, suffixSnapshot);
-assert.equal((suffixSnapshot.networkText.match(/\[TOOL_CALL\]/g) || []).length, 1, 'snapshot suffix extraction must keep single tool call');
+state.parsePacket({summaryText:'正在检查文件。\n\n```codex_tool_call\n { "arguments": {"cmd":"cat a"}, "name":"exec_command" } \n```\n已完成检查。'}, suffixSnapshot);
+assert.equal((suffixSnapshot.networkText.match(/codex_tool_call/g) || []).length, 1, 'snapshot suffix extraction must keep single tool call');
 assert.ok(suffixSnapshot.networkText.endsWith('\n已完成检查。'), 'genuine new suffix in snapshot must be preserved');
 console.log('PASS: decorated and suffix final snapshots without duplicating streamed content');
+
+for (const marker of ['```']) {
+  const fenced = job();
+  const payload = {name:'exec_command', arguments:{cmd:'printf "``` [TOOL_CALL] [[section:literal]] [[suggested_questions]]"'}};
+  const raw = marker + 'codex_tool_call\n' + JSON.stringify(payload) + '\n' + marker;
+  state.parsePacket({groundedContent:{content:{text:'准备检查。\n\n'+raw}}}, fenced);
+  state.parsePacket({summaryText:'[[section:检查]]准备检查。\n\n```codex_tool_call\n'+JSON.stringify({arguments:payload.arguments,name:payload.name},null,2)+'\n```\n[[suggested_questions]]\n下一步？'}, fenced);
+  assert.equal(fenced.networkText, '准备检查。\n\n'+raw, 'new fence formatting must never duplicate commands');
+  state.parsePacket({summaryText:'准备检查。\n\n```codex_tool_call\n'+JSON.stringify(payload)+'\n```\n检查结束。'}, fenced);
+  assert.equal(fenced.networkText, '准备检查。\n\n'+raw+'\n检查结束。', 'new final prose suffix must survive');
+}
+const differentCommand = job();
+const one = {name:'exec_command',arguments:{cmd:'printf "[[section:one]]"'}};
+const two = {name:'exec_command',arguments:{cmd:'printf "[[section:two]]"'}};
+state.parsePacket({groundedContent:{content:{text:'```codex_tool_call\n'+JSON.stringify(one)+'\n```'}}}, differentCommand);
+state.parsePacket({summaryText:'```codex_tool_call\n'+JSON.stringify(two)+'\n```'}, differentCommand);
+assert.ok(differentCommand.networkText.includes('section:two'), 'decorations inside arguments are data and cannot be erased by deduplication');
+console.log('PASS: dedicated fences, variable lengths, literal decorations and real suffixes');
+const adjacentHeader = job();
+const adjacentTool = {name:'exec_command',arguments:{cmd:'cat seed.txt'}};
+const adjacentRaw = '正在查看图片。\n[[section:查看图片与测试文件]]```codex_tool_call\n'+JSON.stringify(adjacentTool)+'\n```';
+state.parsePacket({groundedContent:{content:{text:adjacentRaw}}},adjacentHeader);
+state.parsePacket({summaryText:'正在查看图片。\n\n```codex_tool_call\n'+JSON.stringify(adjacentTool,null,2)+'\n```'},adjacentHeader);
+assert.equal(adjacentHeader.networkText,adjacentRaw,'adjacent webpage section markers cannot duplicate a fenced tool call');
+console.log('PASS: actual webpage section directly adjacent to a client fence');
+
+assert.equal(state.checkChatRpc('https://vertexaisearch.cloud.google.com/_/DotsSplashUi/data/batchexecute', 'POST'), false);
+assert.equal(state.checkChatRpc('https://vertexaisearch.cloud.google.com/v1alpha/projects/p/locations/global/collections/default_collection/engines/e/sessions:createSession', 'POST'), false);
+assert.equal(state.checkChatRpc('https://vertexaisearch.cloud.google.com/v1alpha/projects/p/locations/global/collections/default_collection/engines/e/servingConfigs/default_search:streamAssist', 'POST'), true);
+
+const isolatedJob = job();
+let ctrlPrimary, ctrlBg;
+const primaryStream = new ReadableStream({ start(c) { ctrlPrimary = c; } });
+const bgStream = new ReadableStream({ start(c) { ctrlBg = c; } });
+const enc = new TextEncoder();
+const pPrimary = state.consumeStream(primaryStream, isolatedJob);
+const pBg = state.consumeStream(bgStream, isolatedJob);
+ctrlPrimary.enqueue(enc.encode(")]}'\n[{\"groundedContent\":{\"content\":{\"text\":\"主响应\"}}}"));
+await new Promise((r) => setTimeout(r, 10));
+assert.ok(isolatedJob.primaryStreamToken, 'first content stream locks primaryStreamToken');
+ctrlBg.error(new Error('background rpc aborted'));
+await pBg;
+assert.equal(isolatedJob.networkError, undefined, 'secondary RPC stream failure cannot poison primary stream');
+const utf8Bytes = enc.encode(', {\"groundedContent\":{\"content\":{\"text\":\"完整收尾\"}}}]');
+ctrlPrimary.enqueue(utf8Bytes.slice(0, 31));
+ctrlPrimary.enqueue(utf8Bytes.slice(31));
+ctrlPrimary.close();
+await pPrimary;
+assert.equal(isolatedJob.networkText, '主响应完整收尾');
+assert.equal(isolatedJob.networkDone, true);
+
+const fencedSqJob = job();
+const ticks3 = '\x60\x60\x60';
+const sqToolRaw = ticks3 + 'codex_tool_call\n' + JSON.stringify({name:'exec_command',arguments:{cmd:'rg foo'}}) + '\n' + ticks3;
+state.parsePacket({groundedContent:{content:{text:'检查中。\n' + sqToolRaw}}}, fencedSqJob);
+state.parsePacket({summaryText:'检查中。\n' + ticks3 + 'codex_tool_call\n' + JSON.stringify({name:'exec_command',arguments:{cmd:'rg foo'}}, null, 2) + '\n' + ticks3 + '\n' + ticks3 + 'suggested_questions\n{"questions":["Next?"],"type":"followup"}\n' + ticks3}, fencedSqJob);
+assert.equal((fencedSqJob.networkText.match(/codex_tool_call/g) || []).length, 1);
+assert.ok(!fencedSqJob.networkText.includes('suggested_questions'));
+console.log('PASS: batchexecute exclusion, primary stream lock, XSSI + UTF-8 split, and fenced suggested_questions snapshot');

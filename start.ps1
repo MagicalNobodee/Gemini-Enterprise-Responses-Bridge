@@ -1,7 +1,6 @@
 param(
     [switch]$Test,
     [switch]$ExportOnly,
-    [switch]$SkipUpdate,
     [int]$Port = 0
 )
 
@@ -57,52 +56,17 @@ if ($CurrentHash -ne $InstalledHash) {
     Set-Content -Path $ReqHashFile -Value $CurrentHash -NoNewline
 }
 
-function Invoke-SyncDependenciesAndExtension {
-    $LatestReqHash = (Get-FileHash -Path "requirements.txt" -Algorithm SHA256).Hash
-    $SavedReqHash = if (Test-Path $ReqHashFile) { (Get-Content $ReqHashFile -Raw).Trim() } else { "" }
-    if ($LatestReqHash -ne $SavedReqHash) {
-        Write-Host "[Setup] Updating Python dependencies after release sync ..." -ForegroundColor Yellow
-        & $VenvPython -m pip install -r requirements.txt
-        Set-Content -Path $ReqHashFile -Value $LatestReqHash -NoNewline
-    }
-    & $VenvPython extension_exporter.py
-}
+# Always materialize clean `extension\` (with generated PNG icons) and `userscript\`
+& $VenvPython extension_exporter.py
 
 if ($ExportOnly) {
-    & $VenvPython extension_exporter.py
     exit 0
 }
 
 if ($Test) {
-    & $VenvPython extension_exporter.py
     Write-Host "[Test] Running automated test suite (pytest) ..." -ForegroundColor Cyan
     & $VenvPython -m pytest -v
     exit $LASTEXITCODE
-}
-
-# Check GitHub Releases for backend & extension updates on every startup unless disabled
-$AutoUpdateDisabled = ($SkipUpdate -or ($env:BRIDGE_AUTO_UPDATE -match "^(0|false|no|off)$"))
-if (-not $AutoUpdateDisabled -and (Test-Path "updater.py")) {
-    try {
-        & $VenvPython updater.py --startup-update
-    } catch {
-        Write-Host "[Updater] Startup update check skipped: $($_.Exception.Message)" -ForegroundColor Yellow
-    }
-}
-
-# Always materialize clean `extension\` (with generated PNG icons) and `userscript\`
-Invoke-SyncDependenciesAndExtension
-
-if (Test-Path "sync_client_limits.py") {
-    try {
-        $SyncJson = & $VenvPython sync_client_limits.py
-        $SyncObj = $SyncJson | ConvertFrom-Json -ErrorAction SilentlyContinue
-        if ($SyncObj -and $SyncObj.models_updated -and $SyncObj.models_updated.Count -gt 0) {
-            Write-Host "[Limits] Synced 1M context / 65K output token limits for $($SyncObj.models_updated.Count) Copilot BYOK model(s)." -ForegroundColor Green
-        }
-    } catch {
-        # Best-effort client DB sync; never block startup
-    }
 }
 
 if ($Port -gt 0) {
@@ -141,27 +105,12 @@ if ($ExistingListener) {
     }
 }
 
-$env:BRIDGE_SUPERVISED = "1"
 $MaxRestarts = 3
 $RestartCount = 0
 while ($true) {
     Write-Host "[Server] Running on http://127.0.0.1:${ActivePort} (WebSocket: ws://127.0.0.1:${ActivePort}/ws/browser)" -ForegroundColor Cyan
     & $VenvPython server.py
     $ExitCode = $LASTEXITCODE
-    if ($ExitCode -eq 42) {
-        Write-Host "[Updater] Hot-restart requested (code=42); applying update and restarting server..." -ForegroundColor Cyan
-        if (Test-Path "updater.py") {
-            try {
-                & $VenvPython updater.py --startup-update
-            } catch {
-                Write-Host "[Updater] Post-exit update check warning: $($_.Exception.Message)" -ForegroundColor Yellow
-            }
-        }
-        Invoke-SyncDependenciesAndExtension
-        $RestartCount = 0
-        Start-Sleep -Milliseconds 600
-        continue
-    }
     if ($ExitCode -eq 0 -or $RestartCount -ge $MaxRestarts) {
         if ($ExitCode -ne 0) {
             Write-Host "[Error] server.py exited with code ${ExitCode} after ${MaxRestarts} recovery attempts." -ForegroundColor Red

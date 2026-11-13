@@ -1,7 +1,7 @@
 """Shared Carbon budget and lossless guidance for coding agents.
 
 The API capacity is published; Enterprise web auto-compaction is not.
-The 50% checkpoint follows Google's Gemini CLI policy, not a claimed web limit.
+The local checkpoint leaves room for large coding histories and tool results.
 """
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import hashlib
 import re
 
 CARBON_CONTEXT_WINDOW = 1_048_576
-CARBON_AUTO_COMPACT_TOKENS = CARBON_CONTEXT_WINDOW // 2
+CARBON_AUTO_COMPACT_TOKENS = 300_000
 CARBON_EFFECTIVE_CONTEXT_PERCENT = 95
 
 CODING_WORKFLOW = """[Coding workflow]
@@ -24,6 +24,8 @@ Reuse file content already obtained unless it changed or a specific missing deta
 After an investigation step, make the authorized change or run the next necessary check. Do not endlessly restate a plan or seek permission already given.
 For lengthy work, keep a short factual checkpoint in existing task progress notes when available: completed edits, verified results, unresolved issues, and the next concrete action.
 After a context summary, continue from the checkpoint. Do not restart the investigation, repeat completed tests, or treat a proposed change as applied.
+Prefer small apply_patch hunks when the declared tools support them. Aim for tool arguments below 12000 characters when practical; this is guidance, never permission to truncate content or change a requested value.
+For a full-file replacement that needs chunks, assemble a separate temporary file, check completeness, then replace the destination once. Do not leave the live destination half-written between calls.
 Preserve exact tool names, namespaces, call IDs, patch text and schema constraints. Never fabricate execution or file contents.
 When asked to compact, produce a short factual checkpoint with completed/pending status, relevant paths, verified tests, and the immediate next action.
 [/Coding workflow]

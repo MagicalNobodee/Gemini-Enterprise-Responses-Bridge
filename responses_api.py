@@ -11,7 +11,6 @@ from typing import Any, AsyncIterator
 
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from media_inputs import extract_part_marker
 from schemas import ChatCompletionRequest, ChatMessage
 from streaming_utils import with_keepalive
 
@@ -222,18 +221,6 @@ def content_parts(content: Any) -> Any:
             parts.append(part)
         else:
             raise ResponsesError(f"暂不支持输入内容类型：{kind}")
-    existing_text = "\n".join(
-        p.get("text", "") for p in parts if isinstance(p, dict) and isinstance(p.get("text"), str)
-    )
-    for part in content:
-        if isinstance(part, dict) and part.get("type") in {
-            "input_image", "image_url", "input_file", "file", "document",
-            "input_audio", "audio_url", "audio", "input_video", "video_url", "video",
-        }:
-            marker = extract_part_marker(part)
-            if marker and marker not in existing_text:
-                parts.append({"type": "text", "text": marker})
-                existing_text += "\n" + marker
     return parts
 
 
@@ -403,7 +390,7 @@ async def chat_packets(body: AsyncIterator) -> AsyncIterator[dict]:
                 return
             if data:
                 yield json.loads(data)
-            elif block.startswith(":"):
+            elif block.startswith(":") or block.startswith("event: keepalive"):
                 yield {}
 
 
@@ -429,6 +416,7 @@ async def translate_response(upstream: Any, payload: dict, model: str, mapping: 
         ]
         if msg.get("content") or annotations:
             response["output"].append({"id": "msg_" + uuid.uuid4().hex, "type": "message", "status": "completed", "role": "assistant",
+                "phase": "commentary" if msg.get("tool_calls") else "final_answer",
                 "content": [{"type": "output_text", "text": msg.get("content") or "", "annotations": annotations}]})
         for tc in msg.get("tool_calls", []):
             item = output_call(tc, mapping)
@@ -439,13 +427,19 @@ async def translate_response(upstream: Any, payload: dict, model: str, mapping: 
         remember(response, history, store)
         return JSONResponse(response)
 
+    sequence = 0
+    def event(kind: str, **data: Any) -> str:
+        nonlocal sequence
+        packet = {"type": kind, "sequence_number": sequence, **data}
+        sequence += 1
+        return f"event: {kind}\ndata: {json.dumps(packet, ensure_ascii=False)}\n\n"
+
+    def progress() -> str:
+        # Comments do not reset Codex's event idle timer. Keep the event small even for large tools.
+        snapshot = {key: response[key] for key in ("id", "object", "created_at", "model")}
+        return event("response.in_progress", response={**snapshot, "status": "in_progress", "output": []})
+
     async def events() -> AsyncIterator[str]:
-        sequence = 0
-        def event(kind: str, **data: Any) -> str:
-            nonlocal sequence
-            packet = {"type": kind, "sequence_number": sequence, **data}
-            sequence += 1
-            return f"event: {kind}\ndata: {json.dumps(packet, ensure_ascii=False)}\n\n"
         yield event("response.created", response=response)
         yield event("response.in_progress", response=response)
         message = None
@@ -454,7 +448,7 @@ async def translate_response(upstream: Any, payload: dict, model: str, mapping: 
         try:
             async for packet in chat_packets(upstream.body_iterator):
                 if not packet:
-                    yield ": keepalive\n\n"
+                    yield progress()
                     continue
                 if packet.get("error"):
                     raise ResponsesError(packet["error"]["message"])
@@ -469,7 +463,8 @@ async def translate_response(upstream: Any, payload: dict, model: str, mapping: 
                             for a in delta["attachments"] if isinstance(a, dict)
                         ]
                         if message is None:
-                            message = {"id": "msg_" + uuid.uuid4().hex, "type": "message", "status": "in_progress", "role": "assistant", "content": []}
+                            message = {"id": "msg_" + uuid.uuid4().hex, "type": "message", "status": "in_progress", "role": "assistant", "content": [],
+                                       "phase": "commentary" if mapping else "final_answer"}
                             response["output"].append(message)
                             yield event("response.output_item.added", output_index=0, item=dict(message))
                             part = {"type": "output_text", "text": "", "annotations": []}
@@ -479,7 +474,8 @@ async def translate_response(upstream: Any, payload: dict, model: str, mapping: 
                     text = delta.get("content")
                     if text:
                         if message is None:
-                            message = {"id": "msg_" + uuid.uuid4().hex, "type": "message", "status": "in_progress", "role": "assistant", "content": []}
+                            message = {"id": "msg_" + uuid.uuid4().hex, "type": "message", "status": "in_progress", "role": "assistant", "content": [],
+                                       "phase": "commentary" if mapping else "final_answer"}
                             response["output"].append(message)
                             yield event("response.output_item.added", output_index=0, item=dict(message))
                             part = {"type": "output_text", "text": "", "annotations": []}
@@ -500,6 +496,7 @@ async def translate_response(upstream: Any, payload: dict, model: str, mapping: 
                 raise ResponsesError("上游连接提前结束，未收到完整回复。")
             if message:
                 message["status"] = "completed"
+                message["phase"] = "commentary" if calls else "final_answer"
                 yield event("response.output_text.done", item_id=message["id"], output_index=0, content_index=0, text=message["content"][0]["text"], logprobs=[])
                 yield event("response.content_part.done", item_id=message["id"], output_index=0, content_index=0, part=message["content"][0])
                 yield event("response.output_item.done", output_index=0, item=message)
@@ -530,4 +527,8 @@ async def translate_response(upstream: Any, payload: dict, model: str, mapping: 
             yield event("response.failed", response=response)
         finally:
             await upstream.body_iterator.aclose()
-    return StreamingResponse(with_keepalive(events()), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return StreamingResponse(
+        with_keepalive(events(), frame=progress),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

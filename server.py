@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
+import contextvars
 import json
 import logging
-import os
 import re
 import time
-import urllib.parse
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -18,7 +16,7 @@ from pydantic import ValidationError
 
 from fastapi import Depends, FastAPI, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, FileResponse
 
 from bridge_hub import (
     BridgeExecutionError,
@@ -27,22 +25,16 @@ from bridge_hub import (
     BrowserBridgeHub,
 )
 from config import BridgeSettings
-from agent_policy import (
-    CARBON_AUTO_COMPACT_TOKENS,
-    CARBON_CONTEXT_WINDOW,
-    CODING_WORKFLOW,
-    COMPACTION_INSTRUCTIONS,
-    has_coding_tools,
-    reading_diagnostics,
-    split_checkpoint_history,
-)
+from agent_policy import (CARBON_CONTEXT_WINDOW, CARBON_AUTO_COMPACT_TOKENS,
+                          COMPACTION_INSTRUCTIONS, CODING_WORKFLOW, has_coding_tools,
+                          reading_diagnostics, split_checkpoint_history)
 from context_builder import ConversationContextBuilder
 from dashboard_html import DASHBOARD_HTML
 from extension_exporter import export_extension_bundle
 from gcloud_provider import GCloudUpstreamError, GCloudVertexProvider
-from multimodal import estimate_attachment_tokens
 from schemas import (
     AVAILABLE_MODELS,
+    estimate_tokens,
     BridgeCallbackPayload,
     BridgeEventPayload,
     BridgeRegisterRequest,
@@ -51,39 +43,32 @@ from schemas import (
     build_chat_completion_chunk,
     build_chat_completion_response,
     build_usage,
-    estimate_tokens,
     parse_model_and_session,
-    resolve_model_metadata,
     resolve_target_web_model,
 )
-from updater import (
-    EXIT_RESTART_FOR_UPDATE,
-    UpdateError,
-    UpdateIntegrityError,
-    UpdateManager,
-)
-from usage_stats import UsageTracker
-from version import APP_VERSION
-from image_outputs import generate_images
 from media_inputs import (
     FileStore,
     InvalidAttachmentError,
     collect_attachments,
+    historical_image_markers,
+    reference_historical_images,
     compact_messages_for_store,
     decode_base64_payload,
     parse_multipart_form,
     resolve_mime_and_name,
 )
+from image_outputs import generate_images
 from media_outputs import format_artifacts_markdown, generate_videos, persist_browser_outputs
 from responses_api import ResponseStore, ResponsesError, prepare_request, translate_response
 from streaming_utils import with_keepalive
+from usage_ledger import UsageLedger, estimate_attachment_input_tokens
 from tool_calling import (
-    TOOL_OUTPUT_REPAIR_PROMPT,
-    ToolProtocolError,
     ToolStreamProcessor,
-    build_response_format_instructions,
+    ToolProtocolError,
+    BrowserTaskFailure,
     build_sse_tool_call_deltas,
     build_tool_system_instructions,
+    build_response_format_instructions,
     is_tool_generation_enabled,
     normalize_request_tools,
     normalize_tool_choice,
@@ -118,17 +103,8 @@ def _openai_error_response(
     )
 
 
-def create_app(
-    settings: Optional[BridgeSettings] = None,
-    update_manager: Optional[UpdateManager] = None,
-) -> FastAPI:
+def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
     cfg = settings or BridgeSettings.from_env()
-    root_dir = Path(__file__).resolve().parent
-    updater = update_manager or UpdateManager(
-        root_dir=root_dir,
-        current_version=APP_VERSION,
-        repo=cfg.github_repo,
-    )
     cb_host = "127.0.0.1" if cfg.host in {"0.0.0.0", "::"} else cfg.host
     hub = BrowserBridgeHub(
         include_citations=cfg.include_citations,
@@ -136,122 +112,111 @@ def create_app(
         max_parallel_tabs=cfg.max_parallel_tabs,
         auto_spawn_tabs=cfg.auto_spawn_tabs,
         session_affinity_ttl_seconds=cfg.session_affinity_ttl_seconds,
-        backend_version=updater.current_version,
     )
     context_builder = ConversationContextBuilder(
         default_mode=cfg.context_mode,
         auto_reset_new_chat=cfg.auto_reset_new_chat,
     )
-    usage_tracker = UsageTracker(
-        storage_path=cfg.usage_stats_path or None,
-        usd_to_cny_rate=cfg.usd_to_cny_rate,
-    )
     gcloud = GCloudVertexProvider(cfg)
+    price_overrides: Dict[str, Any] = {}
+    if cfg.price_overrides_json:
+        try:
+            loaded_ov = json.loads(cfg.price_overrides_json)
+            if isinstance(loaded_ov, dict):
+                price_overrides = loaded_ov
+        except Exception as exc:
+            logger.warning("解析 BRIDGE_PRICE_OVERRIDES_JSON 失败，使用默认参考单价: %s", exc)
+    ledger_file = cfg.usage_ledger_path or (str(Path(cfg.generated_dir) / "usage_ledger.json") if cfg.generated_dir else None)
+    usage_ledger = UsageLedger(
+        storage_path=ledger_file,
+        usd_to_cny_rate=cfg.usd_to_cny_rate,
+        price_overrides=price_overrides,
+    )
+    hub.on_slot_removed = context_builder.drop_slot
+    hub.on_slot_migrated = context_builder.migrate_slot_key
+    _ledger_task_var: contextvars.ContextVar[str] = contextvars.ContextVar("bridge_ledger_task", default="chat")
     context_diagnostics: Dict[str, Any] = {}
+    diagnostic_request: Optional[ChatCompletionRequest] = None
+
+    def _active_model_hint(hub_snap: Dict[str, Any], ctx_mon: Dict[str, Any]) -> str:
+        prim_m = str((ctx_mon.get("primary") or {}).get("active_model") or "")
+        if prim_m:
+            return prim_m
+        ac = hub_snap.get("active_client")
+        if isinstance(ac, dict) and ac.get("active_model"):
+            return str(ac["active_model"])
+        for ws_item in hub_snap.get("worker_slots") or []:
+            if isinstance(ws_item, dict) and ws_item.get("active_model"):
+                return str(ws_item["active_model"])
+        return ""
+
+    def build_live_ledger_snapshot(include_catalog: bool = False, hub_snap: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        snap = hub_snap if hub_snap is not None else hub.status_snapshot()
+        ctx_mon = context_builder.get_context_snapshot(snap.get("worker_slots") or [])
+        hint = _active_model_hint(snap, ctx_mon)
+        return {
+            "usage": usage_ledger.snapshot(
+                active_model_hint=hint,
+                default_model=cfg.default_model,
+                include_catalog=include_catalog,
+            ),
+            "context_monitor": ctx_mon,
+        }
 
     def prompt_for_usage(request: ChatCompletionRequest) -> str:
+        # Count the full logical context, even when only a delta is sent to the web.
         system_text, dialogue = context_builder._normalize_messages(request.messages)
-        sections = [
-            system_text,
-            *(text for _, text in dialogue),
-            build_tool_system_instructions(request.tools or [], request.tool_choice, request.parallel_tool_calls),
-            build_response_format_instructions(request.response_format),
-        ]
-        if (
-            has_coding_tools(request.tools)
-            and is_tool_generation_enabled(request.tools or [], request.tool_choice)
-            and CODING_WORKFLOW.strip() not in system_text
-        ):
+        sections = [system_text, *(text for _, text in dialogue),
+                    build_tool_system_instructions(request.tools or [], request.tool_choice, request.parallel_tool_calls),
+                    build_response_format_instructions(request.response_format)]
+        if (has_coding_tools(request.tools) and is_tool_generation_enabled(request.tools or [], request.tool_choice)
+                and CODING_WORKFLOW.strip() not in system_text):
             sections.append(CODING_WORKFLOW)
         return "\n\n".join(filter(None, sections))
 
-    def record_context(request: ChatCompletionRequest, prepared: Any) -> None:
+    def record_context(request: ChatCompletionRequest, prepared, attachments=(), historical_images=()) -> None:
+        nonlocal diagnostic_request
+        diagnostic_request = request
         context_diagnostics.clear()
         context_diagnostics.update(
-            model=request.model or cfg.default_model,
-            strategy=prepared.strategy_used,
-            reset_chat=prepared.reset_chat,
-            web_prompt_characters=len(prepared.prompt),
+            model=request.model or cfg.default_model, strategy=prepared.strategy_used,
+            reset_chat=prepared.reset_chat, web_prompt_characters=len(prepared.prompt),
             estimated_logical_input_tokens=estimate_tokens(prompt_for_usage(request)),
+            uploaded_attachments=sum(att["id"] in prepared.prompt for att in attachments),
+            historical_images_referenced=len(historical_images),
             **reading_diagnostics(request.messages),
         )
 
+    def record_reply_protocol(parsed, session_key, request):
+        if diagnostic_request is request:
+            context_diagnostics["reply_protocol"] = parsed.protocol
+        if parsed.has_tool_calls:
+            logger.info("Accepted client tool reply: protocol=%s slot=%s calls=%d argument_chars=%d",
+                        parsed.protocol, session_key, len(parsed.tool_calls),
+                        sum(len(call["function"]["arguments"]) for call in parsed.tool_calls))
+
     @asynccontextmanager
-    async def conversation_slot(**options: Any) -> AsyncIterator[Any]:
+    async def conversation_slot(**options):
         async with hub.acquire_slot(**options) as slot:
             try:
                 yield slot
-            except BaseException:
-                context_builder.clear_session(slot.slot_key)
+            except BaseException as exc:
+                context_builder.invalidate_session(slot.slot_key)
+                if isinstance(exc, (ToolProtocolError, BrowserTaskFailure)):
+                    hub.record_reply_error(slot, str(exc))
                 slot.pending_tool_call_until = 0.0
                 raise
-
-    def _resolve_active_model_hint(hub_snap: Optional[Dict[str, Any]] = None) -> str:
-        snap = hub_snap if hub_snap is not None else hub.status_snapshot()
-        active_client = snap.get("active_client")
-        if isinstance(active_client, dict) and active_client.get("active_model"):
-            return str(active_client["active_model"])
-        for ws_slot in snap.get("worker_slots") or []:
-            if isinstance(ws_slot, dict) and ws_slot.get("active_model"):
-                return str(ws_slot["active_model"])
-        return ""
-
-    def build_live_usage_snapshot(include_catalog: bool = False) -> Dict[str, Any]:
-        hub_snap = hub.status_snapshot()
-        ctx_monitor = context_builder.get_context_snapshot(hub_snap.get("worker_slots") or [])
-        model_hint = _resolve_active_model_hint(hub_snap) or str(
-            (ctx_monitor.get("primary") or {}).get("active_model") or ""
-        )
-        usage_snap = usage_tracker.snapshot(
-            active_model_hint=model_hint,
-            include_catalog=include_catalog,
-        )
-        return {
-            "usage": usage_snap,
-            "context_monitor": ctx_monitor,
-        }
-
-    def _sync_extension_for_reload(_old_ext_ver: str) -> None:
-        if cfg.auto_export_extension:
-            try:
-                export_extension_bundle(updater.root_dir)
-            except Exception:
-                pass
-
-    hub.usage_snapshot_provider = lambda: build_live_usage_snapshot(include_catalog=False)
-    hub.on_slot_removed = context_builder.drop_slot
-    hub.on_slot_migrated = context_builder.migrate_slot_key
-    hub.on_extension_version_reported = updater.record_extension_version
-    hub.on_outdated_extension_detected = _sync_extension_for_reload
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         if cfg.auto_export_extension:
             try:
-                ext_path = export_extension_bundle(updater.root_dir)
-                logger.info("Chrome/Edge MV3 扩展目录已就绪 (v%s): %s", updater.current_version, ext_path)
+                ext_path = export_extension_bundle(Path(__file__).resolve().parent)
+                logger.info("Chrome/Edge MV3 扩展目录已就绪: %s", ext_path)
             except Exception as exc:  # pragma: no cover
                 logger.warning("自动导出 extension 目录失败（不影响主目录加载）: %s", exc)
-
-        bg_check_task: Optional[asyncio.Task[Any]] = None
-        if cfg.auto_update:
-            async def _initial_github_probe() -> None:
-                try:
-                    snap = await asyncio.to_thread(updater.check_github_update, False, 6.0)
-                    if snap.get("backend_outdated"):
-                        logger.warning(
-                            "发现 GitHub 新版本 v%s（当前本地后端 v%s），可在控制台或插件弹窗一键自动更新！",
-                            snap.get("latest_github_version"),
-                            updater.current_version,
-                        )
-                except Exception:
-                    pass
-
-            bg_check_task = asyncio.create_task(_initial_github_probe())
-
         logger.info(
-            "Gemini Enterprise Bridge v%s 已启动: http://%s:%d/ (OpenAI Base URL: http://%s:%d/v1)",
-            updater.current_version,
+            "Gemini Enterprise Bridge 已启动: http://%s:%d/ (OpenAI Base URL: http://%s:%d/v1)",
             cfg.host,
             cfg.port,
             cfg.host,
@@ -260,51 +225,31 @@ def create_app(
         try:
             yield
         finally:
-            if bg_check_task is not None and not bg_check_task.done():
-                bg_check_task.cancel()
             response_store.close()
 
     app = FastAPI(
         title="Gemini Enterprise Web-to-API Bridge",
-        version=updater.current_version,
+        version="1.0.0",
         description="Browser-in-the-loop OpenAI-compatible proxy for Google Cloud Vertex AI Search / Agentspace",
         lifespan=lifespan,
     )
+
     app.state.settings = cfg
     app.state.hub = hub
     app.state.context_builder = context_builder
-    app.state.usage_tracker = usage_tracker
-    app.state.update_manager = updater
     app.state.gcloud = gcloud
+    app.state.usage_ledger = usage_ledger
     image_output_dir = Path(cfg.generated_dir) if cfg.generated_dir else (Path(__file__).resolve().parent / "generated")
     file_store = FileStore(image_output_dir)
-    response_store = ResponseStore(
-        file_store=file_store,
-        directory=cfg.response_store_dir,
-        ttl_seconds=cfg.response_store_ttl_seconds,
-    )
+    response_store = ResponseStore(file_store=file_store, directory=cfg.response_store_dir,
+                                   ttl_seconds=cfg.response_store_ttl_seconds)
     app.state.file_store = file_store
     app.state.response_store = response_store
     callback_origin = f"http://{cb_host}:{cfg.port}"
 
-    class _WebSocketSafeCORSMiddleware:
-        """Apply CORSMiddleware to HTTP requests while letting WebSocket handshakes pass cleanly."""
-
-        def __init__(self, asgi_app: Any, **cors_kwargs: Any) -> None:
-            self.asgi_app = asgi_app
-            self.cors_app = CORSMiddleware(asgi_app, **cors_kwargs)
-
-        async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
-            if scope.get("type") == "websocket":
-                await self.asgi_app(scope, receive, send)
-                return
-            await self.cors_app(scope, receive, send)
-
-    wildcard_cors = "*" in (cfg.cors_allow_origins or [])
     app.add_middleware(
-        _WebSocketSafeCORSMiddleware,
-        allow_origins=[] if wildcard_cors else cfg.cors_allow_origins,
-        allow_origin_regex=r".*" if wildcard_cors else None,
+        CORSMiddleware,
+        allow_origins=cfg.cors_allow_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -352,7 +297,6 @@ def create_app(
     async def health() -> Dict[str, Any]:
         return {
             "status": "ok",
-            "version": updater.current_version,
             "browser_connected": hub.has_ready_client(),
             "gcloud_configured": gcloud.is_configured(),
             "backend_mode": cfg.backend_mode,
@@ -361,152 +305,58 @@ def create_app(
     @app.get("/api/status")
     async def api_status() -> Dict[str, Any]:
         hub_snap = hub.status_snapshot()
-        if hub_snap.get("connected_extension_version"):
-            updater.record_extension_version(str(hub_snap["connected_extension_version"]))
-        upd_snap = updater.status_snapshot(include_remote_if_cached=True)
-        ctx_monitor = context_builder.get_context_snapshot(hub_snap.get("worker_slots") or [])
-        model_hint = _resolve_active_model_hint(hub_snap) or str(
-            (ctx_monitor.get("primary") or {}).get("active_model") or ""
-        )
+        live_ledger = build_live_ledger_snapshot(include_catalog=False, hub_snap=hub_snap)
         return {
             "status": "ok",
-            "version": updater.current_version,
-            "backend_version": updater.current_version,
-            "connected_extension_version": upd_snap["connected_extension_version"],
-            "backend_update_required": bool(
-                upd_snap["backend_update_required"] or hub_snap.get("backend_update_required")
-            ),
             "backend_mode": cfg.backend_mode,
             "context_mode": cfg.context_mode,
-            "context": {
-                "carbon_model_capacity": CARBON_CONTEXT_WINDOW,
-                "carbon_checkpoint_budget": CARBON_AUTO_COMPACT_TOKENS,
-                "checkpoint_policy": "Gemini CLI 50%; Enterprise web threshold unpublished",
-                "token_count_source": "local_estimate_not_google_usage",
-                "last_request": dict(context_diagnostics),
-            },
+            "default_model": cfg.default_model,
+            "api_key_required": bool(cfg.api_key),
+            "context": {"carbon_model_capacity": CARBON_CONTEXT_WINDOW,
+                        "carbon_checkpoint_budget": CARBON_AUTO_COMPACT_TOKENS,
+                        "checkpoint_policy": "Local coding stability budget; Enterprise web threshold unpublished",
+                        "token_count_source": "local_estimate_not_google_usage",
+                        "last_request": dict(context_diagnostics)},
             "gcloud_configured": gcloud.is_configured(),
             "hub": hub_snap,
-            "update": upd_snap,
-            "usage": usage_tracker.snapshot(active_model_hint=model_hint, include_catalog=False),
-            "context_monitor": ctx_monitor,
+            "usage": live_ledger["usage"],
+            "context_monitor": live_ledger["context_monitor"],
         }
-
-    @app.get("/api/update/status")
-    async def api_update_status(force: bool = False) -> Dict[str, Any]:
-        hub_snap = hub.status_snapshot()
-        if hub_snap.get("connected_extension_version"):
-            updater.record_extension_version(str(hub_snap["connected_extension_version"]))
-        info = await asyncio.to_thread(updater.check_github_update, force)
-        return {
-            "status": "ok",
-            **info,
-        }
-
-    @app.post("/api/update/extension")
-    async def api_update_extension() -> JSONResponse:
-        try:
-            result = await asyncio.to_thread(updater.update_extension_only)
-        except UpdateIntegrityError as exc:
-            return JSONResponse(
-                status_code=400,
-                content={"ok": False, "error": str(exc), "code": "integrity_error"},
-            )
-        except UpdateError as exc:
-            return JSONResponse(
-                status_code=502,
-                content={"ok": False, "error": str(exc), "code": "update_failed"},
-            )
-        updated_ver = str(result.get("updated_version") or updater.current_version)
-        await hub.broadcast_ws_event(
-            {"type": "extension_reload_available", "version": updated_ver},
-            required_capability="auto_update",
-        )
-        return JSONResponse(status_code=200, content=result)
-
-    @app.post("/api/update/apply")
-    async def api_update_apply(request: Request) -> JSONResponse:
-        supervised = os.getenv("BRIDGE_SUPERVISED", "").strip() == "1"
-        requested_restart: Optional[bool] = None
-        try:
-            body = await request.json()
-            if isinstance(body, dict) and "restart" in body:
-                requested_restart = bool(body["restart"])
-        except Exception:
-            pass
-
-        try:
-            result = await asyncio.to_thread(updater.update_backend_and_extension)
-        except UpdateIntegrityError as exc:
-            return JSONResponse(
-                status_code=400,
-                content={"ok": False, "error": str(exc), "code": "integrity_error"},
-            )
-        except UpdateError as exc:
-            return JSONResponse(
-                status_code=502,
-                content={"ok": False, "error": str(exc), "code": "update_failed"},
-            )
-
-        updated_ver = str(result.get("updated_version") or updater.current_version)
-        await hub.broadcast_ws_event(
-            {"type": "extension_reload_available", "version": updated_ver},
-            required_capability="auto_update",
-        )
-
-        will_restart = supervised if requested_restart is None else (requested_restart and supervised)
-        if will_restart:
-            async def _delayed_hot_exit() -> None:
-                await asyncio.sleep(0.35)
-                os._exit(EXIT_RESTART_FOR_UPDATE)
-
-            asyncio.create_task(_delayed_hot_exit())
-            msg = f"已下载并写入 v{updated_ver} 更新文件，本地网关正在自动热重启（约 2~3 秒恢复）..."
-        else:
-            msg = f"已下载并写入 v{updated_ver} 更新文件；当前为手动启动模式，请重启 server.py（使用 start.ps1 启动可自动热重启）。"
-
-        return JSONResponse(
-            status_code=200,
-            content={
-                **result,
-                "supervised": supervised,
-                "restart_scheduled": will_restart,
-                "exit_code": EXIT_RESTART_FOR_UPDATE if will_restart else None,
-                "message": msg,
-            },
-        )
 
     @app.get("/api/usage")
     async def api_usage() -> Dict[str, Any]:
-        live = build_live_usage_snapshot(include_catalog=True)
+        live_ledger = build_live_ledger_snapshot(include_catalog=True)
         return {
             "status": "ok",
-            "usage": live["usage"],
-            "context_monitor": live["context_monitor"],
+            "usage": live_ledger["usage"],
+            "context_monitor": live_ledger["context_monitor"],
         }
 
-    @app.post("/api/usage/reset")
-    async def api_usage_reset(request: Request, scope: Optional[str] = None) -> Dict[str, Any]:
-        resolved_scope = scope or ""
-        if not resolved_scope:
-            try:
-                body = await request.json()
-                if isinstance(body, dict) and body.get("scope"):
-                    resolved_scope = str(body["scope"])
-            except Exception:
-                pass
-        resolved_scope = (resolved_scope or "all").strip().lower()
-        if resolved_scope not in {"session", "today", "all"}:
-            resolved_scope = "all"
-        usage_tracker.reset(scope=resolved_scope)
-        live = build_live_usage_snapshot(include_catalog=True)
-        await hub.broadcast_ws_event({"type": "usage_update", "usage_snapshot": live})
-        return {
-            "ok": True,
-            "scope": resolved_scope,
-            "usage": live["usage"],
-            "context_monitor": live["context_monitor"],
-        }
+    @app.post("/api/slots/reset", dependencies=[Depends(verify_api_key)])
+    async def api_reset_worker_slot(request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        slot_key = str((body or {}).get("slot_key") or "").strip()
+        if not slot_key:
+            return JSONResponse(status_code=400, content={"ok": False, "detail": "缺少席位标识 slot_key"})
+        try:
+            result = await hub.reset_worker_slot(slot_key)
+        except KeyError as exc:
+            return JSONResponse(status_code=404, content={"ok": False, "detail": str(exc)})
+        except RuntimeError as exc:
+            return JSONResponse(status_code=409, content={"ok": False, "detail": str(exc)})
+        context_builder.invalidate_session(slot_key)
+        return JSONResponse(status_code=200, content=result)
+
+    @app.post("/api/extension/reload", dependencies=[Depends(verify_api_key)])
+    async def api_reload_extension() -> JSONResponse:
+        try:
+            result = await hub.reload_connected_extensions()
+        except RuntimeError as exc:
+            return JSONResponse(status_code=409, content={"ok": False, "detail": str(exc)})
+        return JSONResponse(status_code=200, content=result)
 
     # ------------------------------------------------------------------
     # Browser Extension WebSocket Endpoint
@@ -524,15 +374,7 @@ def create_app(
                 if isinstance(data, dict):
                     reply_packet = await hub.handle_browser_event(client.client_id, data)
                     if reply_packet is not None:
-                        reload_ver = reply_packet.pop("_emit_extension_reload", None)
                         await websocket.send_json(reply_packet)
-                        if reload_ver:
-                            await websocket.send_json(
-                                {
-                                    "type": "extension_reload_available",
-                                    "version": str(reload_ver),
-                                }
-                            )
         except WebSocketDisconnect:
             logger.info("浏览器扩展前端已断开连接 (%s)", client.client_id)
         except Exception as exc:
@@ -561,22 +403,14 @@ def create_app(
     async def poll_http_bridge(client_id: str, timeout: float = 18.0) -> Dict[str, Any]:
         bounded = max(1.0, min(timeout, 25.0))
         command = await hub.poll_http_command(client_id=client_id, timeout=bounded)
-        return {
-            "ok": True,
-            "command": command,
-            "usage_snapshot": build_live_usage_snapshot(include_catalog=False),
-        }
+        return {"ok": True, "command": command}
 
     @app.post("/api/bridge/event")
     async def receive_http_bridge_event(payload: BridgeEventPayload) -> Dict[str, Any]:
         raw = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
         raw["type"] = payload.event
         ack = await hub.handle_browser_event(payload.client_id, raw)
-        return {
-            "ok": True,
-            "ack": ack,
-            "usage_snapshot": build_live_usage_snapshot(include_catalog=False),
-        }
+        return {"ok": True, "ack": ack}
 
     @app.post("/api/bridge/callback")
     async def receive_async_bridge_callback(payload: BridgeCallbackPayload) -> Dict[str, Any]:
@@ -611,48 +445,13 @@ def create_app(
             )
         return {"ok": True}
 
-    @app.get("/api/bridge/attachments/{attachment_id}")
-    async def download_staged_bridge_attachment(
-        attachment_id: str,
-        token: str = "",
-    ) -> Response:
-        """Token-guarded or file_id-staged local binary attachment endpoint."""
-        if attachment_id.startswith("file_") and not token:
-            try:
-                meta = file_store.get_meta(attachment_id)
-            except FileNotFoundError:
-                return _openai_error_response(404, "附件缓存不存在或已过期。", "invalid_request_error", "file_not_found")
-            return FileResponse(meta["path"], media_type=meta["mime_type"], filename=meta["filename"])
-        staged, status_reason = hub.verify_staged_attachment(attachment_id, token)
-        if status_reason == "forbidden":
-            return _openai_error_response(
-                status_code=403,
-                message="附件访问令牌无效或缺失。",
-                error_type="permission_error",
-                code="invalid_attachment_token",
-            )
-        if staged is None:
-            return _openai_error_response(
-                status_code=404,
-                message="附件不存在或已过期。",
-                error_type="not_found_error",
-                code="attachment_not_found",
-            )
-        ascii_fallback = staged.filename.encode("ascii", "ignore").decode("ascii") or "attachment"
-        ascii_fallback = ascii_fallback.replace('"', "").replace("\\", "_")
-        encoded_utf8 = urllib.parse.quote(staged.filename, safe="")
-        headers = {
-            "Cache-Control": "no-store, max-age=0",
-            "X-Content-Type-Options": "nosniff",
-            "Content-Disposition": (
-                f'attachment; filename="{ascii_fallback}"; filename*=UTF-8\'\'{encoded_utf8}'
-            ),
-        }
-        return Response(
-            content=staged.data,
-            media_type=staged.mime_type or "application/octet-stream",
-            headers=headers,
-        )
+    @app.get("/api/bridge/attachments/{file_id}")
+    async def fetch_staged_bridge_attachment(file_id: str) -> Any:
+        try:
+            meta = file_store.get_meta(file_id)
+        except FileNotFoundError:
+            return _openai_error_response(404, "附件缓存不存在或已过期。", "invalid_request_error", "file_not_found")
+        return FileResponse(meta["path"], media_type=meta["mime_type"], filename=meta["filename"])
 
     # ------------------------------------------------------------------
     # Agentic Loop & Tool Calling Support
@@ -678,26 +477,6 @@ def create_app(
     @app.get("/models", dependencies=[Depends(verify_api_key)], include_in_schema=False)
     async def list_models() -> Dict[str, Any]:
         return {"object": "list", "data": AVAILABLE_MODELS}
-
-    @app.get("/v1/models/{model_id:path}", dependencies=[Depends(verify_api_key)])
-    @app.get(
-        "/models/{model_id:path}",
-        dependencies=[Depends(verify_api_key)],
-        include_in_schema=False,
-    )
-    async def retrieve_model(model_id: str) -> Any:
-        clean_id = (model_id or "").strip().strip("/")
-        if not clean_id:
-            return {"object": "list", "data": AVAILABLE_MODELS}
-        entry = resolve_model_metadata(clean_id)
-        if entry is None:
-            return _openai_error_response(
-                status_code=404,
-                message=f"The model '{clean_id}' does not exist",
-                error_type="invalid_request_error",
-                code="model_not_found",
-            )
-        return entry
 
     def _select_upstream(model_name: str) -> str:
         """Decide between 'browser' and 'gcloud' upstream."""
@@ -773,6 +552,30 @@ def create_app(
             return _openai_error_response(404, f"文件不存在：{file_id}", "invalid_request_error", "file_not_found")
         return {"id": file_id, "object": "file", "deleted": True}
 
+    async def _run_tracked_image_gen(
+        img_payload: Dict[str, Any],
+        img_attachments: list[dict[str, Any]],
+        explicit_task: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        started = time.monotonic()
+        res = await generate_images(
+            img_payload, hub, context_builder, cfg, image_output_dir, img_attachments, file_store=file_store
+        )
+        img_model = str(img_payload.get("model") or cfg.default_model)
+        p_toks = estimate_tokens(str(img_payload.get("prompt") or "")) + estimate_attachment_input_tokens(img_attachments)
+        t_kind = explicit_task or ("image_edit" if img_attachments else "image_gen")
+        usage_ledger.record_request(
+            requested_model=img_model,
+            prompt_tokens=p_toks,
+            completion_tokens=0,
+            browser_active_model=resolve_target_web_model(img_model),
+            task_type=t_kind,
+            strategy="browser_image",
+            images_generated=max(1, len(res.get("data") or [])),
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+        return res
+
     @app.post("/v1/images/generations", dependencies=[Depends(verify_api_key)])
     async def image_generations(payload: Dict[str, Any]) -> Any:
         try:
@@ -785,7 +588,7 @@ def create_app(
                 callback_base_url=callback_origin,
                 image_output_dir=image_output_dir,
             )
-            return await generate_images(payload, hub, context_builder, cfg, image_output_dir, attachments, file_store=file_store)
+            return await _run_tracked_image_gen(payload, attachments)
         except (InvalidAttachmentError, ValueError) as exc:
             return _openai_error_response(400, str(exc), "invalid_request_error", "invalid_image_request")
         except (BridgeUnavailableError, BridgeTimeoutError, BridgeExecutionError, ToolProtocolError) as exc:
@@ -836,7 +639,7 @@ def create_app(
                     callback_base_url=callback_origin,
                     image_output_dir=image_output_dir,
                 )
-            return await generate_images(payload, hub, context_builder, cfg, image_output_dir, attachments, file_store=file_store)
+            return await _run_tracked_image_gen(payload, attachments, explicit_task="image_edit")
         except (InvalidAttachmentError, ValueError, json.JSONDecodeError) as exc:
             return _openai_error_response(400, str(exc), "invalid_request_error", "invalid_image_request")
         except (BridgeUnavailableError, BridgeTimeoutError, BridgeExecutionError, ToolProtocolError) as exc:
@@ -860,13 +663,27 @@ def create_app(
                 callback_base_url=callback_origin,
                 image_output_dir=image_output_dir,
             ) if raw_refs else []
-            return await generate_videos(payload, hub, context_builder, cfg, image_output_dir, file_store, attachments)
+            v_started = time.monotonic()
+            v_res = await generate_videos(payload, hub, context_builder, cfg, image_output_dir, file_store, attachments)
+            v_model = str(payload.get("model") or cfg.default_model)
+            usage_ledger.record_request(
+                requested_model=v_model,
+                prompt_tokens=estimate_tokens(str(payload.get("prompt") or "")) + estimate_attachment_input_tokens(attachments),
+                completion_tokens=0,
+                browser_active_model=resolve_target_web_model(v_model),
+                task_type="video_gen",
+                strategy="browser_video",
+                videos_generated=max(1, len(v_res.get("data") or [])),
+                duration_ms=int((time.monotonic() - v_started) * 1000),
+            )
+            return v_res
         except (InvalidAttachmentError, ValueError) as exc:
             return _openai_error_response(400, str(exc), "invalid_request_error", "invalid_video_request")
         except (BridgeUnavailableError, BridgeTimeoutError, BridgeExecutionError, ToolProtocolError) as exc:
             return _openai_error_response(502, str(exc), "bridge_error", "video_generation_failed")
 
     async def _handle_audio_task(raw_request: Request, translate_to_english: bool = False) -> Any:
+        audio_started = time.monotonic()
         ctype = raw_request.headers.get("content-type", "")
         body = await raw_request.body()
         try:
@@ -940,6 +757,16 @@ def create_app(
                 finally:
                     context_builder.clear_session(slot.slot_key)
             cleaned_text = parse_assistant_output(raw_reply).content.strip()
+            usage_ledger.record_request(
+                requested_model=model_req,
+                prompt_tokens=estimate_tokens(instruction) + estimate_attachment_input_tokens(attachments),
+                completion_tokens=estimate_tokens(cleaned_text),
+                browser_active_model=resolve_target_web_model(model_req),
+                task_type="audio",
+                strategy="audio_translate" if translate_to_english else "audio_transcribe",
+                audio_requests=1,
+                duration_ms=int((time.monotonic() - audio_started) * 1000),
+            )
             if resp_fmt in {"text", "srt", "vtt"}:
                 from fastapi.responses import PlainTextResponse
                 return PlainTextResponse(cleaned_text)
@@ -968,14 +795,17 @@ def create_app(
         except (ResponsesError, ValidationError) as exc:
             return _openai_error_response(400, str(exc), "invalid_request_error", "invalid_responses_request")
         try:
-            upstream = await chat_completions(
-                request, x_session_id=raw_request.headers.get("x-session-id"),
-                x_bridge_session=raw_request.headers.get("x-bridge-session"))
+            tok = _ledger_task_var.set("responses")
+            try:
+                upstream = await chat_completions(
+                    request, x_session_id=raw_request.headers.get("x-session-id"),
+                    x_bridge_session=raw_request.headers.get("x-bridge-session"))
+            finally:
+                _ledger_task_var.reset(tok)
             return await translate_response(upstream, payload, request.model or cfg.default_model, mapping, history, response_store,
-                image_generator=lambda prompt: generate_images(
-                    {"prompt": prompt}, hub, context_builder, cfg, image_output_dir,
+                image_generator=lambda prompt: _run_tracked_image_gen(
+                    {"prompt": prompt, "model": request.model or cfg.default_model},
                     [a for a in collect_attachments(request.messages, file_store=file_store, callback_base_url=callback_origin, image_output_dir=image_output_dir) if a["category"] == "image"],
-                    file_store=file_store,
                 ))
         except (ResponsesError, BridgeUnavailableError, BridgeTimeoutError, BridgeExecutionError) as exc:
             return _openai_error_response(502, str(exc), "bridge_error", "response_execution_failed")
@@ -1008,7 +838,11 @@ def create_app(
             request, _, _ = prepare_request({**payload, "tools": [], "stream": False}, response_store)
             request.messages, recent_tool_rounds = split_checkpoint_history(request.messages)
             request.messages.append(ChatMessage(role="user", content=COMPACTION_INSTRUCTIONS))
-            result = await chat_completions(request, x_session_id=None, x_bridge_session=None)
+            cmp_tok = _ledger_task_var.set("compaction")
+            try:
+                result = await chat_completions(request, x_session_id=None, x_bridge_session=None)
+            finally:
+                _ledger_task_var.reset(cmp_tok)
             if isinstance(result, JSONResponse):
                 if result.status_code >= 400:
                     return result
@@ -1040,7 +874,6 @@ def create_app(
         x_session_id: Optional[str] = Header(default=None),
         x_bridge_session: Optional[str] = Header(default=None),
     ) -> Any:
-        req_started_mono = time.monotonic()
         if not request.messages:
             return _openai_error_response(
                 status_code=400,
@@ -1058,29 +891,46 @@ def create_app(
             or (x_bridge_session.strip() if x_bridge_session and x_bridge_session.strip() else None)
             or (request.session_id.strip() if request.session_id and request.session_id.strip() else None)
         )
+
         upstream = _select_upstream(model_name)
         target_web_model = resolve_target_web_model(model_name)
-        completion_id = uuid.uuid4().hex
-        created_ts = int(time.time())
-        include_usage = bool(request.stream_options and request.stream_options.include_usage)
-
         norm_tools = normalize_request_tools(request.tools, request.functions)
         norm_tool_choice = normalize_tool_choice(request.tool_choice, request.function_call)
         tools_active = is_tool_generation_enabled(norm_tools, norm_tool_choice)
+        coding_images_only = upstream == "browser" and tools_active and has_coding_tools(norm_tools)
+        old_image_markers = historical_image_markers(request.messages) if coding_images_only else set()
+        try:
+            input_attachments = collect_attachments(
+                request.messages,
+                file_store=file_store,
+                callback_base_url=callback_origin,
+                image_output_dir=image_output_dir,
+                pending_images_only=coding_images_only,
+            )
+        except InvalidAttachmentError as exc:
+            return _openai_error_response(400, str(exc), "invalid_request_error", exc.error_code)
+        except ValueError as exc:
+            return _openai_error_response(400, str(exc), "invalid_request_error", "invalid_attachment")
+
+        completion_id = uuid.uuid4().hex
+        created_ts = int(time.time())
+        req_started_mono = time.monotonic()
+        request_task_type = _ledger_task_var.get()
+        include_usage = bool(request.stream_options and request.stream_options.include_usage)
+
         json_mode_active = isinstance(request.response_format, dict) and str(
             request.response_format.get("type") or ""
         ).lower() in {"json_object", "json_schema"}
         suppress_citations = tools_active or json_mode_active
 
-        usage_prompt = prompt_for_usage(request)
-        extra_attachment_tokens = sum(
-            estimate_attachment_tokens(att)
-            for m in request.messages
-            for att in m.extract_attachments()
-        )
-
         # ---------------- Option 1: Official GCloud Upstream ----------------
+        usage_prompt = prompt_for_usage(request)
+        input_att_tokens = estimate_attachment_input_tokens(input_attachments)
+        logical_in_tokens = estimate_tokens(usage_prompt) + input_att_tokens
+
         if upstream == "gcloud":
+            if input_attachments:
+                return _openai_error_response(400, "多模态附件输入目前需要浏览器模式。", "invalid_request_error", "image_backend_unsupported")
             if not gcloud.is_configured():
                 return _openai_error_response(
                     status_code=503,
@@ -1088,8 +938,8 @@ def create_app(
                     error_type="service_unavailable_error",
                     code="gcloud_not_configured",
                 )
-
             max_out = request.max_completion_tokens or request.max_tokens
+
             if not request.stream:
                 try:
                     raw_reply = await gcloud.complete_chat(
@@ -1111,7 +961,7 @@ def create_app(
                     parallel_tool_calls=request.parallel_tool_calls,
                     response_format=request.response_format,
                 )
-                resp_obj = build_chat_completion_response(
+                resp_gcloud = build_chat_completion_response(
                     request_id=completion_id,
                     model=model_name,
                     reply_text=parsed.content,
@@ -1120,24 +970,18 @@ def create_app(
                     tool_calls=parsed.tool_calls or None,
                     finish_reason=parsed.finish_reason,
                 )
-                if extra_attachment_tokens > 0:
-                    resp_obj["usage"]["prompt_tokens"] += extra_attachment_tokens
-                    resp_obj["usage"]["total_tokens"] = (
-                        resp_obj["usage"]["prompt_tokens"] + resp_obj["usage"]["completion_tokens"]
-                    )
-                usage_tracker.record_request(
+                gc_usage = resp_gcloud.get("usage") or {}
+                usage_ledger.record_request(
                     requested_model=model_name,
-                    prompt_tokens=resp_obj["usage"]["prompt_tokens"],
-                    completion_tokens=resp_obj["usage"]["completion_tokens"],
-                    gcloud_fallback_model=cfg.gcloud_model,
+                    prompt_tokens=logical_in_tokens,
+                    completion_tokens=int(gc_usage.get("completion_tokens") or 0),
+                    gcloud_fallback_model=cfg.gcp_vertex_model,
+                    task_type=request_task_type,
                     strategy="gcloud_direct",
                     slot_key="gcloud",
                     duration_ms=int((time.monotonic() - req_started_mono) * 1000),
                 )
-                await hub.broadcast_ws_event(
-                    {"type": "usage_update", "usage_snapshot": build_live_usage_snapshot()}
-                )
-                return resp_obj
+                return resp_gcloud
 
             async def gcloud_sse() -> AsyncIterator[str]:
                 initial = build_chat_completion_chunk(
@@ -1198,23 +1042,17 @@ def create_app(
                         completion_usage_str = json.dumps(parsed.tool_calls, ensure_ascii=False)
                     else:
                         completion_usage_str = parsed.content or ""
-                    gcloud_u = build_usage(usage_prompt, completion_usage_str)
-                    if extra_attachment_tokens > 0:
-                        gcloud_u["prompt_tokens"] += extra_attachment_tokens
-                        gcloud_u["total_tokens"] = gcloud_u["prompt_tokens"] + gcloud_u["completion_tokens"]
-                    usage_tracker.record_request(
+                    usage_ledger.record_request(
                         requested_model=model_name,
-                        prompt_tokens=gcloud_u["prompt_tokens"],
-                        completion_tokens=gcloud_u["completion_tokens"],
-                        gcloud_fallback_model=cfg.gcloud_model,
+                        prompt_tokens=logical_in_tokens,
+                        completion_tokens=estimate_tokens(completion_usage_str),
+                        gcloud_fallback_model=cfg.gcp_vertex_model,
+                        task_type=request_task_type,
                         strategy="gcloud_stream",
                         slot_key="gcloud",
                         duration_ms=int((time.monotonic() - req_started_mono) * 1000),
                     )
-                    await hub.broadcast_ws_event(
-                        {"type": "usage_update", "usage_snapshot": build_live_usage_snapshot()}
-                    )
-                except (GCloudUpstreamError, ToolProtocolError) as exc:
+                except GCloudUpstreamError as exc:
                     yield "data: " + json.dumps({"error": {"message": str(exc), "type": "upstream_error", "code": "gcloud_failed"}}, ensure_ascii=False) + "\n\n"
                     return
 
@@ -1227,16 +1065,12 @@ def create_app(
                 )
                 yield f"data: {json.dumps(stop_chunk, ensure_ascii=False)}\n\n"
                 if include_usage:
-                    u_obj = build_usage(usage_prompt, completion_usage_str)
-                    if extra_attachment_tokens > 0:
-                        u_obj["prompt_tokens"] += extra_attachment_tokens
-                        u_obj["total_tokens"] = u_obj["prompt_tokens"] + u_obj["completion_tokens"]
                     usage_chunk = build_chat_completion_chunk(
                         request_id=completion_id,
                         model=model_name,
                         delta={},
                         created=created_ts,
-                        usage=u_obj,
+                        usage=build_usage(usage_prompt, completion_usage_str),
                     )
                     yield f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
@@ -1250,33 +1084,6 @@ def create_app(
                     "X-Accel-Buffering": "no",
                 },
             )
-
-        # Validate browser-bound multimodal attachments upfront before checking browser readiness
-        try:
-            collect_attachments(
-                request.messages,
-                file_store=file_store,
-                callback_base_url=callback_origin,
-                image_output_dir=image_output_dir,
-            )
-        except InvalidAttachmentError as exc:
-            return _openai_error_response(400, str(exc), "invalid_request_error", exc.error_code)
-        except ValueError as exc:
-            return _openai_error_response(400, str(exc), "invalid_request_error", "invalid_attachment")
-
-        def _select_turn_attachments(prepared: Any) -> Any:
-            active_msgs = [
-                request.messages[idx]
-                for idx in getattr(prepared, "active_message_indices", [])
-                if 0 <= idx < len(request.messages)
-            ]
-            collected = collect_attachments(
-                active_msgs,
-                file_store=file_store,
-                callback_base_url=callback_origin,
-                image_output_dir=image_output_dir,
-            )
-            return collected if collected else list(prepared.attachments or [])
 
         # ---------------- Option 2: Parallel Browser-in-the-loop Worker Pool ----------------
         if not hub.has_ready_client():
@@ -1308,7 +1115,6 @@ def create_app(
                 matching_slots = [
                     k for k in matching_slots if not context_builder.has_active_tool_session(k)
                 ]
-
             try:
                 async with conversation_slot(
                     explicit_session_id=explicit_session_id,
@@ -1326,7 +1132,8 @@ def create_app(
                         parallel_tool_calls=request.parallel_tool_calls,
                         response_format=request.response_format,
                     )
-                    record_context(request, prepared)
+                    prepared.prompt = reference_historical_images(prepared.prompt, old_image_markers)
+                    record_context(request, prepared, input_attachments, old_image_markers)
                     raw_out_images: list[dict[str, Any]] = []
                     raw_out_files: list[dict[str, Any]] = []
                     raw_reply = await hub.dispatch_complete_on_slot(
@@ -1336,38 +1143,19 @@ def create_app(
                         reset_chat=prepared.reset_chat,
                         suppress_citations=suppress_citations,
                         request_timeout=cfg.request_timeout_seconds,
-                        attachments=_select_turn_attachments(prepared),
+                        attachments=[att for att in input_attachments if att["id"] in prepared.prompt],
                         output_images=raw_out_images,
                         output_files=raw_out_files,
                     )
                     saved_outputs = persist_browser_outputs(
                         raw_out_images, raw_out_files, image_output_dir, file_store, callback_origin
                     )
-                    try:
-                        parsed = parse_assistant_output(
-                            raw_reply,
-                            tools=norm_tools,
-                            tool_choice=norm_tool_choice,
-                            parallel_tool_calls=request.parallel_tool_calls,
-                            response_format=request.response_format,
-                        )
-                    except ToolProtocolError:
-                        logger.warning("Repairing invalid browser tool reply on %s", session_key)
-                        raw_reply = await hub.dispatch_complete_on_slot(
-                            slot=slot,
-                            prompt=TOOL_OUTPUT_REPAIR_PROMPT,
-                            target_model=target_web_model,
-                            reset_chat=False,
-                            suppress_citations=suppress_citations,
-                            request_timeout=cfg.request_timeout_seconds,
-                        )
-                        parsed = parse_assistant_output(
-                            raw_reply,
-                            tools=norm_tools,
-                            tool_choice=norm_tool_choice,
-                            parallel_tool_calls=request.parallel_tool_calls,
-                            response_format=request.response_format,
-                        )
+                    parsed = parse_assistant_output(
+                        raw_reply, tools=norm_tools, tool_choice=norm_tool_choice,
+                        parallel_tool_calls=request.parallel_tool_calls,
+                        response_format=request.response_format,
+                    )
+                    record_reply_protocol(parsed, session_key, request)
                     if saved_outputs and not parsed.has_tool_calls and not json_mode_active:
                         md_links = format_artifacts_markdown(saved_outputs, parsed.content or "")
                         if md_links and (not tools_active or not (parsed.content or "").strip()):
@@ -1376,36 +1164,53 @@ def create_app(
                         time.time() + 60.0 if parsed.has_tool_calls else 0.0
                     )
                     effective_slot_model = slot.active_model or target_web_model
-                    context_builder.record_completed_turn(
-                        session_key=session_key,
-                        sent_history=prepared.normalized_history,
-                        assistant_reply=parsed.content or "",
-                        assistant_tool_calls=parsed.tool_calls or None,
-                        active_model=effective_slot_model,
-                        tools_fingerprint=prepared.tools_fingerprint,
-                        system_fingerprint=prepared.system_fingerprint,
-                        system_tokens=prepared.system_tokens,
-                        tools_tokens=prepared.tools_tokens,
-                        last_delta_tokens=prepared.delta_prompt_tokens,
-                        last_strategy=prepared.strategy_used,
+                    sent_att_toks = estimate_attachment_input_tokens(
+                        [att for att in input_attachments if att["id"] in prepared.prompt]
                     )
-                    comp_text_for_stats = parsed.content or ""
-                    if parsed.has_tool_calls:
-                        comp_text_for_stats += " " + json.dumps(
-                            parsed.tool_calls, ensure_ascii=False
+                    web_sent_toks = estimate_tokens(prepared.prompt) + sent_att_toks
+                    reused_toks = (
+                        max(0, logical_in_tokens - web_sent_toks)
+                        if prepared.strategy_used == "smart_incremental_delta"
+                        else 0
+                    )
+                    comp_for_ledger = (parsed.content or "") + (
+                        " " + json.dumps(parsed.tool_calls, ensure_ascii=False)
+                        if parsed.has_tool_calls
+                        else ""
+                    )
+                    if request_task_type == "compaction":
+                        # Compaction is a one-shot summary pass; clear the worker slot so it never
+                        # masquerades as an uncompacted active conversation in the remaining-pool bar.
+                        context_builder.clear_session(session_key)
+                        slot_ctx = {
+                            "total_context_tokens": logical_in_tokens + estimate_tokens(comp_for_ledger),
+                            "context_limit_tokens": CARBON_CONTEXT_WINDOW,
+                        }
+                    else:
+                        context_builder.record_completed_turn(
+                            session_key=session_key,
+                            sent_history=prepared.normalized_history,
+                            assistant_reply=parsed.content or "",
+                            assistant_tool_calls=parsed.tool_calls or None,
+                            active_model=effective_slot_model,
+                            tools_fingerprint=prepared.tools_fingerprint,
+                            system_fingerprint=prepared.system_fingerprint,
+                            logical_prompt_tokens=logical_in_tokens,
+                            web_prompt_tokens=web_sent_toks,
+                            last_strategy=prepared.strategy_used,
                         )
-                    slot_ctx = context_builder.get_slot_context_metrics(session_key) or {}
-                    usage_tracker.record_request(
+                        slot_ctx = context_builder.get_slot_context_metrics(session_key) or {}
+                    usage_ledger.record_request(
                         requested_model=model_name,
-                        prompt_tokens=max(
-                            prepared.logical_prompt_tokens,
-                            estimate_tokens(usage_prompt),
-                        ),
-                        completion_tokens=estimate_tokens(comp_text_for_stats),
+                        prompt_tokens=logical_in_tokens,
+                        completion_tokens=estimate_tokens(comp_for_ledger),
                         browser_active_model=effective_slot_model,
+                        task_type=request_task_type,
                         strategy=prepared.strategy_used,
-                        cached_tokens=prepared.cached_prefix_tokens,
-                        delta_prompt_tokens=prepared.delta_prompt_tokens,
+                        cached_tokens=reused_toks,
+                        delta_prompt_tokens=max(0, logical_in_tokens - reused_toks),
+                        images_generated=sum(1 for a in (saved_outputs or []) if a.get("category") == "image"),
+                        videos_generated=sum(1 for a in (saved_outputs or []) if a.get("category") == "video"),
                         slot_key=session_key,
                         tab_id=slot.tab_id,
                         context_tokens=slot_ctx.get("total_context_tokens"),
@@ -1417,7 +1222,7 @@ def create_app(
                 return _openai_error_response(503, str(exc), "bridge_unavailable_error", "browser_not_connected")
             except BridgeTimeoutError as exc:
                 return _openai_error_response(504, str(exc), "timeout_error", "browser_timeout")
-            except (BridgeExecutionError, ToolProtocolError) as exc:
+            except (BridgeExecutionError, ToolProtocolError, BrowserTaskFailure) as exc:
                 return _openai_error_response(502, str(exc), "bridge_execution_error", "dom_execution_failed")
 
             resp_payload = build_chat_completion_response(
@@ -1429,14 +1234,6 @@ def create_app(
                 tool_calls=parsed.tool_calls or None,
                 finish_reason=parsed.finish_reason,
                 attachments=saved_outputs or None,
-            )
-            if extra_attachment_tokens > 0:
-                resp_payload["usage"]["prompt_tokens"] += extra_attachment_tokens
-                resp_payload["usage"]["total_tokens"] = (
-                    resp_payload["usage"]["prompt_tokens"] + resp_payload["usage"]["completion_tokens"]
-                )
-            await hub.broadcast_ws_event(
-                {"type": "usage_update", "usage_snapshot": build_live_usage_snapshot()}
             )
             resp_headers = {"X-Bridge-Slot": slot_header_val}
             if explicit_session_id:
@@ -1482,7 +1279,6 @@ def create_app(
                     matching_slots = [
                         k for k in matching_slots if not context_builder.has_active_tool_session(k)
                     ]
-
                 async with conversation_slot(
                     explicit_session_id=explicit_session_id,
                     matching_slot_keys=matching_slots,
@@ -1499,7 +1295,9 @@ def create_app(
                         parallel_tool_calls=request.parallel_tool_calls,
                         response_format=request.response_format,
                     )
-                    record_context(request, prepared)
+
+                    prepared.prompt = reference_historical_images(prepared.prompt, old_image_markers)
+                    record_context(request, prepared, input_attachments, old_image_markers)
                     stream_out_images: list[dict[str, Any]] = []
                     stream_out_files: list[dict[str, Any]] = []
                     async for delta in hub.dispatch_stream_on_slot(
@@ -1509,7 +1307,7 @@ def create_app(
                         reset_chat=prepared.reset_chat,
                         suppress_citations=suppress_citations,
                         request_timeout=cfg.request_timeout_seconds,
-                        attachments=_select_turn_attachments(prepared),
+                        attachments=[att for att in input_attachments if att["id"] in prepared.prompt],
                         output_images=stream_out_images,
                         output_files=stream_out_files,
                     ):
@@ -1518,7 +1316,6 @@ def create_app(
                                 yield ": keepalive\n\n"
                                 last_sse_ts = time.monotonic()
                             continue
-
                         for safe_piece in processor.feed(delta):
                             emitted_content.append(safe_piece)
                             chunk = build_chat_completion_chunk(
@@ -1530,33 +1327,8 @@ def create_app(
                             yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                             last_sse_ts = time.monotonic()
 
-                    try:
-                        tail_pieces, parsed = processor.finalize()
-                    except ToolProtocolError:
-                        logger.warning("Repairing invalid browser tool stream on %s", session_key)
-                        processor = ToolStreamProcessor(
-                            tools=norm_tools,
-                            tool_choice=norm_tool_choice,
-                            parallel_tool_calls=request.parallel_tool_calls,
-                            response_format=request.response_format,
-                        )
-                        async for delta in hub.dispatch_stream_on_slot(
-                            slot=slot,
-                            prompt=TOOL_OUTPUT_REPAIR_PROMPT,
-                            target_model=target_web_model,
-                            reset_chat=False,
-                            suppress_citations=suppress_citations,
-                            request_timeout=cfg.request_timeout_seconds,
-                        ):
-                            if delta:
-                                processor.feed(delta)
-                            if time.monotonic() - last_sse_ts >= 14.5:
-                                yield ": keepalive\n\n"
-                                last_sse_ts = time.monotonic()
-                        tail_pieces, parsed = processor.finalize()
-                        tail_pieces = [parsed.content] if parsed.content else []
-                        parsed.content = ("".join(emitted_content) + (parsed.content or "")).strip() or None
-
+                    tail_pieces, parsed = processor.finalize()
+                    record_reply_protocol(parsed, session_key, request)
                     for raw_piece in tail_pieces:
                         for safe_piece in split_text_slices(raw_piece):
                             chunk = build_chat_completion_chunk(
@@ -1595,9 +1367,18 @@ def create_app(
                     slot.pending_tool_call_until = (
                         time.time() + 60.0 if parsed.has_tool_calls else 0.0
                     )
-                    effective_slot_model = slot.active_model or target_web_model
-                    turn_recorded = False
 
+                    effective_slot_model = slot.active_model or target_web_model
+                    sent_att_toks = estimate_attachment_input_tokens(
+                        [att for att in input_attachments if att["id"] in prepared.prompt]
+                    )
+                    web_sent_toks = estimate_tokens(prepared.prompt) + sent_att_toks
+                    reused_toks = (
+                        max(0, logical_in_tokens - web_sent_toks)
+                        if prepared.strategy_used == "smart_incremental_delta"
+                        else 0
+                    )
+                    turn_completed = False
                     if parsed.has_tool_calls:
                         finish_reason = "tool_calls"
                         for tc_batch in build_sse_tool_call_deltas(parsed.tool_calls):
@@ -1619,16 +1400,15 @@ def create_app(
                             active_model=effective_slot_model,
                             tools_fingerprint=prepared.tools_fingerprint,
                             system_fingerprint=prepared.system_fingerprint,
-                            system_tokens=prepared.system_tokens,
-                            tools_tokens=prepared.tools_tokens,
-                            last_delta_tokens=prepared.delta_prompt_tokens,
+                            logical_prompt_tokens=logical_in_tokens,
+                            web_prompt_tokens=web_sent_toks,
                             last_strategy=prepared.strategy_used,
                         )
-                        turn_recorded = True
+                        turn_completed = True
                     else:
                         full_reply = (parsed.content or "").strip()
                         completion_usage_str = full_reply
-                        if full_reply:
+                        if full_reply or saved_stream_outputs:
                             context_builder.record_completed_turn(
                                 session_key=session_key,
                                 sent_history=prepared.normalized_history,
@@ -1636,36 +1416,31 @@ def create_app(
                                 active_model=effective_slot_model,
                                 tools_fingerprint=prepared.tools_fingerprint,
                                 system_fingerprint=prepared.system_fingerprint,
-                                system_tokens=prepared.system_tokens,
-                                tools_tokens=prepared.tools_tokens,
-                                last_delta_tokens=prepared.delta_prompt_tokens,
+                                logical_prompt_tokens=logical_in_tokens,
+                                web_prompt_tokens=web_sent_toks,
                                 last_strategy=prepared.strategy_used,
                             )
-                            turn_recorded = True
-
-                    if turn_recorded:
+                            turn_completed = True
+                    if turn_completed:
                         slot_ctx = context_builder.get_slot_context_metrics(session_key) or {}
-                        usage_tracker.record_request(
+                        usage_ledger.record_request(
                             requested_model=model_name,
-                            prompt_tokens=max(
-                                prepared.logical_prompt_tokens,
-                                estimate_tokens(prompt_for_usage_str),
-                            ),
+                            prompt_tokens=logical_in_tokens,
                             completion_tokens=estimate_tokens(completion_usage_str),
                             browser_active_model=effective_slot_model,
+                            task_type=request_task_type,
                             strategy=prepared.strategy_used,
-                            cached_tokens=prepared.cached_prefix_tokens,
-                            delta_prompt_tokens=prepared.delta_prompt_tokens,
+                            cached_tokens=reused_toks,
+                            delta_prompt_tokens=max(0, logical_in_tokens - reused_toks),
+                            images_generated=sum(1 for a in (saved_stream_outputs or []) if a.get("category") == "image"),
+                            videos_generated=sum(1 for a in (saved_stream_outputs or []) if a.get("category") == "video"),
                             slot_key=session_key,
                             tab_id=slot.tab_id,
                             context_tokens=slot_ctx.get("total_context_tokens"),
                             context_limit=slot_ctx.get("context_limit_tokens"),
                             duration_ms=int((time.monotonic() - req_started_mono) * 1000),
                         )
-                        await hub.broadcast_ws_event(
-                            {"type": "usage_update", "usage_snapshot": build_live_usage_snapshot()}
-                        )
-            except (BridgeUnavailableError, BridgeTimeoutError, BridgeExecutionError, ToolProtocolError) as exc:
+            except (BridgeUnavailableError, BridgeTimeoutError, BridgeExecutionError, ToolProtocolError, BrowserTaskFailure) as exc:
                 yield "data: " + json.dumps({"error": {"message": str(exc), "type": "bridge_error", "code": "browser_failed"}}, ensure_ascii=False) + "\n\n"
                 return
 
@@ -1679,18 +1454,15 @@ def create_app(
             yield f"data: {json.dumps(stop_chunk, ensure_ascii=False)}\n\n"
 
             if include_usage:
-                u_obj = build_usage(prompt_for_usage_str, completion_usage_str)
-                if extra_attachment_tokens > 0:
-                    u_obj["prompt_tokens"] += extra_attachment_tokens
-                    u_obj["total_tokens"] = u_obj["prompt_tokens"] + u_obj["completion_tokens"]
                 usage_chunk = build_chat_completion_chunk(
                     request_id=completion_id,
                     model=raw_model_name,
                     delta={},
                     created=created_ts,
-                    usage=u_obj,
+                    usage=build_usage(prompt_for_usage_str, completion_usage_str),
                 )
                 yield f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n"
+
             yield "data: [DONE]\n\n"
 
         sse_headers = {
@@ -1717,25 +1489,6 @@ if __name__ == "__main__":
     import uvicorn
 
     runtime_cfg = BridgeSettings.from_env()
-    if os.getenv("BRIDGE_SYNC_COPILOT_LIMITS", "true").strip().lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }:
-        try:
-            from sync_client_limits import sync_copilot_provider_limits
-
-            sync_res = sync_copilot_provider_limits(bridge_port=runtime_cfg.port)
-            updated_rows = sync_res.get("models_updated") or []
-            if updated_rows:
-                logger.info(
-                    "Synced 1M prompt / 65K output token limits for %d Copilot BYOK model(s): %s",
-                    len(updated_rows),
-                    ", ".join(m["model_id"] for m in updated_rows),
-                )
-        except Exception as exc:  # pragma: no cover
-            logger.debug("Optional Copilot BYOK token limit sync skipped: %s", exc)
     uvicorn.run(
         app,
         host=runtime_cfg.host,

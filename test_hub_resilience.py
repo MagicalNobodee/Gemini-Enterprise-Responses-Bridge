@@ -198,3 +198,26 @@ def test_cancelled_page_wait_does_not_clear_active_request():
             assert slot.lock.locked()
             assert slot.waiting_count == 0
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("final", ["rewritten answer", ""])
+def test_completion_must_match_original_chunks_and_failure_cancels(final):
+    from bridge_hub import BridgeExecutionError
+    async def run():
+        hub, client = make_hub()
+        async def receive():
+            async with hub.acquire_slot() as slot:
+                return await hub.dispatch_complete_on_slot(slot, "test", request_timeout=.3)
+        task=asyncio.create_task(receive())
+        command=await client.command_queue.get()
+        await hub.handle_browser_event('test',{'type':'stream_chunk','request_id':command['request_id'],'delta':'original answer'})
+        await hub.handle_browser_event('test',{'type':'request_complete','request_id':command['request_id'],'reply':final,'source':'network_stream'})
+        with pytest.raises(BridgeExecutionError,match='不一致'):
+            await task
+        assert hub.status_snapshot()['total_errors']==1
+        assert not hub._pending
+        assert not any(s.in_flight_request_id for s in hub._slots.values())
+        cancel=await client.command_queue.get()
+        assert cancel['type']=='cancel_request'
+        assert 'source=network_stream' in hub._recent_logs[-1]['message']
+    asyncio.run(run())

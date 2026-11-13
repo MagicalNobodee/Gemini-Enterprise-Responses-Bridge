@@ -2,13 +2,13 @@
 import asyncio
 
 
-async def with_keepalive(stream, interval=14.5):
+async def with_keepalive(stream, interval=14.5, frame=': keepalive\n\n'):
     pending = None
     try:
         while True:
             pending = asyncio.create_task(anext(stream))
             while not (await asyncio.wait({pending}, timeout=interval))[0]:
-                yield ': keepalive\n\n'
+                yield frame() if callable(frame) else frame
             try:
                 piece = pending.result()
             except StopAsyncIteration:

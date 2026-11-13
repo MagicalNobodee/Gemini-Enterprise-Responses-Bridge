@@ -12,12 +12,12 @@ def tools(*names):
 
 
 def call(name="exec_command", cmd="printf verified"):
-    return '[TOOL_CALL]' + json.dumps({"name": name, "arguments": {"cmd": cmd}}) + '[/TOOL_CALL]'
+    return '```codex_tool_call\n' + json.dumps({"name": name, "arguments": {"cmd": cmd}}) + '\n```\n'
 
 
 @pytest.mark.parametrize('width', [1, 7, 51, 1024])
 def test_namespace_added_to_existing_chat_preserves_entire_tool_call(width):
-    raw = call(cmd="read full reply\n" + "x" * 620)
+    raw = call(name="functions.exec_command", cmd="read full reply\n" + "x" * 620)
     processor = ToolStreamProcessor(tools('functions.exec_command'))
     output = []
     for start in range(0, len(raw), width):
@@ -35,9 +35,9 @@ def test_ambiguous_short_name_and_wrong_namespace_are_rejected():
 
 
 @pytest.mark.parametrize('raw', [
-    '[TOOL_CALL]{"name": "exec_command", "arguments": {',
+    '```codex_tool_call\n{"name": "exec_command", "arguments": {',
     call('missing'),
-    call() + '[TOOL_CALL]{"name":"exec_command","arguments":{',
+    call() + '```codex_tool_call\n{"name":"exec_command","arguments":{',
 ])
 def test_invalid_reply_never_becomes_a_completed_text_answer(raw):
     processor = ToolStreamProcessor(tools('exec_command'))
@@ -61,33 +61,34 @@ def test_internal_planning_is_held_back_even_when_split_one_character_at_a_time(
         processor.finalize()
 
 
-def test_incomplete_closing_tag_can_still_recover_complete_json():
-    parsed = parse_assistant_output(call().removesuffix('[/TOOL_CALL]'), tools('exec_command'))
-    assert len(parsed.tool_calls) == 1
+def test_incomplete_closing_fence_is_rejected():
+    with pytest.raises(ToolProtocolError):
+        parse_assistant_output(call().removesuffix('\n```\n'), tools('exec_command'))
 
 
 @pytest.mark.parametrize('stream', [False, True])
-@pytest.mark.parametrize('bad', ['Thinking Process:\ninternal draft only', '思考过程：\ninternal draft only', '[TOOL_CALL]{"name":"exec_command","arguments":{'])
-def test_bad_reply_is_repaired_once_without_exposing_it(stream, bad):
-    request_tools = [{'type': 'function', 'name': 'exec_command', 'parameters': {'type': 'object'}}]
-    with browser([bad, call()]) as (client, commands):
-        result = client.post('/v1/responses', json={'input':'check', 'tools':request_tools, 'stream':stream})
-        response = packets(result.text)[-1]['response'] if stream else result.json()
-        assert response['status'] == 'completed'
-        assert response['output'][0]['type'] == 'function_call'
-        assert json.loads(response['output'][0]['arguments']) == {'cmd':'printf verified'}
+@pytest.mark.parametrize('bad', ['Thinking Process:\ninternal draft only', '思考过程：\ninternal draft only', '```codex_tool_call\n{"name":"exec_command","arguments":{'])
+def test_bad_reply_fails_once_without_resubmission_or_exposure(stream, bad):
+    request_tools = [{'type':'function','name':'exec_command','parameters':{'type':'object'}}]
+    with browser([bad]) as (client,commands):
+        result=client.post('/v1/responses',json={'input':'check','tools':request_tools,'stream':stream})
+        if stream:
+            events=packets(result.text)
+            assert events[-1]['type']=='response.failed'
+            assert not any(e['type']=='response.completed' for e in events)
+        else:
+            assert result.status_code==502
         assert 'internal draft only' not in result.text
-        assert len(commands) == 2 and not commands[-1]['reset_chat']
-        assert 'No tool from that reply was executed' in commands[-1]['prompt']
+        assert len(commands)==1
 
 
 def test_repeated_invalid_output_fails_without_fake_completion():
-    with browser(['[TOOL_CALL]{', '[TOOL_CALL]{']) as (client, commands):
+    with browser(['```codex_tool_call\n{']) as (client, commands):
         events = packets(client.post('/v1/responses', json={'input':'check', 'stream':True,
             'tools':[{'type':'function', 'name':'exec_command', 'parameters':{'type':'object'}}]}).text)
         assert events[-1]['type'] == 'response.failed'
         assert not any(e['type']=='response.completed' for e in events)
-        assert len(commands) == 2
+        assert len(commands) == 1
 
 
 def test_missing_browser_reply_chunk_is_explicit_failure():

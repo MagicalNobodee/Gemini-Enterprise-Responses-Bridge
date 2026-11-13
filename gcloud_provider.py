@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import shutil
 import subprocess
@@ -13,7 +12,6 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Sequence
 import httpx
 
 from config import BridgeSettings
-from multimodal import NormalizedAttachment
 from schemas import ChatMessage
 from tool_calling import (
     build_response_format_instructions,
@@ -81,65 +79,6 @@ class GCloudVertexProvider:
                 last_err = str(exc)
         raise GCloudUpstreamError(f"无法从 gcloud 获取访问令牌: {last_err or '未知错误'}")
 
-    @staticmethod
-    def _is_vertex_native_binary_mime(mime_type: str) -> bool:
-        mime = (mime_type or "").strip().lower()
-        if mime.startswith("image/") and mime != "image/svg+xml":
-            return True
-        if mime.startswith("audio/") or mime.startswith("video/"):
-            return True
-        if mime == "application/pdf":
-            return True
-        return False
-
-    async def _attachment_to_vertex_part(self, att: NormalizedAttachment) -> Dict[str, Any]:
-        """Convert a NormalizedAttachment into a Vertex AI Gemini part (`fileData`, `inlineData`, or `text`)."""
-        src_url = (att.source_url or "").strip()
-        if src_url.lower().startswith("gs://"):
-            return {
-                "fileData": {
-                    "mimeType": att.mime_type or "application/octet-stream",
-                    "fileUri": src_url,
-                }
-            }
-        try:
-            raw_bytes = await att.async_resolve_bytes(timeout=min(self.settings.request_timeout_seconds, 45.0))
-        except Exception as exc:
-            raise GCloudUpstreamError(f"无法读取或下载多模态附件 '{att.filename}': {exc}") from exc
-
-        mime = att.mime_type or "application/octet-stream"
-        if self._is_vertex_native_binary_mime(mime):
-            return {
-                "inlineData": {
-                    "mimeType": mime,
-                    "data": base64.b64encode(raw_bytes).decode("ascii"),
-                }
-            }
-
-        extracted = att.extract_text_fallback()
-        if extracted is not None:
-            return {
-                "text": f"[Attached File: {att.filename} ({mime})]\n{extracted}\n[/Attached File]"
-            }
-
-        return {
-            "text": f"[Attached Binary File: {att.filename} ({mime}, {len(raw_bytes)} bytes)]"
-        }
-
-    async def _attachment_to_discovery_text(self, att: NormalizedAttachment) -> str:
-        """Format an attachment for Discovery Engine `streamAssist` text query."""
-        src_url = (att.source_url or "").strip()
-        if src_url.lower().startswith("gs://"):
-            return f"[Attached GCS File: {att.filename} ({att.mime_type}) uri={src_url}]"
-        try:
-            raw_bytes = await att.async_resolve_bytes(timeout=min(self.settings.request_timeout_seconds, 45.0))
-        except Exception as exc:
-            raise GCloudUpstreamError(f"无法读取或下载多模态附件 '{att.filename}': {exc}") from exc
-        extracted = att.extract_text_fallback()
-        if extracted is not None:
-            return f"[Attached File: {att.filename} ({att.mime_type})]\n{extracted}\n[/Attached File]"
-        return f"[Attached File: {att.filename} ({att.mime_type}, {len(raw_bytes)} bytes)]"
-
     async def stream_chat(
         self,
         messages: Sequence[ChatMessage],
@@ -149,7 +88,6 @@ class GCloudVertexProvider:
         tool_choice: Optional[Any] = None,
         parallel_tool_calls: Optional[bool] = True,
         response_format: Optional[Dict[str, Any]] = None,
-        attachments: Optional[Sequence[NormalizedAttachment]] = None,
     ) -> AsyncIterator[str]:
         if not self.is_configured():
             raise GCloudUpstreamError(
@@ -165,7 +103,6 @@ class GCloudVertexProvider:
                 tool_choice=tool_choice,
                 parallel_tool_calls=parallel_tool_calls,
                 response_format=response_format,
-                attachments=attachments,
             ):
                 yield chunk
             return
@@ -179,7 +116,6 @@ class GCloudVertexProvider:
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,
             response_format=response_format,
-            attachments=attachments,
         ):
             yield chunk
 
@@ -192,7 +128,6 @@ class GCloudVertexProvider:
         tool_choice: Optional[Any] = None,
         parallel_tool_calls: Optional[bool] = True,
         response_format: Optional[Dict[str, Any]] = None,
-        attachments: Optional[Sequence[NormalizedAttachment]] = None,
     ) -> str:
         parts: List[str] = []
         async for chunk in self.stream_chat(
@@ -203,7 +138,6 @@ class GCloudVertexProvider:
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,
             response_format=response_format,
-            attachments=attachments,
         ):
             parts.append(chunk)
         return "".join(parts).strip()
@@ -216,7 +150,6 @@ class GCloudVertexProvider:
         tool_choice: Optional[Any] = None,
         parallel_tool_calls: Optional[bool] = True,
         response_format: Optional[Dict[str, Any]] = None,
-        attachments: Optional[Sequence[NormalizedAttachment]] = None,
     ) -> AsyncIterator[str]:
         """Call Vertex AI Search / Agentspace Discovery Engine streamAssist API."""
         loc = self.settings.gcp_location
@@ -247,31 +180,23 @@ class GCloudVertexProvider:
         for msg in messages:
             role = (msg.role or "user").lower()
             txt = msg.text_content().strip()
-            msg_atts = msg.extract_attachments()
-            att_blocks = [await self._attachment_to_discovery_text(att) for att in msg_atts]
-            combined_txt = "\n\n".join([b for b in [*att_blocks, txt] if b]).strip()
-            if role in {"system", "developer"} and combined_txt:
-                query_blocks.append(f"[System Instructions]\n{combined_txt}")
+            if role in {"system", "developer"} and txt:
+                query_blocks.append(f"[System Instructions]\n{txt}")
             elif role == "assistant":
                 tcs = msg.normalized_tool_calls()
                 for tc in tcs:
                     if tc.get("id") and (tc.get("function") or {}).get("name"):
                         call_names[str(tc["id"])] = str(tc["function"]["name"])
-                asst_txt = format_assistant_history_entry(combined_txt, tcs) if tcs else combined_txt
+                asst_txt = format_assistant_history_entry(txt, tcs) if tcs else txt
                 if asst_txt:
                     query_blocks.append(f"Assistant: {asst_txt}")
             elif role in {"tool", "function"}:
                 rname = msg.name or (call_names.get(msg.tool_call_id) if msg.tool_call_id else None)
                 query_blocks.append(
-                    format_tool_result_entry(combined_txt, tool_call_id=msg.tool_call_id, name=rname)
+                    format_tool_result_entry(txt, tool_call_id=msg.tool_call_id, name=rname)
                 )
-            elif combined_txt:
-                query_blocks.append(f"User: {combined_txt}")
-
-        if attachments:
-            extra_blocks = [await self._attachment_to_discovery_text(att) for att in attachments]
-            if extra_blocks:
-                query_blocks.append("User:\n" + "\n\n".join(extra_blocks))
+            elif txt:
+                query_blocks.append(f"User: {txt}")
 
         reminder = build_tool_delta_reminder(
             norm_tools,
@@ -317,7 +242,6 @@ class GCloudVertexProvider:
         tool_choice: Optional[Any] = None,
         parallel_tool_calls: Optional[bool] = True,
         response_format: Optional[Dict[str, Any]] = None,
-        attachments: Optional[Sequence[NormalizedAttachment]] = None,
     ) -> AsyncIterator[str]:
         """Call Vertex AI Gemini streamGenerateContent SSE endpoint."""
         loc = self.settings.gcp_vertex_location
@@ -333,30 +257,18 @@ class GCloudVertexProvider:
         contents: List[Dict[str, Any]] = []
         call_names: Dict[str, str] = {}
 
-        def _append_vertex_parts(vertex_role: str, new_parts: Sequence[Dict[str, Any]]) -> None:
-            clean_parts = [p for p in new_parts if p]
-            if not clean_parts:
+        def _append_vertex_turn(vertex_role: str, part_text: str) -> None:
+            if not part_text:
                 return
             if contents and contents[-1]["role"] == vertex_role:
-                contents[-1]["parts"].extend(clean_parts)
+                contents[-1]["parts"].append({"text": part_text})
             else:
-                contents.append({"role": vertex_role, "parts": list(clean_parts)})
-
-        def _append_vertex_turn(vertex_role: str, part_text: str) -> None:
-            if part_text:
-                _append_vertex_parts(vertex_role, [{"text": part_text}])
+                contents.append({"role": vertex_role, "parts": [{"text": part_text}]})
 
         for msg in messages:
             role = (msg.role or "user").lower()
             text = msg.text_content().strip()
-            msg_atts = msg.extract_attachments()
             if role in {"system", "developer"}:
-                for att in msg_atts:
-                    extracted = att.extract_text_fallback()
-                    if extracted:
-                        system_texts.append(
-                            f"[Attached System File: {att.filename} ({att.mime_type})]\n{extracted}\n[/Attached System File]"
-                        )
                 if text:
                     system_texts.append(text)
             elif role == "assistant":
@@ -368,21 +280,12 @@ class GCloudVertexProvider:
                 _append_vertex_turn("model", asst_text)
             elif role in {"tool", "function"}:
                 rname = msg.name or (call_names.get(msg.tool_call_id) if msg.tool_call_id else None)
-                att_parts = [await self._attachment_to_vertex_part(att) for att in msg_atts]
                 tool_block = format_tool_result_entry(
                     text, tool_call_id=msg.tool_call_id, name=rname
                 )
-                _append_vertex_parts("user", [*att_parts, {"text": tool_block}])
+                _append_vertex_turn("user", tool_block)
             else:
-                att_parts = [await self._attachment_to_vertex_part(att) for att in msg_atts]
-                turn_parts: List[Dict[str, Any]] = list(att_parts)
-                if text:
-                    turn_parts.append({"text": text})
-                _append_vertex_parts("user", turn_parts)
-
-        if attachments:
-            extra_parts = [await self._attachment_to_vertex_part(att) for att in attachments]
-            _append_vertex_parts("user", extra_parts)
+                _append_vertex_turn("user", text)
 
         tool_sys = build_tool_system_instructions(
             norm_tools, tool_choice=tool_choice, parallel_tool_calls=parallel_tool_calls

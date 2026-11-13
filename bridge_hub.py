@@ -3,24 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
-import hashlib
-from pathlib import Path
 import logging
 import re
-import secrets
 import time
-import urllib.parse
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Sequence, Set
 
 from fastapi import WebSocket
-
-from multimodal import NormalizedAttachment
-from updater import compare_semver, normalize_version
-from version import APP_VERSION
 
 logger = logging.getLogger("gemini_bridge.hub")
 
@@ -108,9 +99,6 @@ class BrowserClientState:
     driver_mode: str = "auto"
     captured_rpc: bool = False
     active_model: str = ""
-    extension_version: str = ""
-    notified_reload_for_version: str = ""
-    warned_outdated_backend_for: str = ""
     completed_requests: int = 0
     capabilities: Set[str] = field(default_factory=set)
     client_max_parallel_tabs: Optional[int] = None
@@ -138,7 +126,6 @@ class BrowserClientState:
             "driver_mode": self.driver_mode,
             "captured_rpc": self.captured_rpc,
             "active_model": self.active_model,
-            "extension_version": self.extension_version,
             "completed_requests": self.completed_requests,
             "capabilities": sorted(self.capabilities),
         }
@@ -163,19 +150,6 @@ class InFlightRequest:
 
 PROMPT_CHUNK_THRESHOLD = 32768
 PROMPT_CHUNK_SIZE = 24576
-ATTACHMENT_STAGE_TTL_SECONDS = 900.0
-
-
-@dataclass
-class StagedAttachment:
-    attachment_id: str
-    token: str
-    filename: str
-    mime_type: str
-    data: bytes
-    sha256: str
-    created_at: float = field(default_factory=time.time)
-    expires_at: float = 0.0
 
 
 class BrowserBridgeHub:
@@ -188,30 +162,32 @@ class BrowserBridgeHub:
         max_parallel_tabs: int = 6,
         auto_spawn_tabs: bool = True,
         session_affinity_ttl_seconds: float = 300.0,
-        backend_version: str = APP_VERSION,
     ) -> None:
         self.include_citations = include_citations
         self.callback_base_url = callback_base_url.rstrip("/")
         self.max_parallel_tabs = max(1, max_parallel_tabs)
         self.auto_spawn_tabs = auto_spawn_tabs
         self.session_affinity_ttl_seconds = max(0.0, session_affinity_ttl_seconds)
-        self.backend_version = normalize_version(backend_version) or APP_VERSION
+
         self._clients: Dict[str, BrowserClientState] = {}
         self._slots: Dict[str, WorkerSlot] = {}
         self._session_affinity: Dict[str, str] = {}  # explicit_session_id -> slot_key
         self._pending: Dict[str, InFlightRequest] = {}
         self._pending_spawns: Dict[str, asyncio.Future[Dict[str, Any]]] = {}
-        self._staged_attachments: Dict[str, StagedAttachment] = {}
+        self._pending_resets: Dict[str, asyncio.Future[Dict[str, Any]]] = {}
         self._routing_lock = asyncio.Lock()
         self._parallel_limit = asyncio.Semaphore(self.max_parallel_tabs)
+
         self._total_requests = 0
         self._total_errors = 0
         self._recent_logs: List[Dict[str, Any]] = []
-        self.usage_snapshot_provider: Optional[Callable[[], Dict[str, Any]]] = None
         self.on_slot_removed: Optional[Callable[[str], None]] = None
         self.on_slot_migrated: Optional[Callable[[str, str], None]] = None
-        self.on_extension_version_reported: Optional[Callable[[str], Any]] = None
-        self.on_outdated_extension_detected: Optional[Callable[[str], Any]] = None
+
+    def record_reply_error(self, slot: WorkerSlot, message: str) -> None:
+        """A transport-complete reply can still be rejected by the tool protocol."""
+        self._total_errors += 1
+        self.add_log("error", message, slot.client_id)
 
     def add_log(self, level: str, message: str, client_id: Optional[str] = None) -> None:
         entry = {
@@ -384,7 +360,6 @@ class BrowserBridgeHub:
             driver_mode=prev.driver_mode if prev else "auto",
             captured_rpc=prev.captured_rpc if prev else False,
             active_model=prev.active_model if prev else "",
-            extension_version=prev.extension_version if prev else "",
             capabilities=set(prev.capabilities) if prev else set(),
             client_max_parallel_tabs=prev.client_max_parallel_tabs if prev else None,
         )
@@ -395,38 +370,17 @@ class BrowserBridgeHub:
             except Exception:
                 pass
         self.add_log("info", f"Extension WebSocket connected ({cid})", cid)
-        welcome_payload: Dict[str, Any] = {
-            "type": "welcome",
-            "client_id": cid,
-            "server_time": int(time.time()),
-            "backend_version": self.backend_version,
-            "max_parallel_tabs": self.max_parallel_tabs,
-            "auto_spawn_tabs": self.auto_spawn_tabs,
-        }
-        if self.usage_snapshot_provider is not None:
-            try:
-                welcome_payload["usage_snapshot"] = self.usage_snapshot_provider()
-            except Exception:
-                pass
-        await self._safe_ws_send(state, welcome_payload)
+        await self._safe_ws_send(
+            state,
+            {
+                "type": "welcome",
+                "client_id": cid,
+                "server_time": int(time.time()),
+                "max_parallel_tabs": self.max_parallel_tabs,
+                "auto_spawn_tabs": self.auto_spawn_tabs,
+            },
+        )
         return state
-
-    async def broadcast_ws_event(
-        self,
-        payload: Dict[str, Any],
-        required_capability: Optional[str] = "usage_push",
-    ) -> None:
-        """Broadcast a JSON event frame (such as `usage_update`) to live WebSocket clients opting in."""
-        now = time.time()
-        targets = [
-            c
-            for c in list(self._clients.values())
-            if c.transport == "websocket"
-            and c.is_alive(now)
-            and (not required_capability or required_capability in c.capabilities)
-        ]
-        for client in targets:
-            await self._safe_ws_send(client, payload)
 
     def unregister_client(
         self,
@@ -557,27 +511,13 @@ class BrowserBridgeHub:
     def status_snapshot(self) -> Dict[str, Any]:
         self._prune_stale_http_clients()
         now = time.time()
-        alive_states = [c for c in self._clients.values() if c.is_alive(now)]
-        clients = [c.to_public_dict() for c in alive_states]
+        clients = [c.to_public_dict() for c in self._clients.values() if c.is_alive(now)]
         slots = self._get_alive_ready_slots()
         active = self.select_active_client()
         busy_slots = sum(1 for s in slots if s.is_busy)
         waiting_total = sum(s.waiting_count for s in slots)
-        connected_ext_ver = ""
-        for st in alive_states:
-            if st.extension_version and (
-                not connected_ext_ver
-                or compare_semver(st.extension_version, connected_ext_ver) > 0
-            ):
-                connected_ext_ver = st.extension_version
-        backend_update_required = bool(
-            connected_ext_ver and compare_semver(connected_ext_ver, self.backend_version) > 0
-        )
         return {
             "browser_connected": len(slots) > 0 or active is not None,
-            "backend_version": self.backend_version,
-            "connected_extension_version": connected_ext_ver,
-            "backend_update_required": backend_update_required,
             "active_client": active.to_public_dict() if active else None,
             "clients": clients,
             "worker_slots": [s.to_public_dict() for s in slots],
@@ -612,40 +552,20 @@ class BrowserBridgeHub:
                 fut.set_result(data)
             return None
 
+        if msg_type == "reset_tab_result":
+            reset_id = str(data.get("reset_id") or "")
+            fut = self._pending_resets.get(reset_id)
+            if fut is not None and not fut.done():
+                fut.set_result(data)
+            return None
+
+        if msg_type == "reload_extension_ack":
+            return None
+
         if msg_type in {"hello", "tab_status", "heartbeat"}:
-            reported_ext_ver = normalize_version(str(data.get("extension_version") or ""))
-            emit_ext_reload = False
-            backend_outdated_flag = False
             if state is not None:
                 if isinstance(data.get("capabilities"), list):
                     state.capabilities = {str(x) for x in data["capabilities"] if x}
-                if reported_ext_ver:
-                    state.extension_version = reported_ext_ver
-                    if self.on_extension_version_reported is not None:
-                        try:
-                            self.on_extension_version_reported(reported_ext_ver)
-                        except Exception:
-                            pass
-                    cmp_ver = compare_semver(reported_ext_ver, self.backend_version)
-                    if cmp_ver > 0:
-                        backend_outdated_flag = True
-                        if state.warned_outdated_backend_for != reported_ext_ver:
-                            state.warned_outdated_backend_for = reported_ext_ver
-                            self.add_log(
-                                "warn",
-                                f"浏览器插件已升级至 v{reported_ext_ver}（当前后端 v{self.backend_version}）— 请更新后端",
-                                client_id,
-                            )
-                    elif cmp_ver < 0:
-                        if self.on_outdated_extension_detected is not None:
-                            try:
-                                self.on_outdated_extension_detected(reported_ext_ver)
-                            except Exception:
-                                pass
-                        target_combo = f"{reported_ext_ver}->{self.backend_version}"
-                        if state.notified_reload_for_version != target_combo:
-                            state.notified_reload_for_version = target_combo
-                            emit_ext_reload = True
                 if data.get("max_parallel_tabs") is not None:
                     try:
                         state.client_max_parallel_tabs = max(1, int(data["max_parallel_tabs"]))
@@ -685,21 +605,9 @@ class BrowserBridgeHub:
                     else:
                         self._sync_client_tabs(client_id, [])
 
-            resp_frame: Dict[str, Any] = {
-                "type": "pong" if msg_type == "heartbeat" else "ack",
-                "server_time": int(time.time()),
-                "backend_version": self.backend_version,
-            }
-            if backend_outdated_flag:
-                resp_frame["backend_update_required"] = True
-            if emit_ext_reload:
-                resp_frame["_emit_extension_reload"] = self.backend_version
-            if self.usage_snapshot_provider is not None:
-                try:
-                    resp_frame["usage_snapshot"] = self.usage_snapshot_provider()
-                except Exception:
-                    pass
-            return resp_frame
+            if msg_type == "heartbeat":
+                return {"type": "pong", "server_time": int(time.time())}
+            return {"type": "ack", "server_time": int(time.time())}
 
         if msg_type == "log":
             self.add_log(
@@ -716,6 +624,7 @@ class BrowserBridgeHub:
         inflight = self._pending.get(req_id)
         if inflight is None:
             return None
+
         if inflight.client_id != client_id:
             return None
         if data.get("tab_id") is not None:
@@ -887,6 +796,73 @@ class BrowserBridgeHub:
         )
         self.add_log("info", f"Parallel worker tab #{slot.tab_id} ready ({slot.slot_key})", client.client_id)
         return slot
+
+    async def reset_worker_slot(self, slot_key: str) -> Dict[str, Any]:
+        """Reset a single idle worker slot to a fresh conversation without disturbing busy slots."""
+        slot = self._slots.get(slot_key)
+        if slot is None:
+            raise KeyError("未找到指定的工作席位")
+        if slot.is_busy:
+            raise RuntimeError("该工作席位正在回答中，请等待本轮回复完成后再开启新对话")
+
+        slot.pinned_session_id = None
+        slot.pending_tool_call_until = 0.0
+        slot.tab_title = "Gemini Enterprise"
+        for sid, mapped in list(self._session_affinity.items()):
+            if mapped == slot_key:
+                self._session_affinity.pop(sid, None)
+
+        in_tab_reset = False
+        client = self._clients.get(slot.client_id)
+        now = time.time()
+        if (
+            client is not None
+            and client.transport == "websocket"
+            and client.is_alive(now)
+            and slot.tab_id is not None
+            and "reset_tab" in client.capabilities
+        ):
+            reset_id = f"rst-{uuid.uuid4().hex[:10]}"
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future[Dict[str, Any]] = loop.create_future()
+            self._pending_resets[reset_id] = fut
+            sent = await self._safe_ws_send(
+                client,
+                {
+                    "type": "reset_tab",
+                    "reset_id": reset_id,
+                    "tab_id": slot.tab_id,
+                },
+            )
+            if sent:
+                try:
+                    res = await asyncio.wait_for(fut, timeout=14.0)
+                    in_tab_reset = bool(isinstance(res, dict) and res.get("ok"))
+                except asyncio.TimeoutError:
+                    in_tab_reset = False
+                finally:
+                    self._pending_resets.pop(reset_id, None)
+            else:
+                self._pending_resets.pop(reset_id, None)
+
+        label = f"#{slot.tab_id}" if slot.tab_id is not None else slot_key
+        self.add_log("info", f"工作席位 {label} 已重置为新对话", slot.client_id)
+        return {
+            "ok": True,
+            "slot_key": slot_key,
+            "tab_id": slot.tab_id,
+            "in_tab_reset": in_tab_reset,
+        }
+
+    async def reload_connected_extensions(self) -> Dict[str, Any]:
+        if self._pending:
+            raise RuntimeError("当前仍有请求正在执行，请等待空闲后再重载扩展。")
+        reloaded: List[str] = []
+        for cid, client in list(self._clients.items()):
+            if client.transport == "websocket" and client.websocket is not None:
+                if await self._safe_ws_send(client, {"type": "reload_extension"}):
+                    reloaded.append(cid)
+        return {"ok": len(reloaded) > 0, "reloaded_clients": reloaded}
 
     def get_affinity_slot_key(self, explicit_session_id: Optional[str]) -> Optional[str]:
         if not explicit_session_id:
@@ -1084,106 +1060,9 @@ class BrowserBridgeHub:
         return ranked[0]
 
     # ------------------------------------------------------------------
-    # Multimodal Attachment Staging (Token-Guarded Local Binary Store)
-    # ------------------------------------------------------------------
-    def prune_expired_attachments(self) -> None:
-        now = time.time()
-        for att_id, item in list(self._staged_attachments.items()):
-            if item.expires_at <= now:
-                self._staged_attachments.pop(att_id, None)
-
-    async def stage_attachments(
-        self,
-        attachments: Sequence[Any],
-        ttl_seconds: float = ATTACHMENT_STAGE_TTL_SECONDS,
-    ) -> List[Dict[str, Any]]:
-        self.prune_expired_attachments()
-        if not attachments:
-            return []
-        now = time.time()
-        expires_at = now + max(60.0, ttl_seconds)
-        staged_list: List[Dict[str, Any]] = []
-        for att in attachments:
-            if isinstance(att, dict):
-                fname = str(att.get("name") or att.get("filename") or "attachment.bin")
-                mime = str(att.get("mime_type") or "application/octet-stream")
-                cat = str(att.get("category") or att.get("kind") or att.get("media_kind") or "file")
-                data_url = str(att.get("data_url") or "")
-                if data_url and "," in data_url:
-                    raw_bytes = base64.b64decode(data_url.split(",", 1)[1])
-                elif att.get("_path") and Path(str(att["_path"])).is_file():
-                    raw_bytes = Path(str(att["_path"])).read_bytes()
-                else:
-                    raw_bytes = b""
-                sha = hashlib.sha256(raw_bytes).hexdigest()
-            else:
-                try:
-                    raw_bytes = await att.async_resolve_bytes()
-                except Exception as exc:
-                    raise BridgeExecutionError(f"无法读取或下载多模态附件 '{att.filename}': {exc}") from exc
-                fname = att.filename
-                mime = att.mime_type
-                cat = att.kind
-                sha = att.sha256
-                data_url = (
-                    f"data:{mime};base64,{base64.b64encode(raw_bytes).decode('ascii')}"
-                    if len(raw_bytes) <= 1024 * 1024
-                    else ""
-                )
-            att_id = uuid.uuid4().hex
-            token = secrets.token_urlsafe(24)
-            record = StagedAttachment(
-                attachment_id=att_id,
-                token=token,
-                filename=fname,
-                mime_type=mime,
-                data=raw_bytes,
-                sha256=sha,
-                created_at=now,
-                expires_at=expires_at,
-            )
-            self._staged_attachments[att_id] = record
-            rel_path = f"/api/bridge/attachments/{att_id}?token={urllib.parse.quote(token, safe='')}"
-            full_url = f"{self.callback_base_url}{rel_path}" if self.callback_base_url else rel_path
-            entry: Dict[str, Any] = {
-                "id": att_id,
-                "name": fname,
-                "filename": fname,
-                "mime_type": mime,
-                "category": cat,
-                "kind": cat,
-                "media_kind": cat,
-                "size_bytes": len(raw_bytes),
-                "sha256": sha,
-                "url": full_url,
-                "path": rel_path,
-            }
-            if data_url:
-                entry["data_url"] = data_url
-            if isinstance(att, dict):
-                if "file_id" in att:
-                    entry["file_id"] = att["file_id"]
-                if "fetch_url" in att:
-                    entry["fetch_url"] = att["fetch_url"]
-            staged_list.append(entry)
-        return staged_list
-
-    def verify_staged_attachment(self, attachment_id: str, token: str) -> tuple[Optional[StagedAttachment], str]:
-        self.prune_expired_attachments()
-        item = self._staged_attachments.get(attachment_id)
-        if item is None:
-            return None, "not_found"
-        if not token or not secrets.compare_digest(item.token, token):
-            return None, "forbidden"
-        return item, "ok"
-
-    def get_staged_attachment(self, attachment_id: str, token: str) -> Optional[StagedAttachment]:
-        item, _ = self.verify_staged_attachment(attachment_id, token)
-        return item
-
-    # ------------------------------------------------------------------
     # Prompt Dispatch & Streaming Pipeline (Per-Slot Parallel Execution)
     # ------------------------------------------------------------------
+
     async def dispatch_stream_on_slot(
         self,
         slot: WorkerSlot,
@@ -1192,7 +1071,7 @@ class BrowserBridgeHub:
         reset_chat: bool = False,
         suppress_citations: bool = False,
         request_timeout: float = 600.0,
-        attachments: Optional[Sequence[Any]] = None,
+        attachments: Optional[List[Dict[str, Any]]] = None,
         image_generation: bool = False,
         video_generation: bool = False,
         output_images: Optional[List[Dict[str, Any]]] = None,
@@ -1209,16 +1088,8 @@ class BrowserBridgeHub:
 
         slot.in_flight_request_id = req_id
         completed_normally = False
-        staged_ids: List[str] = []
 
         try:
-            staged_attachments = (
-                await self.stage_attachments(attachments, ttl_seconds=max(request_timeout, ATTACHMENT_STAGE_TTL_SECONDS))
-                if attachments
-                else []
-            )
-            staged_ids = [item["id"] for item in staged_attachments]
-
             inflight = InFlightRequest(
                 request_id=req_id,
                 client_id=client.client_id,
@@ -1278,7 +1149,7 @@ class BrowserBridgeHub:
                     "timeout_ms": int(request_timeout * 1000),
                     "callback_url": callback_url,
                 }
-            command["attachments"] = staged_attachments
+            command["attachments"] = attachments or []
             command["image_generation"] = image_generation
             command["video_generation"] = video_generation
             if slot.tab_id is not None:
@@ -1303,6 +1174,7 @@ class BrowserBridgeHub:
                         timeout=min(remaining, 15.0),
                     )
                 except asyncio.TimeoutError:
+                    # Yield empty string heartbeat so SSE streams can emit `: keepalive` comments
                     yield ""
                     continue
 
@@ -1322,12 +1194,10 @@ class BrowserBridgeHub:
                         emitted_parts.append(delta)
                         yield delta
                     deadline = max(deadline, time.monotonic() + sliding_window)
-
                 elif ev_type == "error":
                     raise BridgeExecutionError(str(event.get("message") or "网页端执行失败"))
 
                 elif ev_type == "done":
-                    completed_normally = True
                     if output_images is not None:
                         output_images.extend(event.get("output_images") or [])
                     if output_files is not None:
@@ -1342,24 +1212,28 @@ class BrowserBridgeHub:
                         tail = final_reply[len(emitted_so_far) :]
                         if tail:
                             yield tail
-                    elif final_reply and final_reply != emitted_so_far:
+                    elif final_reply != emitted_so_far:
+                        common = 0
+                        for left, right in zip(emitted_so_far, final_reply):
+                            if left != right:
+                                break
+                            common += 1
+                        self._total_errors += 1
+                        self.add_log("error", f"Reply integrity request={req_id[:8]} source={event.get('source')} streamed={len(emitted_so_far)} final={len(final_reply)} common_prefix={common}", client.client_id)
                         raise BridgeExecutionError("网页最终回复与已接收内容不一致，未将截断内容标为完成。")
 
+                    completed_normally = True
+                    self.add_log("info", f"Reply complete request={req_id[:8]} source={event.get('source')} streamed={len(emitted_so_far)} final={len(final_reply)}", client.client_id)
                     citations = event.get("citations") or []
                     if self.include_citations and not suppress_citations and citations:
                         formatted_refs = self._format_citations(citations, final_reply or emitted_so_far)
                         if formatted_refs:
                             yield formatted_refs
                     break
+
         finally:
             self._pending.pop(req_id, None)
             slot.in_flight_request_id = None
-            grace_exp = time.time() + 45.0
-            for sid in staged_ids:
-                st = self._staged_attachments.get(sid)
-                if st is not None:
-                    st.expires_at = min(st.expires_at, grace_exp)
-            self.prune_expired_attachments()
             if not completed_normally and client is not None:
                 await self._send_cancel_safely(client, req_id, tab_id=slot.tab_id)
 
@@ -1371,7 +1245,7 @@ class BrowserBridgeHub:
         reset_chat: bool = False,
         suppress_citations: bool = False,
         request_timeout: float = 600.0,
-        attachments: Optional[Sequence[Any]] = None,
+        attachments: Optional[List[Dict[str, Any]]] = None,
         image_generation: bool = False,
         video_generation: bool = False,
         output_images: Optional[List[Dict[str, Any]]] = None,
@@ -1405,7 +1279,6 @@ class BrowserBridgeHub:
         queue_timeout: float = 300.0,
         explicit_session_id: Optional[str] = None,
         matching_slot_keys: Optional[Sequence[str]] = None,
-        attachments: Optional[Sequence[NormalizedAttachment]] = None,
     ) -> AsyncIterator[str]:
         """Acquire a parallel worker slot and stream chunks."""
         async with self.acquire_slot(
@@ -1420,7 +1293,6 @@ class BrowserBridgeHub:
                 reset_chat=reset_chat,
                 suppress_citations=suppress_citations,
                 request_timeout=request_timeout,
-                attachments=attachments,
             ):
                 yield delta
 
@@ -1434,7 +1306,6 @@ class BrowserBridgeHub:
         queue_timeout: float = 300.0,
         explicit_session_id: Optional[str] = None,
         matching_slot_keys: Optional[Sequence[str]] = None,
-        attachments: Optional[Sequence[NormalizedAttachment]] = None,
     ) -> str:
         chunks: List[str] = []
         async for delta in self.dispatch_stream(
@@ -1446,7 +1317,6 @@ class BrowserBridgeHub:
             queue_timeout=queue_timeout,
             explicit_session_id=explicit_session_id,
             matching_slot_keys=matching_slot_keys,
-            attachments=attachments,
         ):
             if delta:
                 chunks.append(delta)

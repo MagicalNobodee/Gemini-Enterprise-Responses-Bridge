@@ -7,8 +7,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
 
-from version import DEFAULT_GITHUB_REPO
-
 
 def _load_dotenv_file(dotenv_path: Path) -> None:
     """Load key=value pairs from .env without failing if python-dotenv is absent."""
@@ -79,14 +77,12 @@ class BridgeSettings:
     include_citations: bool = True
     cors_allow_origins: List[str] = field(default_factory=lambda: ["*"])
     auto_export_extension: bool = True
-    auto_update: bool = True
-    github_repo: str = DEFAULT_GITHUB_REPO
-    github_token: str = ""
-    usage_stats_path: str = ""
-    usd_to_cny_rate: float = 6.8
     generated_dir: str = ""
     response_store_dir: str = ""
     response_store_ttl_seconds: float = 86400.0
+    usage_ledger_path: str = ""
+    usd_to_cny_rate: float = 6.8
+    price_overrides_json: str = ""
 
     # Optional Option-1 (Official GCloud CLI / Vertex AI / Discovery Engine) settings
     gcp_project_id: str = ""
@@ -132,22 +128,17 @@ class BridgeSettings:
             include_citations=_env_bool("BRIDGE_INCLUDE_CITATIONS", True),
             cors_allow_origins=origins,
             auto_export_extension=_env_bool("BRIDGE_AUTO_EXPORT_EXTENSION", True),
-            auto_update=_env_bool("BRIDGE_AUTO_UPDATE", True),
-            github_repo=os.getenv("BRIDGE_GITHUB_REPO", DEFAULT_GITHUB_REPO).strip().strip("/")
-            or DEFAULT_GITHUB_REPO,
-            github_token=(
-                os.getenv("BRIDGE_GITHUB_TOKEN", "").strip()
-                or os.getenv("GITHUB_TOKEN", "").strip()
-            ),
-            usage_stats_path=os.getenv("BRIDGE_USAGE_STATS_PATH", "").strip(),
-            usd_to_cny_rate=_env_float("BRIDGE_USD_TO_CNY_RATE", 6.8),
-            generated_dir=os.getenv("BRIDGE_GENERATED_DIR", "").strip(),
             response_store_dir=os.getenv(
                 "BRIDGE_RESPONSE_STORE_DIR", str(root / ".cache" / "response_store")
             ).strip(),
             response_store_ttl_seconds=max(
                 60.0, _env_float("BRIDGE_RESPONSE_STORE_TTL", 86400.0)
             ),
+            usage_ledger_path=os.getenv(
+                "BRIDGE_USAGE_LEDGER_PATH", str(root / ".cache" / "usage_ledger.json")
+            ).strip(),
+            usd_to_cny_rate=_env_float("BRIDGE_USD_TO_CNY_RATE", 6.8),
+            price_overrides_json=os.getenv("BRIDGE_PRICE_OVERRIDES_JSON", "").strip(),
             gcp_project_id=os.getenv("GCP_PROJECT_ID", "").strip(),
             gcp_location=os.getenv("GCP_LOCATION", "global").strip() or "global",
             gcp_vertex_location=os.getenv("GCP_VERTEX_LOCATION", "us-central1").strip()

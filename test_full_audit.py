@@ -14,16 +14,14 @@ TOOLS = [{'type': 'function', 'function': {'name': 'functions.exec_command', 'pa
 
 
 def call(cmd='verified'):
-    return '[TOOL_CALL]' + json.dumps({'name': 'functions.exec_command', 'arguments': {'cmd': cmd}}, ensure_ascii=False) + '[/TOOL_CALL]'
+    return '```codex_tool_call\n' + json.dumps({'name': 'functions.exec_command', 'arguments': {'cmd': cmd}}, ensure_ascii=False) + '\n```\n'
 
 
-@pytest.mark.parametrize('closing', ['[/TOOL_CALL]', '</tool_call>'])
+@pytest.mark.parametrize('closing', ['\n```\n', '</tool_call>'])
 @pytest.mark.parametrize('width', [1, 73, 12000])
 def test_protocol_markers_inside_arguments_are_literal(closing, width):
-    cmd = 'printf \'[TOOL_CALL]{"name":"other","arguments":{}}' + closing + '\'\n# 中文 \\"'
+    cmd = 'printf \'```codex_tool_call\n{"name":"other","arguments":{}}' + closing + '\'\n# 中文 \\"'
     raw = call(cmd)
-    if closing == '</tool_call>':
-        raw = '<tool_call>' + raw[len('[TOOL_CALL]'):-len('[/TOOL_CALL]')] + '</tool_call>'
     processor = ToolStreamProcessor(TOOLS)
     emitted = []
     for start in range(0, len(raw), width):
@@ -36,8 +34,13 @@ def test_protocol_markers_inside_arguments_are_literal(closing, width):
 
 def test_marker_in_first_call_does_not_execute_nested_or_drop_next():
     inner = call('inner')
-    parsed = parse_assistant_output(call(inner) + call('second'), TOOLS)
-    assert [json.loads(c['function']['arguments'])['cmd'] for c in parsed.tool_calls] == [inner, 'second']
+    # Single shell calls keep nested protocol strings as literal arguments.
+    parsed = parse_assistant_output(call(inner), TOOLS)
+    assert json.loads(parsed.tool_calls[0]['function']['arguments'])['cmd'] == inner
+    # A second shell action must not execute concurrently with the first.
+    from tool_calling import ToolProtocolError
+    with pytest.raises(ToolProtocolError):
+        parse_assistant_output(call(inner) + call('second'), TOOLS)
 
 
 def test_compaction_survives_reopen_and_normal_response_expiry(tmp_path):
@@ -77,20 +80,14 @@ def test_store_limits_fail_explicitly_and_preserve_compactions(tmp_path):
     store.close()
 
 
-def test_repaired_preamble_matches_client_history():
-    prefix = 'I will inspect the relevant files before proceeding. ' * 4
-    request_tools = [{'type':'function', 'name':'functions.exec_command', 'parameters':{'type':'object'}}]
-    with browser([prefix + '[TOOL_CALL]{', 'Repair finished. ' + call(), 'continued']) as (client, commands):
-        payload = {'input': 'check', 'tools': request_tools, 'stream': True, 'prompt_cache_key':'repair-history-audit'}
-        events = packets(client.post('/v1/responses', json=payload).text)
-        response = events[-1]['response']
-        assert response['status'] == 'completed'
-        text = ''.join(e['delta'] for e in events if e['type'] == 'response.output_text.delta')
-        assert text == response['output'][0]['content'][0]['text']
-        client.post('/v1/responses', json={**payload, 'stream':False,
-            'input':[{'role':'user','content':'check'}] + response['output'] + [{'type':'function_call_output','call_id':response['output'][-1]['call_id'],'output':'verified'}]})
-        assert commands[-1]['reset_chat'] is False
-        assert 'I will inspect' not in commands[-1]['prompt']
+def test_invalid_reply_never_triggers_repair_or_fake_history():
+    prefix='I will inspect the relevant files before proceeding. '*4
+    request_tools=[{'type':'function','name':'functions.exec_command','parameters':{'type':'object'}}]
+    with browser([prefix+'```codex_tool_call\n{']) as (client,commands):
+        events=packets(client.post('/v1/responses',json={'input':'check','tools':request_tools,'stream':True}).text)
+        assert events[-1]['type']=='response.failed'
+        assert not any(e['type']=='response.completed' for e in events)
+        assert len(commands)==1
 
 
 def test_keepalive_during_buffered_work_and_cancellation():
@@ -133,7 +130,7 @@ def test_responses_image_wait_keeps_alive_and_cancels(monkeypatch):
     from fastapi.responses import StreamingResponse
     import responses_api
     from streaming_utils import with_keepalive
-    monkeypatch.setattr(responses_api, 'with_keepalive', lambda s: with_keepalive(s, interval=.01))
+    monkeypatch.setattr(responses_api, 'with_keepalive', lambda s, **kw: with_keepalive(s, interval=.01, **kw))
     async def run():
         stopped = asyncio.Event()
         async def image_generator(prompt):
@@ -147,12 +144,17 @@ def test_responses_image_wait_keeps_alive_and_cancels(monkeypatch):
         response = await responses_api.translate_response(StreamingResponse(upstream()), {}, 'gemini-4-carbon',
             {'bridge_image_generation':{'type':'image_generation', 'name':'bridge_image_generation'}}, [], ResponseStore(), image_generator)
         stream = response.body_iterator
+        seen = []
         for _ in range(10):
             piece = await asyncio.wait_for(anext(stream), .2)
-            if piece.startswith(':'):
+            seen.append(piece)
+            if piece.startswith('event: response.in_progress') and 'image_generation_call' in ''.join(seen):
                 break
         else:
             pytest.fail('no heartbeat during image generation')
+        events = packets(''.join(seen))
+        assert [e['sequence_number'] for e in events] == list(range(len(events)))
+        assert events[-1]['response']['output'] == []
         await stream.aclose()
         assert stopped.is_set()
     asyncio.run(run())
@@ -209,7 +211,7 @@ def test_buffered_tool_stream_keeps_client_alive(monkeypatch):
         result = client.post('/v1/responses', json={'input':'large tool', 'stream':True,
             'tools':[{'type':'function','name':'functions.exec_command','parameters':{'type':'object'}}]})
         events = packets(result.text)
-        assert ': keepalive\n\n' in result.text
+        assert any(e['type'] == 'response.in_progress' for e in events[2:])
         assert events[-1]['type'] == 'response.completed'
         assert not any(e['type'] == 'response.output_text.delta' for e in events)
         assert json.loads(events[-1]['response']['output'][0]['arguments'])['cmd'] == 'x' * 3000

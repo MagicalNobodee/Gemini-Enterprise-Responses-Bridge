@@ -43,6 +43,29 @@ def update_catalog(text: str) -> str:
     return json.dumps(document, ensure_ascii=False, indent=2) + '\n' if changed else text
 
 
+def update_stream_timeouts(text: str) -> str:
+    document = tomllib.loads(text)
+    for name, provider in document.get('model_providers', {}).items():
+        if provider.get('base_url', '').rstrip('/') not in {
+            'http://127.0.0.1:8000/v1', 'http://127.0.0.1:18001/v1',
+        }:
+            continue
+        table = re.search(r'^\[model_providers\.(?:' + re.escape(name) + '|' + re.escape(json.dumps(name)) + r')\][^\n]*\n', text, re.M)
+        if table is None:
+            continue
+        following = re.search(r'^\[', text[table.end():], re.M)
+        end = table.end() + following.start() if following else len(text)
+        body = text[table.end():end]
+        pattern = r'^stream_idle_timeout_ms\s*=.*$'
+        if re.search(pattern, body, re.M):
+            body = re.sub(pattern, 'stream_idle_timeout_ms = 660000', body, flags=re.M)
+        else:
+            body = 'stream_idle_timeout_ms = 660000\n' + body
+        text = text[:table.end()] + body + text[end:]
+    tomllib.loads(text)
+    return text
+
+
 def update_profile(text: str) -> str:
     document = tomllib.loads(text)
     if document.get('model') not in {'gemini-4-carbon', 'gemini-4-argon'}:
@@ -58,7 +81,7 @@ def update_profile(text: str) -> str:
             head = f'{key} = {value}\n' + head
     result = head + tail
     tomllib.loads(result)
-    return result
+    return update_stream_timeouts(result)
 
 
 def update_ccswitch(database: Path, apply: bool, backup_dir: Path | None) -> list[str]:
@@ -96,7 +119,7 @@ def update_ccswitch(database: Path, apply: bool, backup_dir: Path | None) -> lis
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--codex-home', type=Path, default=Path.home() / '.codex')
-    parser.add_argument('--outputs', type=Path, default=None)
+    parser.add_argument('--outputs', type=Path, required=True)
     parser.add_argument('--backup-dir', type=Path)
     parser.add_argument('--apply', action='store_true')
     args = parser.parse_args()
@@ -105,15 +128,16 @@ def main():
     catalogs = [Path(__file__).with_name('codex-models.json'), args.codex_home / 'model-router/models.json',
                 args.codex_home / 'gemini-ccswitch-models.json']
     profiles = [args.codex_home / 'gemini-bridge.config.toml', args.codex_home / 'gemini-4-carbon.config.toml',
-                args.codex_home / 'gemini-4-argon.config.toml']
-    if args.outputs is not None:
-        profiles.extend([args.outputs / 'gemini-bridge.config.toml', args.outputs / 'ccswitch-gemini.config.toml'])
+                args.codex_home / 'gemini-4-argon.config.toml',
+                args.outputs / 'gemini-bridge.config.toml', args.outputs / 'ccswitch-gemini.config.toml']
     # The shared desktop config switches providers; per-model catalogs own its budgets.
     if args.apply:
         args.backup_dir.mkdir(parents=True, exist_ok=True)
         args.backup_dir.chmod(0o700)
     changes = []
-    for path, transform in [(p, update_catalog) for p in catalogs] + [(p, update_profile) for p in profiles]:
+    targets = ([(p, update_catalog) for p in catalogs] + [(p, update_profile) for p in profiles]
+               + [(args.codex_home / 'config.toml', update_stream_timeouts)])
+    for path, transform in targets:
         if not path.is_file():
             continue
         original = path.read_text()
@@ -141,7 +165,7 @@ def main():
     print(json.dumps({'applied': args.apply, 'files': changes,
                       'carbon_context_window': CARBON_CONTEXT_WINDOW,
                       'checkpoint_tokens': CARBON_AUTO_COMPACT_TOKENS,
-                      'checkpoint_basis': 'Google Gemini CLI 50%, not a published Enterprise web trigger'}, ensure_ascii=False, indent=2))
+                      'checkpoint_basis': 'Local coding stability budget, not a published Enterprise web trigger'}, ensure_ascii=False, indent=2))
 
 
 if __name__ == '__main__':

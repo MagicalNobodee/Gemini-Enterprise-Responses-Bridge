@@ -11,7 +11,7 @@ from agent_policy import (
 from configure_codex_context import update_catalog, update_profile
 from context_builder import ConversationContextBuilder
 from schemas import ChatMessage
-from test_responses import browser
+from test_responses import browser, wire_results
 from tool_calling import build_tool_system_instructions
 
 
@@ -66,7 +66,7 @@ def test_deduplication_does_not_break_incremental_history_or_hide_first_source()
     history = [ChatMessage(role='user', content='Inspect the source.'), call('c1', 'cat big.txt'),
                ChatMessage(role='tool', content=body, tool_call_id='c1')]
     first = builder.build(history, tools=tools)
-    assert body in first.prompt
+    assert wire_results(first.prompt)[0]['output'] == body.strip()
     builder.record_completed_turn(session_key="default", sent_history=first.normalized_history,
         assistant_tool_calls=call('c2', 'cat big.txt').tool_calls,
         tools_fingerprint=first.tools_fingerprint, system_fingerprint=first.system_fingerprint)
@@ -77,7 +77,7 @@ def test_deduplication_does_not_break_incremental_history_or_hide_first_source()
     assert body not in second.prompt and 'call_id=c1' in second.prompt
     # A new web session is reconstructed with the full first output and a reference to it.
     packed = ConversationContextBuilder().build(history, tools=tools)
-    assert packed.prompt.count(body) == 1 and 'call_id=c1' in packed.prompt
+    assert sum(r['output'] == body.strip() for r in wire_results(packed.prompt)) == 1 and 'call_id=c1' in packed.prompt
     assert history[-1].content == body
 
 
@@ -161,7 +161,7 @@ def test_compaction_endpoint_replays_recent_evidence_and_unresolved_calls():
         response = client.post('/v1/responses', json={'input': compact['output'] + [{'role': 'user', 'content': 'continue'}]})
         assert response.status_code == 200
         assert 'RECENT_EVIDENCE_1' in commands[-1]['prompt'] and 'RECENT_EVIDENCE_2' in commands[-1]['prompt']
-        assert 'call_id="c2"' in commands[-1]['prompt']
+        assert any(r['call_id'] == 'c2' for r in wire_results(commands[-1]['prompt']))
 
 
 def test_ccswitch_sync_preserves_other_presets_and_credentials(tmp_path):
