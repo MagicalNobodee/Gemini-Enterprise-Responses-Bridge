@@ -568,7 +568,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             fd.append('purpose', 'user_data');
             const upRes = await fetch('/v1/files', { method: 'POST', headers: { 'Authorization': authHeader }, body: fd });
             if (!upRes.ok) {
-              out.textContent = '附件上传失败:\n' + (await upRes.text());
+              out.textContent = '附件上传失败:\\n' + (await upRes.text());
               return;
             }
             const upMeta = await upRes.json();
