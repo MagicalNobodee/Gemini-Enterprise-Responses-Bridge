@@ -622,6 +622,7 @@ class UsageLedger:
         sorted_models = sorted(
             (group.get("by_model") or {}).items(),
             key=lambda kv: (
+                float(kv[1].get("cached_equivalent_cost_usd") or 0.0),
                 float(kv[1].get("equivalent_cost_usd") or 0.0),
                 int(kv[1].get("total_tokens") or 0),
             ),

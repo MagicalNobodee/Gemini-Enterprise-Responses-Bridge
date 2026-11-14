@@ -9,12 +9,15 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
 
 from schemas import ChatMessage, estimate_tokens, model_requests_new_chat, resolve_target_web_model
 from agent_policy import (CARBON_AUTO_COMPACT_TOKENS, CARBON_CONTEXT_WINDOW, CARBON_EFFECTIVE_CONTEXT_PERCENT,
                           CODING_WORKFLOW, COMPACTION_INSTRUCTIONS,
                           has_coding_tools, reading_diagnostics, reading_reminder, deduplicate_tool_text)
+from codex_activity import resolve_slot_activity
 from tool_calling import (
     build_response_format_instructions,
     build_tool_delta_reminder,
@@ -43,9 +46,28 @@ _METADATA_BLOCK_RE = re.compile(
     re.IGNORECASE,
 )
 _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_VERTEX_SESSION_PATH_RE = re.compile(
+    r"/(?:r/session|session|c)/([^/?#]+)",
+    re.IGNORECASE,
+)
 
 _CODEX_INDEX_CACHE: Dict[str, Any] = {"sig": None, "titles": {}}
 _CODEX_SQLITE_CACHE: Dict[str, Tuple[float, str]] = {}
+
+
+def extract_vertex_session_id(raw_url: str) -> str:
+    """Extract the concrete Gemini Enterprise session identifier from a Vertex URL, if present."""
+    if not raw_url or not isinstance(raw_url, str):
+        return ""
+    try:
+        parsed = urlparse(raw_url.strip())
+    except Exception:
+        return ""
+    host = (parsed.netloc or "").lower()
+    if host and "vertexaisearch.cloud.google.com" not in host:
+        return ""
+    match = _VERTEX_SESSION_PATH_RE.search(parsed.path or "")
+    return match.group(1).strip() if match and match.group(1) else ""
 
 
 def clean_prompt_to_title(raw_text: str, max_chars: int = 64) -> str:
@@ -270,6 +292,258 @@ class PreparedPrompt:
     system_fingerprint: str = ""
 
 
+@dataclass
+class SessionRecoveryNotice:
+    kind: str = "interrupted"
+    reason: str = ""
+
+
+@dataclass
+class ArchivedSessionRecord:
+    archive_key: str
+    explicit_session_id: Optional[str]
+    vertex_session_id: str
+    session_url: str
+    session_title: str
+    active_model: Optional[str]
+    tools_fp: str
+    system_fp: str
+    turns: List[Tuple[str, str]]
+    metrics: Dict[str, Any]
+    updated_at: float
+
+
+class SessionArchiveStore:
+    """SQLite-backed L2 archive mapping evicted/historical Codex sessions to Gemini `/r/session/<id>` URLs."""
+
+    MAX_ENTRIES = 300
+
+    def __init__(self, archive_path: str | Path | None = None, ttl_seconds: float = 30 * 86400.0) -> None:
+        self.ttl_seconds = max(300.0, float(ttl_seconds))
+        self._lock = RLock()
+        db_target = ":memory:"
+        if archive_path:
+            p = Path(archive_path)
+            p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            db_target = str(p)
+        self._db = sqlite3.connect(db_target, check_same_thread=False)
+        if db_target != ":memory:":
+            try:
+                Path(db_target).chmod(0o600)
+            except OSError:
+                pass
+        with self._lock, self._db:
+            self._db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_archive (
+                    archive_key TEXT PRIMARY KEY,
+                    explicit_session_id TEXT,
+                    vertex_session_id TEXT NOT NULL,
+                    session_url TEXT NOT NULL,
+                    session_title TEXT NOT NULL DEFAULT '',
+                    active_model TEXT,
+                    tools_fp TEXT NOT NULL DEFAULT '',
+                    system_fp TEXT NOT NULL DEFAULT '',
+                    turns_json TEXT NOT NULL,
+                    metrics_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sa_explicit_sid ON session_archive(explicit_session_id)"
+            )
+            self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sa_vertex_sid ON session_archive(vertex_session_id)"
+            )
+            self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sa_updated_at ON session_archive(updated_at DESC)"
+            )
+
+    @staticmethod
+    def _row_to_record(row: tuple) -> Optional[ArchivedSessionRecord]:
+        try:
+            raw_turns = json.loads(row[8] or "[]")
+            turns = [
+                (str(item[0]), str(item[1]))
+                for item in raw_turns
+                if isinstance(item, (list, tuple)) and len(item) == 2
+            ]
+            metrics = json.loads(row[9] or "{}")
+            if not isinstance(metrics, dict):
+                metrics = {}
+        except Exception:
+            return None
+        if not turns:
+            return None
+        return ArchivedSessionRecord(
+            archive_key=str(row[0]),
+            explicit_session_id=str(row[1]) if row[1] else None,
+            vertex_session_id=str(row[2]),
+            session_url=str(row[3]),
+            session_title=str(row[4] or ""),
+            active_model=str(row[5]) if row[5] else None,
+            tools_fp=str(row[6] or ""),
+            system_fp=str(row[7] or ""),
+            turns=turns,
+            metrics=metrics,
+            updated_at=float(row[10] or 0.0),
+        )
+
+    def _prune_locked(self, now: float) -> None:
+        self._db.execute(
+            "DELETE FROM session_archive WHERE updated_at < ?",
+            (now - self.ttl_seconds,),
+        )
+        overflow = self._db.execute(
+            "SELECT archive_key FROM session_archive ORDER BY updated_at DESC LIMIT -1 OFFSET ?",
+            (self.MAX_ENTRIES,),
+        ).fetchall()
+        if overflow:
+            self._db.executemany(
+                "DELETE FROM session_archive WHERE archive_key = ?",
+                [(r[0],) for r in overflow],
+            )
+
+    def upsert(
+        self,
+        *,
+        session_url: str,
+        turns: Sequence[Tuple[str, str]],
+        explicit_session_id: Optional[str] = None,
+        session_title: str = "",
+        active_model: Optional[str] = None,
+        tools_fp: str = "",
+        system_fp: str = "",
+        metrics: Optional[Dict[str, Any]] = None,
+        updated_at: Optional[float] = None,
+    ) -> Optional[str]:
+        vsid = extract_vertex_session_id(session_url)
+        if not vsid or not turns:
+            return None
+        sid = explicit_session_id.strip() if isinstance(explicit_session_id, str) and explicit_session_id.strip() else None
+        now = float(updated_at if updated_at is not None else time.time())
+        with self._lock, self._db:
+            # Preserve previously learned explicit_session_id if updating the same Vertex session without one
+            if not sid:
+                prev_row = self._db.execute(
+                    "SELECT explicit_session_id FROM session_archive WHERE vertex_session_id = ? LIMIT 1",
+                    (vsid,),
+                ).fetchone()
+                if prev_row and prev_row[0]:
+                    sid = str(prev_row[0])
+            archive_key = f"sid:{sid}" if sid else f"vsid:{vsid}"
+            self._db.execute(
+                "DELETE FROM session_archive WHERE vertex_session_id = ? AND archive_key != ?",
+                (vsid, archive_key),
+            )
+            if sid:
+                self._db.execute(
+                    "DELETE FROM session_archive WHERE explicit_session_id = ? AND archive_key != ?",
+                    (sid, archive_key),
+                )
+            turns_json = json.dumps([[r, t] for r, t in turns], ensure_ascii=False)
+            metrics_json = json.dumps(metrics or {}, ensure_ascii=False)
+            self._db.execute(
+                """
+                INSERT OR REPLACE INTO session_archive (
+                    archive_key, explicit_session_id, vertex_session_id, session_url,
+                    session_title, active_model, tools_fp, system_fp,
+                    turns_json, metrics_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    archive_key,
+                    sid,
+                    vsid,
+                    session_url.strip(),
+                    (session_title or "").strip(),
+                    active_model,
+                    tools_fp or "",
+                    system_fp or "",
+                    turns_json,
+                    metrics_json,
+                    now,
+                ),
+            )
+            self._prune_locked(now)
+        return archive_key
+
+    def get_by_explicit_session_id(self, explicit_session_id: Optional[str]) -> Optional[ArchivedSessionRecord]:
+        if not explicit_session_id or not explicit_session_id.strip():
+            return None
+        sid = explicit_session_id.strip()
+        with self._lock, self._db:
+            self._prune_locked(time.time())
+            row = self._db.execute(
+                """
+                SELECT archive_key, explicit_session_id, vertex_session_id, session_url,
+                       session_title, active_model, tools_fp, system_fp,
+                       turns_json, metrics_json, updated_at
+                FROM session_archive
+                WHERE explicit_session_id = ?
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                (sid,),
+            ).fetchone()
+        return self._row_to_record(row) if row else None
+
+    def get_by_vertex_session_id(self, vertex_session_id: Optional[str]) -> Optional[ArchivedSessionRecord]:
+        if not vertex_session_id or not vertex_session_id.strip():
+            return None
+        vsid = vertex_session_id.strip()
+        with self._lock, self._db:
+            self._prune_locked(time.time())
+            row = self._db.execute(
+                """
+                SELECT archive_key, explicit_session_id, vertex_session_id, session_url,
+                       session_title, active_model, tools_fp, system_fp,
+                       turns_json, metrics_json, updated_at
+                FROM session_archive
+                WHERE vertex_session_id = ?
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                (vsid,),
+            ).fetchone()
+        return self._row_to_record(row) if row else None
+
+    def list_recent(self, limit: int = 200) -> List[ArchivedSessionRecord]:
+        with self._lock, self._db:
+            self._prune_locked(time.time())
+            rows = self._db.execute(
+                """
+                SELECT archive_key, explicit_session_id, vertex_session_id, session_url,
+                       session_title, active_model, tools_fp, system_fp,
+                       turns_json, metrics_json, updated_at
+                FROM session_archive
+                ORDER BY updated_at DESC LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        out: List[ArchivedSessionRecord] = []
+        for r in rows:
+            rec = self._row_to_record(r)
+            if rec is not None:
+                out.append(rec)
+        return out
+
+    def delete(self, archive_key: str) -> None:
+        if not archive_key:
+            return
+        with self._lock, self._db:
+            self._db.execute("DELETE FROM session_archive WHERE archive_key = ?", (archive_key,))
+
+    def delete_by_vertex_session_id(self, vertex_session_id: str) -> None:
+        if not vertex_session_id:
+            return
+        with self._lock, self._db:
+            self._db.execute("DELETE FROM session_archive WHERE vertex_session_id = ?", (vertex_session_id,))
+
+    def close(self) -> None:
+        with self._lock:
+            self._db.close()
+
+
 class ConversationContextBuilder:
     """Converts stateless OpenAI message arrays (including tool loops) into stateful web prompts."""
 
@@ -278,10 +552,13 @@ class ConversationContextBuilder:
         default_mode: str = "smart",
         auto_reset_new_chat: bool = True,
         codex_home: Optional[Path] = None,
+        archive_path: str | Path | None = None,
+        archive_ttl_seconds: float = 30 * 86400.0,
     ) -> None:
         self.default_mode = default_mode
         self.auto_reset_new_chat = auto_reset_new_chat
         self._codex_home = codex_home
+        self._archive = SessionArchiveStore(archive_path=archive_path, ttl_seconds=archive_ttl_seconds)
         # Keyed by browser client/tab identifier -> list of (role, canonical_text) already in web chat
         self._session_turns: Dict[str, List[Tuple[str, str]]] = {}
         self._session_models: Dict[str, Optional[str]] = {}
@@ -289,7 +566,14 @@ class ConversationContextBuilder:
         self._session_system_fp: Dict[str, str] = {}
         self._session_metrics: Dict[str, Dict[str, Any]] = {}
         self._session_titles: Dict[str, str] = {}
+        self._session_urls: Dict[str, str] = {}
+        self._session_explicit_ids: Dict[str, str] = {}
+        self._session_recovery: Dict[str, SessionRecoveryNotice] = {}
         self._session_force_reset: set[str] = set()
+        self._hydration_misses: Dict[str, str] = {}
+
+    def close(self) -> None:
+        self._archive.close()
 
     def clear_session(self, session_key: str = "default") -> None:
         self._session_turns.pop(session_key, None)
@@ -298,26 +582,238 @@ class ConversationContextBuilder:
         self._session_system_fp.pop(session_key, None)
         self._session_metrics.pop(session_key, None)
         self._session_titles.pop(session_key, None)
+        self._session_urls.pop(session_key, None)
+        self._session_explicit_ids.pop(session_key, None)
+        self._session_recovery.pop(session_key, None)
         self._session_force_reset.discard(session_key)
+        self._hydration_misses.pop(session_key, None)
 
     def invalidate_session(self, session_key: str) -> None:
         """A rejected/failed turn cannot be reused, even with automatic resets disabled."""
         self.clear_session(session_key)
         self._session_force_reset.add(session_key)
 
+    def record_failed_turn(
+        self,
+        session_key: str,
+        *,
+        kind: str = "interrupted",
+        reason: str = "",
+        submitted: bool = True,
+        tab_reset: bool = False,
+    ) -> bool:
+        """Keep an established web session alive on the first failure; reset only on repeat or blank failure."""
+        if tab_reset:
+            self.invalidate_session(session_key)
+            return False
+        tracked = self._session_turns.get(session_key)
+        if not submitted:
+            return bool(tracked)
+        if not tracked or session_key in self._session_recovery:
+            self.invalidate_session(session_key)
+            return False
+        self._session_recovery[session_key] = SessionRecoveryNotice(
+            kind=kind or "interrupted",
+            reason=(reason or "").strip(),
+        )
+        return True
+
+    @staticmethod
+    def _build_recovery_prompt_block(recovery: SessionRecoveryNotice, has_tools: bool = False) -> str:
+        clean_reason = _WHITESPACE_RUN_RE.sub(" ", recovery.reason or "").replace("```", "'''").strip()[:240]
+        if recovery.kind == "protocol_error":
+            detail = f" Reason: {clean_reason}" if clean_reason else ""
+            lines = [
+                "[Retry Notice — Previous Reply Had a Format Error; Please Rewrite]",
+                f"Your immediately preceding reply in this chat had an invalid format and was REJECTED without executing.{detail}",
+                "Ignore your previous rejected reply completely — none of the tool calls or actions in it were run.",
+                "Rewrite your response cleanly from scratch for the input below:",
+            ]
+            if has_tools:
+                lines.extend(
+                    [
+                        '- For client tool calls, use a standalone three-backtick `codex_tool_call` code block on its own line containing valid RFC 8259 JSON `{"name": "...", "arguments": {...}}` (never backslash-escape Markdown characters inside JSON strings), close with three backticks on its own line, and stop immediately without `suggested_questions`.',
+                        "- Emit ONE `codex_tool_call` block for edits or shell/script commands (multiple blocks are allowed ONLY for independent pure read-only lookups).",
+                        "- Never output internal thinking ('Thinking Process:' / '思考过程：') or host-native tool calls.",
+                    ]
+                )
+            else:
+                lines.append("- Follow the requested output format strictly and do not output internal thinking.")
+            return "\n".join(lines)
+        if recovery.kind == "upstream_task_failure":
+            return (
+                "[Retry Notice — Previous Cloud Fallback Reply Rejected; Retry In Current Session]\n"
+                "Your immediately preceding reply failed with a generic cloud/file fallback error and was REJECTED.\n"
+                "Ignore your previous failed reply completely. Do NOT delegate to cloud/host agents or ask the user to upload local workspace files — "
+                "use the declared `codex_tool_call` client tools or answer directly from the input below."
+            )
+        return (
+            "[Retry Notice — Ignore Incomplete Previous Attempt]\n"
+            "The immediately preceding submission or partial reply in this chat was interrupted, timed out, or cut off before completion and was NOT accepted.\n"
+            "Ignore that incomplete previous attempt and any half-finished output above, and respond fresh and completely to the input below."
+        )
+
     def drop_slot(self, session_key: str) -> None:
+        self.flush_slot_to_archive(session_key)
         self.clear_session(session_key)
 
     def migrate_slot_key(self, old_key: str, new_key: str) -> None:
         if old_key == new_key:
             return
         for mapping in (self._session_turns, self._session_models, self._session_tools_fp,
-                        self._session_system_fp, self._session_metrics, self._session_titles):
+                        self._session_system_fp, self._session_metrics, self._session_titles,
+                        self._session_urls, self._session_explicit_ids, self._session_recovery,
+                        self._hydration_misses):
             if old_key in mapping:
                 mapping[new_key] = mapping.pop(old_key)
         if old_key in self._session_force_reset:
             self._session_force_reset.discard(old_key)
             self._session_force_reset.add(new_key)
+
+    def flush_slot_to_archive(
+        self,
+        session_key: str,
+        *,
+        fallback_url: str = "",
+        fallback_explicit_session_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Persist the active conversation on `session_key` into the L2 archive if it has a Vertex session URL."""
+        turns = self._session_turns.get(session_key)
+        if not turns:
+            return None
+        eff_url = self._session_urls.get(session_key) or fallback_url or ""
+        if not extract_vertex_session_id(eff_url):
+            return None
+        eff_sid = self._session_explicit_ids.get(session_key) or fallback_explicit_session_id
+        return self._archive.upsert(
+            session_url=eff_url,
+            turns=turns,
+            explicit_session_id=eff_sid,
+            session_title=self._session_titles.get(session_key, ""),
+            active_model=self._session_models.get(session_key),
+            tools_fp=self._session_tools_fp.get(session_key, ""),
+            system_fp=self._session_system_fp.get(session_key, ""),
+            metrics=self._session_metrics.get(session_key),
+        )
+
+    def evict_slot_to_archive(
+        self,
+        session_key: str,
+        *,
+        fallback_url: str = "",
+        fallback_explicit_session_id: Optional[str] = None,
+    ) -> None:
+        """Archive `session_key`'s current conversation and mark the slot as needing a fresh chat."""
+        self.flush_slot_to_archive(
+            session_key,
+            fallback_url=fallback_url,
+            fallback_explicit_session_id=fallback_explicit_session_id,
+        )
+        self.invalidate_session(session_key)
+
+    def restore_archived_to_slot(
+        self,
+        session_key: str,
+        record: ArchivedSessionRecord,
+        *,
+        explicit_session_id: Optional[str] = None,
+        session_url: Optional[str] = None,
+    ) -> None:
+        """Mount a verified historical Gemini session back onto a live worker slot."""
+        self.clear_session(session_key)
+        self._session_turns[session_key] = list(record.turns)
+        if record.active_model:
+            self._session_models[session_key] = record.active_model
+        if record.tools_fp:
+            self._session_tools_fp[session_key] = record.tools_fp
+        self._session_system_fp[session_key] = record.system_fp
+        if record.session_title:
+            self._session_titles[session_key] = record.session_title
+        eff_url = (session_url or record.session_url or "").strip()
+        if eff_url:
+            self._session_urls[session_key] = eff_url
+        eff_sid = explicit_session_id or record.explicit_session_id
+        if eff_sid:
+            self._session_explicit_ids[session_key] = eff_sid
+        if record.metrics:
+            restored_meta = dict(record.metrics)
+            restored_meta["slot_key"] = session_key
+            self._session_metrics[session_key] = restored_meta
+
+    def hydrate_live_slots_from_archive(
+        self,
+        slot_urls: Dict[str, str],
+    ) -> Dict[str, Optional[str]]:
+        """Rehydrate untouched live browser tabs (e.g. after server restart) whose `/r/session/<id>` is in L2."""
+        hydrated_sids: Dict[str, Optional[str]] = {}
+        for slot_key, tab_url in slot_urls.items():
+            if slot_key in self._session_turns or slot_key in self._session_force_reset:
+                continue
+            vsid = extract_vertex_session_id(tab_url)
+            if not vsid:
+                continue
+            if self._hydration_misses.get(slot_key) == vsid:
+                continue
+            rec = self._archive.get_by_vertex_session_id(vsid)
+            if rec is None:
+                self._hydration_misses[slot_key] = vsid
+                continue
+            self.restore_archived_to_slot(slot_key, rec, session_url=tab_url)
+            hydrated_sids[slot_key] = rec.explicit_session_id
+        return hydrated_sids
+
+    def delete_archived_session(self, archive_key: str) -> None:
+        self._archive.delete(archive_key)
+
+    def find_archived_session(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        model: str = "gemini-enterprise-web",
+        explicit_session_id: Optional[str] = None,
+        exclude_vertex_session_ids: Sequence[str] = (),
+    ) -> Optional[ArchivedSessionRecord]:
+        """Locate an archived Gemini session in L2 that matches the incoming multi-turn continuation."""
+        if model_requests_new_chat(model):
+            return None
+        user_system_text, dialogue = self._normalize_messages(messages)
+        if len(dialogue) <= 1:
+            return None
+        if dialogue[-1][0] == "user" and dialogue[-1][1].startswith("[NEW_CHAT]"):
+            return None
+
+        excluded = {v for v in exclude_vertex_session_ids if v}
+        req_sid = explicit_session_id.strip() if isinstance(explicit_session_id, str) and explicit_session_id.strip() else None
+
+        def _matches(rec: ArchivedSessionRecord) -> bool:
+            if not rec.vertex_session_id or not rec.session_url or not rec.turns:
+                return False
+            if rec.vertex_session_id in excluded:
+                return False
+            if len(rec.turns) >= len(dialogue):
+                return False
+            sys_ok, _ = self._system_prompts_compatible(
+                rec.system_fp, user_system_text, has_tracked_dialogue=len(rec.turns) >= 2
+            )
+            if not sys_ok:
+                return False
+            return self._history_matches(rec.turns, dialogue[: len(rec.turns)])
+
+        if req_sid:
+            direct = self._archive.get_by_explicit_session_id(req_sid)
+            if direct is not None and _matches(direct):
+                return direct
+
+        candidates: List[Tuple[int, float, ArchivedSessionRecord]] = []
+        for rec in self._archive.list_recent(limit=200):
+            if req_sid and rec.explicit_session_id and rec.explicit_session_id != req_sid:
+                continue
+            if _matches(rec):
+                candidates.append((len(rec.turns), rec.updated_at, rec))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return candidates[0][2]
 
     def get_slot_context_metrics(self, session_key: str) -> Optional[Dict[str, Any]]:
         meta = self._session_metrics.get(session_key)
@@ -333,6 +829,15 @@ class ConversationContextBuilder:
         if extracted:
             self._session_titles[session_key] = extracted
 
+    def is_slot_session_active(self, slot_key: str, slot_dict: Dict[str, Any]) -> bool:
+        """Return True if a slot is busy in Bridge or mid-turn in its bound Codex session."""
+        act = resolve_slot_activity(
+            slot_dict,
+            fallback_session_id=self._session_explicit_ids.get(slot_key),
+            codex_home=self._codex_home,
+        )
+        return bool(act.get("session_active"))
+
     def get_context_snapshot(self, worker_slots: Optional[Sequence[Dict[str, Any]]] = None) -> Dict[str, Any]:
         eff_limit_default = int(CARBON_CONTEXT_WINDOW * CARBON_EFFECTIVE_CONTEXT_PERCENT / 100)
         slots_out: List[Dict[str, Any]] = []
@@ -346,8 +851,15 @@ class ConversationContextBuilder:
             seen_keys.add(skey)
             meta = self._session_metrics.get(skey) or {}
             t_cnt = int(meta.get("turn_count") or 0)
-            sess_title, title_src = resolve_slot_session_title(
+            fallback_sid = self._session_explicit_ids.get(skey)
+            ws_for_lookup = ws if ws.get("pinned_session_id") or not fallback_sid else {**ws, "pinned_session_id": fallback_sid}
+            act = resolve_slot_activity(
                 ws,
+                fallback_session_id=fallback_sid,
+                codex_home=self._codex_home,
+            )
+            sess_title, title_src = resolve_slot_session_title(
+                ws_for_lookup,
                 prompt_title=self._session_titles.get(skey, "") or str(meta.get("session_title") or ""),
                 turn_count=t_cnt,
                 codex_home=self._codex_home,
@@ -358,12 +870,22 @@ class ConversationContextBuilder:
             compact_toks = int(meta.get("compact_threshold_tokens") or CARBON_AUTO_COMPACT_TOKENS)
             rem_compact = max(0, compact_toks - total_toks)
             rem_context = max(0, limit_toks - total_toks)
+            base_updated = int(meta.get("updated_at") or ws.get("last_used_at") or 0)
+            if t_cnt > 0 or ws_for_lookup.get("pinned_session_id") or act["session_active"]:
+                eff_updated = max(base_updated, int(act.get("codex_updated_at") or 0))
+            else:
+                eff_updated = base_updated
             slots_out.append({
                 "slot_key": skey,
                 "tab_id": ws.get("tab_id"),
                 "busy": bool(ws.get("busy")),
                 "waiting_count": int(ws.get("waiting_count") or 0),
-                "pinned_session_id": ws.get("pinned_session_id"),
+                "session_active": bool(act["session_active"]),
+                "activity_phase": str(act["activity_phase"]),
+                "activity_label": str(act["activity_label"]),
+                "activity_source": str(act["activity_source"]),
+                "tool_name": str(act["tool_name"]),
+                "pinned_session_id": ws_for_lookup.get("pinned_session_id"),
                 "session_title": sess_title,
                 "title_source": title_src,
                 "active_model": str(ws.get("active_model") or meta.get("active_model") or ""),
@@ -380,7 +902,7 @@ class ConversationContextBuilder:
                 "last_delta_tokens": int(meta.get("last_delta_tokens") or 0),
                 "last_completion_tokens": int(meta.get("last_completion_tokens") or 0),
                 "last_strategy": str(meta.get("last_strategy") or ""),
-                "updated_at": int(meta.get("updated_at") or ws.get("last_used_at") or 0),
+                "updated_at": eff_updated,
             })
         for skey, meta in self._session_metrics.items():
             if skey in seen_keys:
@@ -388,6 +910,9 @@ class ConversationContextBuilder:
             m_copy = dict(meta)
             m_copy.setdefault("session_title", self._session_titles.get(skey, ""))
             m_copy.setdefault("title_source", "prompt" if m_copy.get("session_title") else "")
+            m_copy.setdefault("session_active", bool(m_copy.get("busy")))
+            m_copy.setdefault("activity_phase", "generating" if m_copy.get("busy") else "idle")
+            m_copy.setdefault("activity_label", "工作中 · 模型回复" if m_copy.get("busy") else "空闲待命")
             t_tok = int(m_copy.get("total_context_tokens") or 0)
             l_tok = int(m_copy.get("context_limit_tokens") or CARBON_CONTEXT_WINDOW)
             c_tok = int(m_copy.get("compact_threshold_tokens") or CARBON_AUTO_COMPACT_TOKENS)
@@ -397,15 +922,29 @@ class ConversationContextBuilder:
             m_copy.setdefault("remaining_context_tokens", max(0, l_tok - t_tok))
             m_copy["compact_pct"] = round(min(100.0, (t_tok / max(c_tok, 1)) * 100.0), 1)
             slots_out.append(m_copy)
+        working_count = sum(
+            1
+            for s in slots_out
+            if bool(s.get("busy")) or int(s.get("waiting_count") or 0) > 0 or bool(s.get("session_active"))
+        )
         active_slots = [
             s for s in slots_out
-            if bool(s.get("busy")) or int(s.get("turn_count") or 0) > 0 or bool(s.get("session_title"))
+            if bool(s.get("busy")) or bool(s.get("session_active")) or int(s.get("turn_count") or 0) > 0 or bool(s.get("session_title"))
         ]
-        active_slots.sort(key=lambda s: (1 if s.get("busy") else 0, int(s.get("updated_at") or 0)), reverse=True)
+        active_slots.sort(
+            key=lambda s: (
+                1 if (s.get("busy") or s.get("session_active")) else 0,
+                int(s.get("updated_at") or 0),
+            ),
+            reverse=True,
+        )
         primary = active_slots[0] if active_slots else ({
             "slot_key": "",
             "tab_id": None,
             "busy": False,
+            "session_active": False,
+            "activity_phase": "idle",
+            "activity_label": "空闲待命",
             "session_title": "",
             "title_source": "",
             "active_model": "",
@@ -428,6 +967,7 @@ class ConversationContextBuilder:
             "primary": primary,
             "slots": slots_out,
             "active_session_count": len(active_slots),
+            "working_session_count": working_count,
         }
 
     def get_session_model(self, session_key: str = "default") -> Optional[str]:
@@ -570,6 +1110,8 @@ class ConversationContextBuilder:
         logical_prompt_tokens: Optional[int] = None,
         web_prompt_tokens: Optional[int] = None,
         last_strategy: Optional[str] = None,
+        session_url: Optional[str] = None,
+        explicit_session_id: Optional[str] = None,
     ) -> None:
         updated = list(sent_history)
         if assistant_tool_calls:
@@ -578,12 +1120,18 @@ class ConversationContextBuilder:
             canon = (assistant_reply or "").strip()
         updated.append(("assistant", canon))
         self._session_turns[session_key] = updated
+        self._session_recovery.pop(session_key, None)
+        self._session_force_reset.discard(session_key)
         if active_model is not None:
             self._session_models[session_key] = active_model
         if tools_fingerprint is not None:
             self._session_tools_fp[session_key] = tools_fingerprint
         if system_fingerprint is not None:
             self._session_system_fp[session_key] = system_fingerprint
+        if session_url and extract_vertex_session_id(session_url):
+            self._session_urls[session_key] = session_url.strip()
+        if explicit_session_id and explicit_session_id.strip():
+            self._session_explicit_ids[session_key] = explicit_session_id.strip()
 
         comp_tokens = estimate_tokens(canon)
         if logical_prompt_tokens is not None:
@@ -615,6 +1163,7 @@ class ConversationContextBuilder:
             "last_strategy": last_strategy or "smart_single_turn",
             "updated_at": int(time.time()),
         }
+        self.flush_slot_to_archive(session_key)
 
     def build(
         self,
@@ -630,11 +1179,13 @@ class ConversationContextBuilder:
         mode = (mode_override or self.default_mode or "smart").lower()
         explicit_new_chat = model_requests_new_chat(model) or session_key in self._session_force_reset
         target_model = resolve_target_web_model(model)
+        pending_recovery = self._session_recovery.get(session_key)
 
         norm_tools = list(tools or [])
+        tools_enabled = is_tool_generation_enabled(norm_tools, tool_choice)
         tools_fp = (
             compute_tools_fingerprint(norm_tools)
-            if is_tool_generation_enabled(norm_tools, tool_choice)
+            if tools_enabled
             else ""
         )
 
@@ -654,7 +1205,7 @@ class ConversationContextBuilder:
 
         if not dialogue:
             fallback_prompt = combined_system_text or "Hello"
-            reset_only_sys = explicit_new_chat or self.auto_reset_new_chat
+            reset_only_sys = explicit_new_chat or self.auto_reset_new_chat or (pending_recovery is not None)
             if reset_only_sys:
                 self.clear_session(session_key)
             return PreparedPrompt(
@@ -675,6 +1226,10 @@ class ConversationContextBuilder:
 
         if explicit_new_chat:
             self.clear_session(session_key)
+            pending_recovery = None
+
+        tracked = self._session_turns.get(session_key)
+        recovery_notice = self._build_recovery_prompt_block(pending_recovery, has_tools=tools_enabled) if pending_recovery else ""
 
         has_trailing_tool_results = any(
             r == "tool" for r, _ in self._trailing_non_assistant_slice(dialogue)
@@ -695,13 +1250,21 @@ class ConversationContextBuilder:
             self._session_models[session_key] = target_model
 
         if mode == "last_message":
+            matches_last = bool(
+                not explicit_new_chat
+                and tracked
+                and len(tracked) < len(dialogue)
+                and self._history_matches(tracked, dialogue[: len(tracked)])
+            )
             tail_prompt = self._format_delta_entries(
                 self._trailing_non_assistant_slice(dialogue) or [dialogue[-1]],
                 extra_instructions=[fmt_sys_text, delta_reminder] if len(dialogue) > 1 else [],
             )
-            reset_last = explicit_new_chat or (self.auto_reset_new_chat and len(dialogue) == 1)
+            reset_last = explicit_new_chat or (self.auto_reset_new_chat and len(dialogue) == 1) or (pending_recovery is not None and not matches_last)
             if reset_last:
                 self.clear_session(session_key)
+            elif recovery_notice and matches_last:
+                tail_prompt = f"{recovery_notice}\n\n{tail_prompt}"
             self._record_dialogue_title(session_key, dialogue)
             prompt = self._with_system_if_first_turn(
                 last_text=tail_prompt,
@@ -719,7 +1282,7 @@ class ConversationContextBuilder:
             )
 
         if mode == "transcript":
-            reset_trans = explicit_new_chat or self.auto_reset_new_chat
+            reset_trans = explicit_new_chat or self.auto_reset_new_chat or (pending_recovery is not None)
             if reset_trans:
                 self.clear_session(session_key)
             self._record_dialogue_title(session_key, dialogue)
@@ -744,7 +1307,7 @@ class ConversationContextBuilder:
         #    request after server startup, in case the browser tab already has an old `/r/session/...` open;
         #    page-driver.js fast-paths in 0ms if the tab is already on a blank new chat).
         if len(dialogue) == 1 and dialogue[0][0] == "user":
-            reset_chat = explicit_new_chat or self.auto_reset_new_chat
+            reset_chat = explicit_new_chat or self.auto_reset_new_chat or (pending_recovery is not None)
             if reset_chat:
                 self.clear_session(session_key)
                 if target_model is not None:
@@ -766,7 +1329,6 @@ class ConversationContextBuilder:
             )
 
         # 2) Multi-turn continuation of the SAME local conversation (including tool_result loops!)
-        tracked = self._session_turns.get(session_key)
         prev_sys_fp = self._session_system_fp.get(session_key)
         system_matches, sys_delta_block = self._system_prompts_compatible(
             prev_sys_fp, user_system_text, has_tracked_dialogue=bool(tracked and len(tracked) >= 2)
@@ -801,6 +1363,8 @@ class ConversationContextBuilder:
                 extra_blocks.append(inc_reminder)
             self._record_dialogue_title(session_key, dialogue)
             prompt = self._format_delta_entries(delta_entries, extra_instructions=extra_blocks)
+            if recovery_notice:
+                prompt = f"{recovery_notice}\n\n{prompt}"
             return PreparedPrompt(
                 prompt=prompt,
                 reset_chat=False,
@@ -813,7 +1377,7 @@ class ConversationContextBuilder:
 
         # 3) Switched to a DIFFERENT multi-turn local conversation not matching current browser tab:
         #    Start a clean web session (`reset_chat=True` when auto_reset_new_chat=True) and pack its history.
-        reset_packed = explicit_new_chat or self.auto_reset_new_chat
+        reset_packed = explicit_new_chat or self.auto_reset_new_chat or (pending_recovery is not None)
         if reset_packed:
             self.clear_session(session_key)
             if target_model is not None:

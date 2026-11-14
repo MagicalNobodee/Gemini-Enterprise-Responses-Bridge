@@ -1,7 +1,7 @@
 // MAIN-world driver: DOM controls the composer; the original RPC is the only reply source.
 
 (() => {
-  const DRIVER_VERSION = "2.8.2";
+  const DRIVER_VERSION = "2.8.4";
 
   // Optional Trusted Types policy (gracefully guarded if CSP `trusted-types` header restricts custom policy names;
   // all DOM mutations below strictly use `replaceChildren` + `createElement` + `textContent` and ZERO `innerHTML`!)
@@ -2801,27 +2801,36 @@
   const mainPromptReassembly = new Map();
 
   function emitRequestComplete(payload) {
-    const fullReply = String(payload.reply || "");
+    const enrichedPayload = {
+      ...payload,
+      tab_url:
+        payload.tab_url ||
+        (typeof window !== "undefined" && window.location ? String(window.location.href || "") : ""),
+      tab_title:
+        payload.tab_title ||
+        (typeof document !== "undefined" ? String(document.title || "") : "")
+    };
+    const fullReply = String(enrichedPayload.reply || "");
     if (fullReply.length > REPLY_POSTMSG_CHUNK_THRESHOLD) {
       const total = Math.ceil(fullReply.length / REPLY_POSTMSG_CHUNK_SIZE);
       for (let i = 0; i < total; i += 1) {
         emitToIsolated({
           type: "reply_chunk",
-          request_id: payload.request_id,
+          request_id: enrichedPayload.request_id,
           chunk_index: i,
           total_chunks: total,
           data: fullReply.slice(i * REPLY_POSTMSG_CHUNK_SIZE, (i + 1) * REPLY_POSTMSG_CHUNK_SIZE)
         });
       }
       emitToIsolated({
-        ...payload,
+        ...enrichedPayload,
         reply: "",
         chunked: true,
         total_chunks: total
       });
       return;
     }
-    emitToIsolated(payload);
+    emitToIsolated(enrichedPayload);
   }
 
   async function executePromptJob({
@@ -2871,6 +2880,11 @@
       }
     };
     activeJob = job;
+    let chatWasReset = false;
+    let promptSubmitted = false;
+    let filledInputInThisJob = false;
+    let composerEl = null;
+    let hadPreexistingAttachments = false;
 
     try {
       if (!String(prompt || "").trim()) {
@@ -2879,6 +2893,13 @@
 
       if (resetChat) {
         await triggerNewChatSession();
+        chatWasReset = true;
+      } else if (isPageStillGenerating()) {
+        const lingeringStop = findGenerationStopButton();
+        if (lingeringStop) lingeringStop.click();
+        for (let waitIdx = 0; waitIdx < 16 && isPageStillGenerating(); waitIdx += 1) {
+          await sleep(200);
+        }
       }
 
       // Wait for composer to mount before model switching (important right after New Chat!)
@@ -2914,10 +2935,11 @@
       const baselineReplies = collectAssistantReplyTexts();
       const baselineCount = baselineReplies.length;
       const baselineLastText = baselineCount > 0 ? baselineReplies[baselineCount - 1] : "";
+      hadPreexistingAttachments = composerAttachmentControls().length > 0;
 
       await attachFilesToComposer(attachments, () => {
         lastActivityAt = Date.now();
-        emitToIsolated({ type: "request_progress", request_id: requestId, generating: true, dom_len: 0, net_len: 0 });
+        emitToIsolated({ type: "request_progress", request_id: requestId, generating: true, submitted: false, tab_reset: chatWasReset, dom_len: 0, net_len: 0 });
       });
       assertJobActive(job);
       for (const img of querySelectorAllDeep("img")) {
@@ -2944,6 +2966,8 @@
       };
       inputEl = findComposerInput() || inputEl;
       await fillInputWithPrompt(inputEl, prompt);
+      filledInputInThisJob = true;
+      composerEl = inputEl;
       assertJobActive(job);
       job.awaitingRpc = true;
       const sendMethod = await submitComposerWithVerification(
@@ -2952,6 +2976,16 @@
         job,
         baselineCount
       );
+      promptSubmitted = true;
+      emitToIsolated({
+        type: "request_progress",
+        request_id: requestId,
+        generating: true,
+        submitted: true,
+        tab_reset: chatWasReset,
+        dom_len: 0,
+        net_len: 0
+      });
       if ((attachments || []).length) {
         for (let attempt = 0; attempt < 12 && composerAttachmentControls().length; attempt += 1) await sleep(150);
         if (composerAttachmentControls().length) throw new Error("提交后仍有附件留在输入框，文件未完整发送，已停止等待错误结果。");
@@ -3099,15 +3133,37 @@
 
       throw new Error("等待 Gemini Enterprise 页面回复超时，请确认页面未处于重登录或验证码状态。");
     } catch (err) {
+      if (!promptSubmitted && (job.submissionStarted || job.networkText.length > 0 || job.networkDone)) {
+        promptSubmitted = true;
+      }
       if (!job.cancelled) {
         emitToIsolated({
           type: "request_error",
           request_id: requestId,
+          submitted: promptSubmitted,
+          tab_reset: chatWasReset,
           error: err && err.message ? err.message : String(err)
         });
         stopJob(job);
       }
     } finally {
+      if (!promptSubmitted && (job.submissionStarted || job.networkText.length > 0 || job.networkDone)) {
+        promptSubmitted = true;
+      }
+      if (!promptSubmitted) {
+        if (!hadPreexistingAttachments && (attachments || []).length > 0) {
+          for (const ctrl of composerAttachmentControls()) {
+            try {
+              ctrl.click();
+            } catch (_) {}
+          }
+        }
+        if (filledInputInThisJob && composerEl) {
+          try {
+            await fillInputWithPrompt(composerEl, "");
+          } catch (_) {}
+        }
+      }
       job.completed = true;
       if (activeJob === job) {
         activeJob = null;

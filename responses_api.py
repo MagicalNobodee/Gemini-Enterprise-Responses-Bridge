@@ -328,7 +328,7 @@ def prepare_request(payload: dict, store: ResponseStore) -> tuple[ChatCompletion
         stream_options={"include_usage": True}, tools=tools, tool_choice=choice,
         parallel_tool_calls=payload.get("parallel_tool_calls", True), response_format=response_format,
         max_completion_tokens=payload.get("max_output_tokens"), temperature=payload.get("temperature"), top_p=payload.get("top_p"),
-        session_id=payload.get("prompt_cache_key"))
+        session_id=payload.get("prompt_cache_key") or previous.get("prompt_cache_key"))
     return req, mapping, [m.model_dump(exclude_none=True) for m in messages]
 
 
@@ -354,11 +354,14 @@ def output_call(call: dict, mapping: dict) -> dict:
 
 
 def response_base(payload: dict, model: str) -> dict:
-    return {"id": "resp_bridge_" + uuid.uuid4().hex, "object": "response", "created_at": int(time.time()),
+    base = {"id": "resp_bridge_" + uuid.uuid4().hex, "object": "response", "created_at": int(time.time()),
             "status": "in_progress", "model": model, "output": [], "error": None, "incomplete_details": None,
             "parallel_tool_calls": payload.get("parallel_tool_calls", True), "tool_choice": payload.get("tool_choice", "auto"),
             "tools": payload.get("tools", []), "instructions": payload.get("instructions"), "metadata": payload.get("metadata") or {},
             "usage": None, "store": payload.get("store", True)}
+    if payload.get("prompt_cache_key"):
+        base["prompt_cache_key"] = payload["prompt_cache_key"]
+    return base
 
 
 def usage_from_chat(usage: dict) -> dict:
@@ -406,7 +409,15 @@ async def translate_response(upstream: Any, payload: dict, model: str, mapping: 
         if upstream.status_code >= 400:
             return upstream
         upstream = json.loads(upstream.body)
-    response = response_base(payload, model)
+    inherited_cache_key = payload.get("prompt_cache_key")
+    if not inherited_cache_key and payload.get("previous_response_id"):
+        try:
+            prev_resp, _ = store.get(payload["previous_response_id"])
+            inherited_cache_key = prev_resp.get("prompt_cache_key")
+        except Exception:
+            inherited_cache_key = None
+    effective_payload = {**payload, "prompt_cache_key": inherited_cache_key} if inherited_cache_key else payload
+    response = response_base(effective_payload, model)
     if not isinstance(upstream, StreamingResponse):
         msg = upstream["choices"][0]["message"]
         annotations = [

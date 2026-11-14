@@ -80,6 +80,7 @@ class BridgeSettings:
     generated_dir: str = ""
     response_store_dir: str = ""
     response_store_ttl_seconds: float = 86400.0
+    session_archive_path: str = ""
     usage_ledger_path: str = ""
     usd_to_cny_rate: float = 6.8
     price_overrides_json: str = ""
@@ -134,6 +135,9 @@ class BridgeSettings:
             response_store_ttl_seconds=max(
                 60.0, _env_float("BRIDGE_RESPONSE_STORE_TTL", 86400.0)
             ),
+            session_archive_path=os.getenv(
+                "BRIDGE_SESSION_ARCHIVE_PATH", str(root / ".cache" / "session_archive.sqlite3")
+            ).strip(),
             usage_ledger_path=os.getenv(
                 "BRIDGE_USAGE_LEDGER_PATH", str(root / ".cache" / "usage_ledger.json")
             ).strip(),

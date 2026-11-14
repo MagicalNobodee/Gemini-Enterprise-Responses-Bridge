@@ -169,6 +169,8 @@ class BridgeCallbackPayload(_FlexibleModel):
 
     client_id: Optional[str] = None
     tab_id: Optional[int] = None
+    tab_url: Optional[str] = None
+    tab_title: Optional[str] = None
     request_id: str
     reply: Optional[str] = None
     error: Optional[str] = None

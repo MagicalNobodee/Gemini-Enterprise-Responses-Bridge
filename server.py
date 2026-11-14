@@ -29,7 +29,7 @@ from agent_policy import (CARBON_CONTEXT_WINDOW, CARBON_AUTO_COMPACT_TOKENS,
                           COMPACTION_INSTRUCTIONS, CODING_WORKFLOW, has_coding_tools,
                           reading_diagnostics, split_checkpoint_history)
 from context_builder import ConversationContextBuilder
-from dashboard_html import DASHBOARD_HTML
+from dashboard_html import DASHBOARD_HTML, get_dashboard_html
 from extension_exporter import export_extension_bundle
 from gcloud_provider import GCloudUpstreamError, GCloudVertexProvider
 from schemas import (
@@ -116,6 +116,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
     context_builder = ConversationContextBuilder(
         default_mode=cfg.context_mode,
         auto_reset_new_chat=cfg.auto_reset_new_chat,
+        archive_path=cfg.session_archive_path,
     )
     gcloud = GCloudVertexProvider(cfg)
     price_overrides: Dict[str, Any] = {}
@@ -134,6 +135,13 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
     )
     hub.on_slot_removed = context_builder.drop_slot
     hub.on_slot_migrated = context_builder.migrate_slot_key
+    hub.on_slot_evicted = lambda s: context_builder.evict_slot_to_archive(
+        s.slot_key,
+        fallback_url=s.tab_url or "",
+        fallback_explicit_session_id=s.pinned_session_id,
+    )
+    hub.has_slot_conversation = context_builder.has_active_conversation
+    hub.is_slot_session_active = lambda s: context_builder.is_slot_session_active(s.slot_key, s.to_public_dict())
     _ledger_task_var: contextvars.ContextVar[str] = contextvars.ContextVar("bridge_ledger_task", default="chat")
     context_diagnostics: Dict[str, Any] = {}
     diagnostic_request: Optional[ChatCompletionRequest] = None
@@ -151,6 +159,12 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
         return ""
 
     def build_live_ledger_snapshot(include_catalog: bool = False, hub_snap: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        hydrated = context_builder.hydrate_live_slots_from_archive(hub.ready_slot_url_map())
+        if hydrated:
+            for h_slot_key, h_sid in hydrated.items():
+                if h_sid:
+                    hub.restore_slot_affinity(h_slot_key, h_sid)
+            hub_snap = hub.status_snapshot()
         snap = hub_snap if hub_snap is not None else hub.status_snapshot()
         ctx_mon = context_builder.get_context_snapshot(snap.get("worker_slots") or [])
         hint = _active_model_hint(snap, ctx_mon)
@@ -196,15 +210,105 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                         sum(len(call["function"]["arguments"]) for call in parsed.tool_calls))
 
     @asynccontextmanager
-    async def conversation_slot(**options):
-        async with hub.acquire_slot(**options) as slot:
+    async def conversation_slot(
+        *,
+        request_messages,
+        model_name: str,
+        explicit_session_id: Optional[str],
+        tools_active: bool,
+        queue_timeout: float,
+    ):
+        hydrated = context_builder.hydrate_live_slots_from_archive(hub.ready_slot_url_map())
+        for h_slot_key, h_sid in hydrated.items():
+            if h_sid:
+                hub.restore_slot_affinity(h_slot_key, h_sid)
+
+        ready_keys = hub.list_ready_slot_keys()
+        matching_slots = context_builder.find_matching_slots(
+            ready_keys,
+            request_messages,
+            model=model_name,
+        )
+        aff_slot = hub.get_affinity_slot_key(explicit_session_id)
+        archived_match = None
+        if aff_slot not in ready_keys and not matching_slots:
+            archived_match = context_builder.find_archived_session(
+                request_messages,
+                model=model_name,
+                explicit_session_id=explicit_session_id,
+            )
+
+        ephemeral_aux = bool(
+            not tools_active
+            and (
+                (aff_slot and context_builder.has_active_tool_session(aff_slot))
+                or any(context_builder.has_active_tool_session(k) for k in matching_slots)
+                or (
+                    archived_match is not None
+                    and bool(archived_match.tools_fp)
+                    and len(archived_match.turns) >= 2
+                )
+            )
+        )
+        if ephemeral_aux:
+            matching_slots = [
+                k for k in matching_slots if not context_builder.has_active_tool_session(k)
+            ]
+            archived_match = None
+
+        effective_sid = None if ephemeral_aux else explicit_session_id
+        async with hub.acquire_slot(
+            explicit_session_id=explicit_session_id,
+            matching_slot_keys=matching_slots,
+            queue_timeout=queue_timeout,
+            ephemeral_aux=ephemeral_aux,
+            preferred_session_url=archived_match.session_url if archived_match is not None else None,
+        ) as slot:
+            slot.last_dispatch_submitted = False
+            slot.last_dispatch_tab_reset = False
+            resumed_from_archive = False
+            if archived_match is not None and not context_builder.has_active_conversation(slot.slot_key):
+                resumed_ok = await hub.navigate_slot_to_session(slot, archived_match.session_url)
+                if resumed_ok:
+                    context_builder.restore_archived_to_slot(
+                        slot.slot_key,
+                        archived_match,
+                        explicit_session_id=effective_sid,
+                        session_url=slot.tab_url or archived_match.session_url,
+                    )
+                    resumed_from_archive = True
+                else:
+                    context_builder.delete_archived_session(archived_match.archive_key)
+                    context_builder.invalidate_session(slot.slot_key)
             try:
-                yield slot
+                yield slot, effective_sid, resumed_from_archive
             except BaseException as exc:
-                context_builder.invalidate_session(slot.slot_key)
+                if isinstance(exc, ToolProtocolError):
+                    err_kind = "protocol_error"
+                elif isinstance(exc, BrowserTaskFailure):
+                    err_kind = "upstream_task_failure"
+                else:
+                    err_kind = "interrupted"
+                preserved = context_builder.record_failed_turn(
+                    slot.slot_key,
+                    kind=err_kind,
+                    reason=str(exc),
+                    submitted=bool(slot.last_dispatch_submitted),
+                    tab_reset=bool(slot.last_dispatch_tab_reset),
+                )
                 if isinstance(exc, (ToolProtocolError, BrowserTaskFailure)):
+                    logger.warning(
+                        "Rejected browser reply on slot=%s (preserved=%s): %s",
+                        slot.slot_key,
+                        preserved,
+                        exc,
+                    )
                     hub.record_reply_error(slot, str(exc))
-                slot.pending_tool_call_until = 0.0
+                slot.pending_tool_call_until = (
+                    time.time() + 60.0
+                    if preserved and context_builder.has_active_tool_session(slot.slot_key)
+                    else 0.0
+                )
                 raise
 
     @asynccontextmanager
@@ -226,6 +330,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
             yield
         finally:
             response_store.close()
+            context_builder.close()
 
     app = FastAPI(
         title="Gemini Enterprise Web-to-API Bridge",
@@ -291,7 +396,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
     async def root_dashboard() -> HTMLResponse:
-        return HTMLResponse(content=DASHBOARD_HTML)
+        return HTMLResponse(content=get_dashboard_html())
 
     @app.get("/health")
     async def health() -> Dict[str, Any]:
@@ -306,6 +411,17 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
     async def api_status() -> Dict[str, Any]:
         hub_snap = hub.status_snapshot()
         live_ledger = build_live_ledger_snapshot(include_catalog=False, hub_snap=hub_snap)
+        ctx_mon = live_ledger.get("context_monitor") or {}
+        ctx_slots = ctx_mon.get("slots") or []
+        working_tab_ids = [
+            int(s["tab_id"])
+            for s in ctx_slots
+            if isinstance(s, dict)
+            and s.get("tab_id") is not None
+            and (bool(s.get("busy")) or bool(s.get("session_active")) or int(s.get("waiting_count") or 0) > 0)
+        ]
+        hub_snap["working_slots"] = int(ctx_mon.get("working_session_count") or 0)
+        await hub.push_working_tabs_if_changed(working_tab_ids)
         return {
             "status": "ok",
             "backend_mode": cfg.backend_mode,
@@ -341,6 +457,25 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
         slot_key = str((body or {}).get("slot_key") or "").strip()
         if not slot_key:
             return JSONResponse(status_code=400, content={"ok": False, "detail": "缺少席位标识 slot_key"})
+        existing_slot = hub._slots.get(slot_key)
+        if existing_slot is not None:
+            if (
+                existing_slot.is_busy
+                or existing_slot.waiting_count > 0
+                or context_builder.is_slot_session_active(slot_key, existing_slot.to_public_dict())
+            ):
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "ok": False,
+                        "detail": "该工作席位正在执行任务中，请等待本轮任务完成后再开启新对话",
+                    },
+                )
+            context_builder.evict_slot_to_archive(
+                slot_key,
+                fallback_url=existing_slot.tab_url or "",
+                fallback_explicit_session_id=existing_slot.pinned_session_id,
+            )
         try:
             result = await hub.reset_worker_slot(slot_key)
         except KeyError as exc:
@@ -435,6 +570,8 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                     "type": "request_complete",
                     "request_id": payload.request_id,
                     "tab_id": payload.tab_id,
+                    "tab_url": payload.tab_url,
+                    "tab_title": payload.tab_title,
                     "reply": payload.reply or "",
                     "output_images": payload.output_images or [],
                     "output_files": payload.output_files or [],
@@ -1098,30 +1235,14 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
             )
 
         if not request.stream:
-            matching_slots = context_builder.find_matching_slots(
-                hub.list_ready_slot_keys(),
-                request.messages,
-                model=model_name,
-            )
-            aff_slot = hub.get_affinity_slot_key(explicit_session_id)
-            ephemeral_aux = bool(
-                not tools_active
-                and (
-                    (aff_slot and context_builder.has_active_tool_session(aff_slot))
-                    or any(context_builder.has_active_tool_session(k) for k in matching_slots)
-                )
-            )
-            if ephemeral_aux:
-                matching_slots = [
-                    k for k in matching_slots if not context_builder.has_active_tool_session(k)
-                ]
             try:
                 async with conversation_slot(
+                    request_messages=request.messages,
+                    model_name=model_name,
                     explicit_session_id=explicit_session_id,
-                    matching_slot_keys=matching_slots,
+                    tools_active=tools_active,
                     queue_timeout=cfg.queue_timeout_seconds,
-                    ephemeral_aux=ephemeral_aux,
-                ) as slot:
+                ) as (slot, effective_sid, resumed_from_archive):
                     session_key = slot.slot_key
                     prepared = context_builder.build(
                         messages=request.messages,
@@ -1134,6 +1255,8 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                     )
                     prepared.prompt = reference_historical_images(prepared.prompt, old_image_markers)
                     record_context(request, prepared, input_attachments, old_image_markers)
+                    if resumed_from_archive:
+                        context_diagnostics["resumed_archived_session"] = True
                     raw_out_images: list[dict[str, Any]] = []
                     raw_out_files: list[dict[str, Any]] = []
                     raw_reply = await hub.dispatch_complete_on_slot(
@@ -1198,6 +1321,8 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                             logical_prompt_tokens=logical_in_tokens,
                             web_prompt_tokens=web_sent_toks,
                             last_strategy=prepared.strategy_used,
+                            session_url=slot.tab_url or None,
+                            explicit_session_id=effective_sid,
                         )
                         slot_ctx = context_builder.get_slot_context_metrics(session_key) or {}
                     usage_ledger.record_request(
@@ -1262,29 +1387,13 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
             emitted_content: list[str] = []
 
             try:
-                matching_slots = context_builder.find_matching_slots(
-                    hub.list_ready_slot_keys(),
-                    request.messages,
-                    model=model_name,
-                )
-                aff_slot = hub.get_affinity_slot_key(explicit_session_id)
-                ephemeral_aux = bool(
-                    not tools_active
-                    and (
-                        (aff_slot and context_builder.has_active_tool_session(aff_slot))
-                        or any(context_builder.has_active_tool_session(k) for k in matching_slots)
-                    )
-                )
-                if ephemeral_aux:
-                    matching_slots = [
-                        k for k in matching_slots if not context_builder.has_active_tool_session(k)
-                    ]
                 async with conversation_slot(
+                    request_messages=request.messages,
+                    model_name=model_name,
                     explicit_session_id=explicit_session_id,
-                    matching_slot_keys=matching_slots,
+                    tools_active=tools_active,
                     queue_timeout=cfg.queue_timeout_seconds,
-                    ephemeral_aux=ephemeral_aux,
-                ) as slot:
+                ) as (slot, effective_sid, resumed_from_archive):
                     session_key = slot.slot_key
                     prepared = context_builder.build(
                         messages=request.messages,
@@ -1298,6 +1407,8 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
 
                     prepared.prompt = reference_historical_images(prepared.prompt, old_image_markers)
                     record_context(request, prepared, input_attachments, old_image_markers)
+                    if resumed_from_archive:
+                        context_diagnostics["resumed_archived_session"] = True
                     stream_out_images: list[dict[str, Any]] = []
                     stream_out_files: list[dict[str, Any]] = []
                     async for delta in hub.dispatch_stream_on_slot(
@@ -1403,6 +1514,8 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                             logical_prompt_tokens=logical_in_tokens,
                             web_prompt_tokens=web_sent_toks,
                             last_strategy=prepared.strategy_used,
+                            session_url=slot.tab_url or None,
+                            explicit_session_id=effective_sid,
                         )
                         turn_completed = True
                     else:
@@ -1419,6 +1532,8 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                                 logical_prompt_tokens=logical_in_tokens,
                                 web_prompt_tokens=web_sent_toks,
                                 last_strategy=prepared.strategy_used,
+                                session_url=slot.tab_url or None,
+                                explicit_session_id=effective_sid,
                             )
                             turn_completed = True
                     if turn_completed:

@@ -6,7 +6,13 @@ import pytest
 from configure_codex_context import update_catalog, update_profile
 from context_builder import ConversationContextBuilder
 from schemas import ChatMessage
-from tool_calling import ToolStreamProcessor, ToolProtocolError, build_tool_system_instructions, parse_assistant_output
+from tool_calling import (
+    ToolStreamProcessor,
+    ToolProtocolError,
+    build_tool_delta_reminder,
+    build_tool_system_instructions,
+    parse_assistant_output,
+)
 from test_responses import browser, packets
 
 
@@ -173,3 +179,121 @@ def test_parallel_safe_read_pipelines_and_multi_object_fence():
         parse_assistant_output(call('git status') + call('git checkout main'), tools())
     instructions = build_tool_system_instructions(tools())
     assert 'RFC 8259' in instructions and 'Markdown backslash escaping' in instructions
+    assert 'Default to ONE codex_tool_call code block per turn.' in instructions
+    reminder = build_tool_delta_reminder(tools(), has_tool_results=True)
+    assert 'emit one fenced codex_tool_call JSON block' in reminder
+    assert 'block(s)' not in reminder
+
+
+def test_real_world_read_queries_coordinator_tools_and_disjoint_patches():
+    multi_tools = [
+        {'type': 'function', 'function': {'name': 'functions.exec_command', 'parameters': {'type': 'object'}}},
+        {'type': 'function', 'function': {'name': 'functions.apply_patch', 'parameters': {'type': 'object'}}},
+        {'type': 'function', 'function': {'name': 'functions.view_image', 'parameters': {'type': 'object'}}},
+        {'type': 'function', 'function': {'name': 'functions.update_plan', 'parameters': {'type': 'object'}}},
+    ]
+
+    def fence_call(name, args):
+        return '```codex_tool_call\n' + json.dumps({'name': name, 'arguments': args}, ensure_ascii=False) + '\n```\n'
+
+    # 1. Real-world read-only shell commands (cd, single-quoted backticks, sed regex/step, awk, codegraph, node -v/--check, git branch/remote)
+    rich_reads = (
+        fence_call('functions.exec_command', {'cmd': "cd work && rg -n '`template`' src/ 2>/dev/null || true"})
+        + fence_call('functions.exec_command', {'cmd': "sed -n '/function init/,+40p' work/src/main.js"})
+        + fence_call('functions.exec_command', {'cmd': "awk 'NR>=100 && NR<=200' work/src/main.js"})
+        + fence_call('functions.exec_command', {'cmd': 'node -v && npm -v && node --check work/src/main.js && codegraph explore "main.js" && git branch --show-current && git remote -v >/dev/null'})
+    )
+    assert len(parse_assistant_output(rich_reads, multi_tools).tool_calls) == 4
+
+    # Unsafe variants of those commands must still be rejected in multi-call batches
+    for unsafe_cmd in [
+        "sed -n '1,10w out.txt' a.txt",
+        'awk \'{system("id")}\' a.txt',
+        'sort -o out.txt a.txt',
+        'echo "`id`"',
+        'git branch new-feature',
+        'node -e "console.log(1)"',
+    ]:
+        with pytest.raises(ToolProtocolError):
+            parse_assistant_output(call('cat a.txt') + call(unsafe_cmd), multi_tools)
+
+    # 2. Coordinator / UI tools alongside a single workspace command or patch
+    img_plus_ocr = (
+        fence_call('functions.view_image', {'path': '/tmp/shot.png'})
+        + fence_call('functions.exec_command', {'cmd': "swift -e 'print(1)'"})
+    )
+    assert len(parse_assistant_output(img_plus_ocr, multi_tools).tool_calls) == 2
+
+    patch_a = '*** Begin Patch\n*** Add File: work/lan_server.mjs\n+export const port = 8787;\n*** End Patch'
+    patch_b = '*** Begin Patch\n*** Add File: work/src/lan_client.js\n+export const host = "127.0.0.1";\n*** End Patch'
+    plan_plus_patch = (
+        fence_call('functions.update_plan', {'plan': [{'step': 'Add LAN', 'status': 'in_progress'}]})
+        + fence_call('functions.apply_patch', {'input': patch_a})
+    )
+    assert len(parse_assistant_output(plan_plus_patch, multi_tools).tool_calls) == 2
+
+    # Duplicate non-read coordinator calls still fail
+    dup_plan = fence_call('functions.update_plan', {'plan': []}) * 2
+    with pytest.raises(ToolProtocolError):
+        parse_assistant_output(dup_plan, multi_tools)
+
+    # 3. Disjoint-file apply_patch batch succeeds and preserves smart_incremental_delta
+    disjoint_patches = (
+        fence_call('functions.apply_patch', {'input': patch_a})
+        + fence_call('functions.apply_patch', {'input': patch_b})
+    )
+    parsed_disjoint = parse_assistant_output(disjoint_patches, multi_tools)
+    assert len(parsed_disjoint.tool_calls) == 2
+
+    # Same-file or aliasing relative/absolute apply_patch batches still fail
+    patch_a_rel = '*** Begin Patch\n*** Update File: ./work/lan_server.mjs\n@@\n-export const port = 8787;\n+export const port = 8788;\n*** End Patch'
+    patch_a_abs = '*** Begin Patch\n*** Update File: /Users/test/repo/work/lan_server.mjs\n@@\n-export const port = 8787;\n+export const port = 8788;\n*** End Patch'
+    with pytest.raises(ToolProtocolError):
+        parse_assistant_output(
+            fence_call('functions.apply_patch', {'input': patch_a})
+            + fence_call('functions.apply_patch', {'input': patch_a_rel}),
+            multi_tools,
+        )
+    with pytest.raises(ToolProtocolError):
+        parse_assistant_output(
+            fence_call('functions.apply_patch', {'input': patch_a})
+            + fence_call('functions.apply_patch', {'input': patch_a_abs}),
+            multi_tools,
+        )
+    # Patch + shell command in same turn still fails
+    with pytest.raises(ToolProtocolError):
+        parse_assistant_output(
+            fence_call('functions.apply_patch', {'input': patch_a})
+            + fence_call('functions.exec_command', {'cmd': 'ls -la work/lan_server.mjs'}),
+            multi_tools,
+        )
+
+    # Verify full Responses API round-trip with 2 disjoint custom_tool_call patches keeps incremental session
+    resp_tools = [
+        {'type': 'custom', 'name': 'apply_patch'},
+        {'type': 'function', 'name': 'exec_command', 'parameters': {'type': 'object'}},
+    ]
+    raw_two_patches = (
+        fence_call('apply_patch', {'input': patch_a})
+        + fence_call('apply_patch', {'input': patch_b})
+    )
+    with browser([raw_two_patches, 'LAN modules created.']) as (client, commands):
+        r1 = client.post('/v1/responses', json={'input': 'Create LAN modules', 'tools': resp_tools, 'stream': True})
+        resp1 = packets(r1.text)[-1]['response']
+        assert resp1['status'] == 'completed'
+        calls_out = [o for o in resp1['output'] if o['type'] == 'custom_tool_call']
+        assert len(calls_out) == 2
+        r2 = client.post(
+            '/v1/responses',
+            json={
+                'previous_response_id': resp1['id'],
+                'tools': resp_tools,
+                'input': [
+                    {'type': 'custom_tool_call_output', 'call_id': calls_out[0]['call_id'], 'output': 'Success.'},
+                    {'type': 'custom_tool_call_output', 'call_id': calls_out[1]['call_id'], 'output': 'Success.'},
+                ],
+            },
+        )
+        assert r2.status_code == 200
+        assert not commands[-1]['reset_chat']
+        assert '[Conversation History]' not in commands[-1]['prompt']

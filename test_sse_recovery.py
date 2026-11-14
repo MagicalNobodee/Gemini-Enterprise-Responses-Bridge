@@ -101,12 +101,57 @@ def test_http_large_history_recovery_keeps_completed_turns(stream):
         assert (packets(failed.text)[-1]['type'] == 'response.failed') if stream else failed.status_code == 502
         recovered = client.post('/v1/responses', json={**common,'input':history}).json()
         assert recovered['status'] == 'completed'
-        assert commands[-1]['reset_chat']
-        assert 'KEEP_FULL_SOURCE' in commands[-1]['prompt']
-        assert 'Retry Notice' not in commands[-1]['prompt']
+        assert not commands[-1]['reset_chat']
+        assert 'KEEP_FULL_SOURCE' not in commands[-1]['prompt']
+        assert '[Retry Notice — Ignore Incomplete Previous Attempt]' in commands[-1]['prompt']
+        assert 'latest input' in commands[-1]['prompt']
         history += recovered['output'] + [{'role':'user','content':'one more'}]
         assert client.post('/v1/responses', json={**common,'input':history}).json()['status'] == 'completed'
         assert 'Retry Notice' not in commands[-1]['prompt'] and not commands[-1]['reset_chat']
+
+
+@pytest.mark.parametrize('stream', [False, True])
+def test_http_large_history_double_failure_rebuilds_clean_session(stream):
+    history = [{'role':'user','content':'KEEP_FULL_SOURCE\n' + 'x'*120000},
+               {'role':'assistant','content':'recorded'}, {'role':'user','content':'continue'}]
+    with browser([
+        'second answer',
+        {'type':'request_error','error':'network failed'},
+        {'type':'request_error','error':'network failed again'},
+        'recovered',
+    ]) as (client, commands):
+        common = {'model':'gemini-4-carbon','prompt_cache_key':'large-history-double-fail'}
+        first = client.post('/v1/responses', json={**common,'input':history}).json()
+        history += first['output'] + [{'role':'user','content':'latest input'}]
+        failed1 = client.post('/v1/responses', json={**common,'input':history,'stream':stream})
+        assert (packets(failed1.text)[-1]['type'] == 'response.failed') if stream else failed1.status_code == 502
+        failed2 = client.post('/v1/responses', json={**common,'input':history,'stream':stream})
+        assert (packets(failed2.text)[-1]['type'] == 'response.failed') if stream else failed2.status_code == 502
+        assert not commands[-1]['reset_chat']
+        recovered = client.post('/v1/responses', json={**common,'input':history}).json()
+        assert recovered['status'] == 'completed'
+        assert commands[-1]['reset_chat']
+        assert 'KEEP_FULL_SOURCE' in commands[-1]['prompt']
+        assert 'Retry Notice' not in commands[-1]['prompt']
+
+
+def test_pre_submission_error_keeps_session_clean_without_retry_notice():
+    with browser([
+        'first answer',
+        {'type':'request_error','submitted':False,'tab_reset':False,'error':'未找到已打开的标签页'},
+        'recovered',
+    ]) as (client, commands):
+        common = {'model':'gemini-4-carbon','prompt_cache_key':'pre-submit-error'}
+        first = client.post('/v1/responses', json={**common,'input':'hello'}).json()
+        history = [{'role':'user','content':'hello'}] + first['output'] + [{'role':'user','content':'follow up'}]
+        failed = client.post('/v1/responses', json={**common,'input':history})
+        assert failed.status_code == 502
+        recovered = client.post('/v1/responses', json={**common,'input':history}).json()
+        assert recovered['status'] == 'completed'
+        assert not commands[-1]['reset_chat']
+        assert 'Retry Notice' not in commands[-1]['prompt']
+        assert 'hello' not in commands[-1]['prompt']
+        assert 'follow up' in commands[-1]['prompt']
 
 
 def test_local_timeout_sync_preserves_remote_provider_and_global_budgets():

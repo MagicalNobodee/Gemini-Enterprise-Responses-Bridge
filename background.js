@@ -16,7 +16,7 @@ const DEFAULT_SETTINGS = {
 
 const ALARM_NAME = "geb-keepalive-alarm";
 const VERTEX_MATCH_PATTERN = "https://vertexaisearch.cloud.google.com/*";
-const EXPECTED_DRIVER_VERSION = "2.8.2";
+const EXPECTED_DRIVER_VERSION = "2.8.4";
 
 // Live non-serializable WebSocket handle & per-tab fast caches; durable settings live in chrome.storage
 const socketRuntime = {
@@ -30,6 +30,7 @@ const socketRuntime = {
 const runtimeTabMeta = new Map(); // tabId -> { activeModel, capturedRpc }
 const injectedTabVersions = new Map(); // tabId -> driverVersion
 const busyRequestsByTab = new Map(); // requestId -> tabId
+let backendBusyTabIds = new Set(); // session-level active tabIds pushed by Bridge
 let managedTabOrder = new Set(); // stable admitted tabIds within maxParallelTabs
 
 function extractVertexSessionKey(rawUrl) {
@@ -49,10 +50,32 @@ function extractVertexSessionKey(rawUrl) {
 
 function isTabCurrentlyBusy(tabId) {
   if (!tabId) return false;
+  if (backendBusyTabIds.has(Number(tabId))) return true;
   for (const [, tid] of busyRequestsByTab) {
     if (tid === tabId) return true;
   }
   return false;
+}
+
+function applyBackendBusyTabIds(rawIds) {
+  const next = new Set(
+    (Array.isArray(rawIds) ? rawIds : [])
+      .map((n) => Number(n))
+      .filter((n) => Number.isFinite(n) && n > 0)
+  );
+  let changed = next.size !== backendBusyTabIds.size;
+  if (!changed) {
+    for (const id of next) {
+      if (!backendBusyTabIds.has(id)) {
+        changed = true;
+        break;
+      }
+    }
+  }
+  if (changed) {
+    backendBusyTabIds = next;
+    void broadcastTabTakeoverStates();
+  }
 }
 
 async function getManualExclusions() {
@@ -419,7 +442,7 @@ async function reportTabStatusToBackend() {
   const settings = cls.settings;
   const tabsSnapshot = await buildReportedTabsSnapshot(cls);
   const primary = tabsSnapshot[0] || null;
-  const capabilities = ["multi_tab", "reset_tab"];
+  const capabilities = ["multi_tab", "reset_tab", "open_session", "session_busy_sync"];
   if (settings.autoSpawnTabs !== false) {
     capabilities.push("spawn_tab");
   }
@@ -479,7 +502,7 @@ function startHeartbeatInterval() {
       const tabsSnapshot = await buildReportedTabsSnapshot();
       const primary = tabsSnapshot[0] || null;
       const preferredTabId = await getPreferredTabId();
-      const capabilities = ["multi_tab", "reset_tab"];
+      const capabilities = ["multi_tab", "reset_tab", "open_session", "session_busy_sync"];
       if (settings.autoSpawnTabs !== false && !preferredTabId) {
         capabilities.push("spawn_tab");
       }
@@ -533,6 +556,10 @@ async function disconnectWebSocket() {
     } catch (_) {}
   }
   socketRuntime.connecting = false;
+  if (backendBusyTabIds.size > 0) {
+    backendBusyTabIds.clear();
+    void broadcastTabTakeoverStates();
+  }
   await setSessionStatus({ wsConnected: false });
 }
 
@@ -653,6 +680,89 @@ function computeCleanVertexHomeUrl(rawUrl) {
   return "";
 }
 
+function extractVertexSessionIdFromUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== "string") return "";
+  try {
+    const u = new URL(rawUrl.trim());
+    if (!u.hostname.toLowerCase().endsWith("vertexaisearch.cloud.google.com")) {
+      return "";
+    }
+    const m = u.pathname.match(/\/(?:r\/session|session|c)\/([^/?#]+)/i);
+    return m && m[1] ? decodeURIComponent(m[1]).trim() : "";
+  } catch (_) {
+    return "";
+  }
+}
+
+async function waitForSessionPageReady(tabId, targetSessionId, timeoutMs = 12000) {
+  const startedAt = Date.now();
+  const deadline = startedAt + Math.max(1000, Number(timeoutMs) || 12000);
+  let lastUrl = "";
+  let lastTitle = "";
+  let lastActiveModel = "";
+  while (Date.now() < deadline) {
+    let latestTab = null;
+    try {
+      latestTab = await chrome.tabs.get(tabId);
+      if (latestTab) {
+        lastUrl = latestTab.url || lastUrl;
+        lastTitle = latestTab.title || lastTitle;
+      }
+    } catch (_) {}
+
+    let diag = null;
+    try {
+      diag = await chrome.tabs.sendMessage(tabId, { type: "GEB_DIAGNOSE_PAGE" });
+    } catch (_) {
+      await ensureScriptsInjected(tabId);
+    }
+
+    if (diag && diag.ok) {
+      lastUrl = diag.url || lastUrl;
+      lastTitle = diag.title || lastTitle;
+      if (diag.activeModel) {
+        lastActiveModel = diag.activeModel;
+      }
+      const currentSid = extractVertexSessionIdFromUrl(lastUrl);
+      if (targetSessionId) {
+        if (!currentSid && Date.now() - startedAt >= 800) {
+          return {
+            ok: false,
+            redirected: true,
+            tab_url: lastUrl,
+            tab_title: lastTitle,
+            active_model: lastActiveModel,
+            error: "历史会话已被重定向回空白首页"
+          };
+        }
+        if (currentSid === targetSessionId && diag.inputFound) {
+          return {
+            ok: true,
+            tab_url: lastUrl,
+            tab_title: lastTitle,
+            active_model: lastActiveModel
+          };
+        }
+      } else if (diag.inputFound) {
+        return {
+          ok: true,
+          tab_url: lastUrl,
+          tab_title: lastTitle,
+          active_model: lastActiveModel
+        };
+      }
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return {
+    ok: false,
+    tab_url: lastUrl,
+    tab_title: lastTitle,
+    active_model: lastActiveModel,
+    error: "等待历史会话输入框就绪超时"
+  };
+}
+
 function waitForTabComplete(tabId, timeoutMs = 12000) {
   return new Promise((resolve) => {
     let settled = false;
@@ -691,7 +801,7 @@ async function prepareTabForBackgroundExecution(tab) {
     await reloadWait;
     await new Promise((r) => setTimeout(r, 650));
     await ensureScriptsInjected(freshTab.id);
-    injectedTabVersions.set(freshTab.id, "2.6");
+    injectedTabVersions.set(freshTab.id, EXPECTED_DRIVER_VERSION);
     try {
       freshTab = await chrome.tabs.get(freshTab.id);
     } catch (_) {}
@@ -700,7 +810,7 @@ async function prepareTabForBackgroundExecution(tab) {
   return freshTab;
 }
 
-async function spawnParallelWorkerTab(baseUrlHint = "") {
+async function spawnParallelWorkerTab(baseUrlHint = "", preserveSessionUrl = false) {
   const cls = await classifyAllVertexTabs();
   const allVertexTabs = cls.allTabs;
   const maxTabs = cls.maxTabs;
@@ -710,7 +820,9 @@ async function spawnParallelWorkerTab(baseUrlHint = "") {
 
   let targetUrl = "";
   if (baseUrlHint && baseUrlHint.startsWith("https://vertexaisearch.cloud.google.com")) {
-    targetUrl = computeCleanVertexHomeUrl(baseUrlHint) || baseUrlHint;
+    targetUrl = preserveSessionUrl
+      ? baseUrlHint
+      : (computeCleanVertexHomeUrl(baseUrlHint) || baseUrlHint);
   }
   if (!targetUrl && allVertexTabs.length > 0) {
     const refUrl = allVertexTabs[0].url || "";
@@ -730,12 +842,24 @@ async function spawnParallelWorkerTab(baseUrlHint = "") {
     throw new Error("无法创建新的后台工作标签页");
   }
 
+  const loadPromise =
+    created.status === "complete" ? Promise.resolve() : waitForTabComplete(created.id, 14000);
   await protectTabFromFreeze(created.id);
   managedTabOrder.add(created.id);
-  await waitForTabComplete(created.id, 14000);
+  await loadPromise;
   await new Promise((r) => setTimeout(r, 600));
   await ensureScriptsInjected(created.id);
-  injectedTabVersions.set(created.id, "2.6");
+  injectedTabVersions.set(created.id, EXPECTED_DRIVER_VERSION);
+
+  const targetSid = preserveSessionUrl ? extractVertexSessionIdFromUrl(targetUrl) : "";
+  let sessionProbe = null;
+  if (targetSid) {
+    sessionProbe = await waitForSessionPageReady(created.id, targetSid, 10000);
+    if (sessionProbe.active_model) {
+      const prevMeta = runtimeTabMeta.get(created.id) || {};
+      runtimeTabMeta.set(created.id, { ...prevMeta, activeModel: sessionProbe.active_model });
+    }
+  }
 
   let latest = created;
   try {
@@ -746,8 +870,9 @@ async function spawnParallelWorkerTab(baseUrlHint = "") {
   await reportTabStatusToBackend();
   return {
     tab_id: latest.id,
-    tab_url: latest.url || targetUrl,
-    tab_title: latest.title || "Gemini Enterprise",
+    tab_url: (sessionProbe && sessionProbe.tab_url) || latest.url || targetUrl,
+    tab_title: (sessionProbe && sessionProbe.tab_title) || latest.title || "Gemini Enterprise",
+    active_model: (sessionProbe && sessionProbe.active_model) || "",
     ready: true
   };
 }
@@ -913,7 +1038,9 @@ async function deliverResultToBackend(eventData) {
           source: eventData.source || "http_callback",
           output_images: eventData.output_images || [],
           output_files: eventData.output_files || [],
-          active_model: eventData.active_model || null
+          active_model: eventData.active_model || null,
+          tab_url: eventData.tab_url || null,
+          tab_title: eventData.tab_title || null
         })
       });
       if (resp.ok) {
@@ -954,7 +1081,10 @@ async function deliverResultToBackend(eventData) {
 
 async function handleBackendCommand(msg) {
   const type = msg.type || "";
-  if (type === "welcome" || type === "pong" || type === "ack") {
+  if (Array.isArray(msg.busy_tab_ids)) {
+    applyBackendBusyTabIds(msg.busy_tab_ids);
+  }
+  if (type === "sync_busy_tabs" || type === "welcome" || type === "pong" || type === "ack") {
     return;
   }
   if (type === "ping") {
@@ -977,7 +1107,10 @@ async function handleBackendCommand(msg) {
   if (type === "spawn_tab") {
     const spawnId = msg.spawn_id || "";
     try {
-      const spawned = await spawnParallelWorkerTab(msg.base_url || "");
+      const spawned = await spawnParallelWorkerTab(
+        msg.base_url || "",
+        Boolean(msg.preserve_session_url)
+      );
       sendWsJson({
         type: "spawn_tab_result",
         spawn_id: spawnId,
@@ -1023,6 +1156,55 @@ async function handleBackendCommand(msg) {
     return;
   }
 
+  if (type === "open_session") {
+    const openId = msg.open_id || "";
+    const sessionUrl = String(msg.session_url || "").trim();
+    const targetSid = extractVertexSessionIdFromUrl(sessionUrl);
+    try {
+      if (!sessionUrl || !sessionUrl.startsWith("https://vertexaisearch.cloud.google.com") || !targetSid) {
+        throw new Error("无效的历史会话地址");
+      }
+      const rawTab = await findTargetVertexTab(msg.tab_id);
+      if (!rawTab || !rawTab.id) {
+        throw new Error("未找到对应的 Google 工作标签页");
+      }
+      const tab = await prepareTabForBackgroundExecution(rawTab);
+      const currentSid = extractVertexSessionIdFromUrl(tab.url || "");
+      if (currentSid !== targetSid) {
+        const loadPromise = waitForTabComplete(tab.id, 14000);
+        await chrome.tabs.update(tab.id, { url: sessionUrl });
+        await loadPromise;
+        await new Promise((r) => setTimeout(r, 450));
+      }
+      await ensureTabBridgeReady(tab.id);
+      const readyRes = await waitForSessionPageReady(tab.id, targetSid, 12000);
+      if (readyRes.active_model) {
+        const prevMeta = runtimeTabMeta.get(tab.id) || {};
+        runtimeTabMeta.set(tab.id, { ...prevMeta, activeModel: readyRes.active_model });
+      }
+      await reportTabStatusToBackend();
+      sendWsJson({
+        type: "open_session_result",
+        open_id: openId,
+        ok: Boolean(readyRes.ok),
+        tab_id: tab.id,
+        tab_url: readyRes.tab_url || "",
+        tab_title: readyRes.tab_title || "",
+        active_model: readyRes.active_model || "",
+        error: readyRes.ok ? undefined : (readyRes.error || "历史会话未能打开或已被重定向")
+      });
+    } catch (err) {
+      await reportTabStatusToBackend();
+      sendWsJson({
+        type: "open_session_result",
+        open_id: openId,
+        ok: false,
+        error: err && err.message ? err.message : String(err)
+      });
+    }
+    return;
+  }
+
   if (type === "execute_prompt_chunk") {
     // Buffer chunks safely inside Service Worker FIRST so any subsequent tab wake/reload/new_chat
     // navigation during `execute_prompt` NEVER wipes buffered prompt chunks!
@@ -1038,6 +1220,7 @@ async function handleBackendCommand(msg) {
 
   if (type === "execute_prompt") {
     const requestId = msg.request_id;
+    let tabResetDone = false;
     try {
       let assembledPrompt = String(msg.prompt || "");
       if (msg.chunked) {
@@ -1052,6 +1235,8 @@ async function handleBackendCommand(msg) {
         sendWsJson({
           type: "request_error",
           request_id: requestId,
+          submitted: false,
+          tab_reset: false,
           error: "未找到已打开的 https://vertexaisearch.cloud.google.com 标签页。"
         });
         return;
@@ -1078,6 +1263,7 @@ async function handleBackendCommand(msg) {
       if (remainingResetChat) {
         const resetDone = await resetTabChatWithFallback(tab);
         if (resetDone) {
+          tabResetDone = true;
           remainingResetChat = false;
         }
       }
@@ -1153,6 +1339,8 @@ async function handleBackendCommand(msg) {
       sendWsJson({
         type: "request_error",
         request_id: requestId,
+        submitted: false,
+        tab_reset: tabResetDone,
         error: "Gemini 工作页面恢复或发送失败: " + err.message
       });
     }
@@ -1313,6 +1501,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (senderTabId !== null && eventData.tab_id === undefined) {
         eventData.tab_id = senderTabId;
       }
+      if (sender && sender.tab) {
+        if (!eventData.tab_url && sender.tab.url) {
+          eventData.tab_url = sender.tab.url;
+        }
+        if (!eventData.tab_title && sender.tab.title) {
+          eventData.tab_title = sender.tab.title;
+        }
+      }
 
       if (senderTabId !== null) {
         const prevMeta = runtimeTabMeta.get(senderTabId) || {};
@@ -1357,6 +1553,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           const mergedJson = assembleChunks(entry, total);
           const unpacked = JSON.parse(mergedJson);
           if (senderTabId !== null && !unpacked.tab_id) unpacked.tab_id = senderTabId;
+          if (sender && sender.tab) {
+            if (!unpacked.tab_url && sender.tab.url) unpacked.tab_url = sender.tab.url;
+            if (!unpacked.tab_title && sender.tab.title) unpacked.tab_title = sender.tab.title;
+          }
           await deliverResultToBackend(unpacked);
         } else if (eventData.type === "request_complete" && eventData.chunked) {
           const entry = swReplyReassembly.get(eventData.request_id);

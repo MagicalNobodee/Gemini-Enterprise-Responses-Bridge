@@ -178,7 +178,12 @@ def test_http_compaction_and_previous_id_survive_app_restart(tmp_path):
 
 @pytest.mark.parametrize('stream', [False, True])
 def test_failed_turn_invalidates_incremental_page_history(stream):
-    with browser(['first answer', {'type':'request_error','error':'network failed'}, 'recovered']) as (client, commands):
+    with browser([
+        'first answer',
+        {'type':'request_error','error':'network failed'},
+        {'type':'request_error','error':'network failed again'},
+        'recovered',
+    ]) as (client, commands):
         first = client.post('/v1/responses', json={'input':'first question', 'prompt_cache_key':'failure-recovery'}).json()
         history = [{'role':'user','content':'first question'}] + first['output'] + [{'role':'user','content':'next'}]
         failed = client.post('/v1/responses', json={'input':history, 'prompt_cache_key':'failure-recovery', 'stream':stream})
@@ -186,9 +191,18 @@ def test_failed_turn_invalidates_incremental_page_history(stream):
             assert packets(failed.text)[-1]['type'] == 'response.failed'
         else:
             assert failed.status_code == 502
+        failed2 = client.post('/v1/responses', json={'input':history, 'prompt_cache_key':'failure-recovery', 'stream':stream})
+        if stream:
+            assert packets(failed2.text)[-1]['type'] == 'response.failed'
+        else:
+            assert failed2.status_code == 502
+        assert commands[-1]['reset_chat'] is False
+        assert '[Retry Notice — Ignore Incomplete Previous Attempt]' in commands[-1]['prompt']
+        assert 'first question' not in commands[-1]['prompt']
         result = client.post('/v1/responses', json={'input':history, 'prompt_cache_key':'failure-recovery'}).json()
         assert result['status'] == 'completed'
-        assert 'first question' in commands[-1]['prompt'], 'retry must reconstruct history after a partially submitted turn'
+        assert commands[-1]['reset_chat'] is True
+        assert 'first question' in commands[-1]['prompt'], 'second consecutive failure must reconstruct history in a clean chat'
 
 
 def test_buffered_tool_stream_keeps_client_alive(monkeypatch):

@@ -389,7 +389,7 @@
       }
     } catch (error) {
       void chrome.runtime.sendMessage({type: "GEB_DRIVER_EVENT", payload: {
-        type: "request_error", request_id: message.request_id, error: error.message
+        type: "request_error", request_id: message.request_id, submitted: false, tab_reset: false, error: error.message
       }}).catch(() => {});
     }
   }

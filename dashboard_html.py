@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -41,6 +43,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
 
     * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
 
     body {
       margin: 0;
@@ -115,13 +118,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       display: inline-flex;
       align-items: center;
       gap: 8px;
-      padding: 7px 14px;
+      height: 36px;
+      padding: 0 14px;
       border-radius: 999px;
-      font-size: 0.84rem;
+      font-size: 0.82rem;
       font-weight: 600;
       background: var(--surface);
       border: 1px solid var(--border);
       box-shadow: 0 2px 8px rgba(15, 23, 42, 0.03);
+      white-space: nowrap;
+      transition: border-color 0.2s ease, background 0.2s ease, box-shadow 0.2s ease;
+    }
+    .live-pill.flash {
+      border-color: rgba(37, 99, 235, 0.36);
+      box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
     }
 
     .dot {
@@ -140,22 +150,28 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       align-items: center;
       justify-content: center;
       gap: 6px;
-      padding: 8px 15px;
-      border-radius: 11px;
+      height: 36px;
+      padding: 0 14px;
+      border-radius: 10px;
       border: 1px solid var(--border);
       background: var(--surface);
       color: var(--text-sub);
       font: inherit;
-      font-size: 0.85rem;
+      font-size: 0.84rem;
       font-weight: 600;
       cursor: pointer;
-      transition: all 0.16s ease;
+      white-space: nowrap;
+      user-select: none;
+      transition: transform 0.12s ease, background 0.16s ease, border-color 0.16s ease, color 0.16s ease, box-shadow 0.16s ease;
       text-decoration: none;
     }
     .btn:hover:not(:disabled) {
       border-color: var(--border-strong);
       background: var(--surface-soft);
       color: var(--text);
+    }
+    .btn:active:not(:disabled) {
+      transform: scale(0.96);
     }
     .btn:disabled {
       opacity: 0.55;
@@ -180,17 +196,54 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       background: #dbeafe;
     }
     .btn.sm {
-      padding: 5px 11px;
+      height: 28px;
+      padding: 0 10px;
       font-size: 0.78rem;
       border-radius: 8px;
+    }
+
+    @keyframes refreshSpin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+    .btn-refresh {
+      min-width: 88px;
+    }
+    .refresh-icon {
+      width: 15px;
+      height: 15px;
+      flex-shrink: 0;
+      transition: transform 0.25s ease;
+    }
+    .btn-refresh:hover:not(:disabled):not(.is-refreshing) .refresh-icon {
+      transform: rotate(35deg);
+    }
+    .btn-refresh.is-refreshing {
+      border-color: rgba(37, 99, 235, 0.38);
+      background: var(--primary-soft);
+      color: var(--primary);
+    }
+    .btn-refresh.is-refreshing .refresh-icon {
+      animation: refreshSpin 0.56s linear infinite;
+    }
+    .btn-refresh.is-refreshed {
+      border-color: var(--ok-border);
+      background: var(--ok-soft);
+      color: var(--ok);
+    }
+    .btn-refresh.is-error {
+      border-color: var(--err-border);
+      background: var(--err-soft);
+      color: var(--err);
     }
 
     /* 3-Step Self-Check Strip */
     .check-strip {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 12px;
-      margin-bottom: 20px;
+      gap: 14px;
+      margin-bottom: 18px;
+      align-items: stretch;
     }
     @media (max-width: 820px) {
       .check-strip { grid-template-columns: 1fr; }
@@ -198,12 +251,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .step-card {
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 16px;
-      padding: 13px 16px;
+      border-radius: 15px;
+      min-height: 60px;
+      padding: 11px 16px;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 12px;
+      gap: 10px;
       box-shadow: var(--shadow-card);
       transition: border-color 0.2s ease;
     }
@@ -213,14 +267,27 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .step-left {
       display: flex;
       align-items: center;
-      gap: 11px;
+      gap: 10px;
+      min-width: 0;
+      flex: 1;
+    }
+    .step-text {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
       min-width: 0;
     }
+    .step-right {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
     .step-badge {
-      width: 28px;
-      height: 28px;
-      border-radius: 9px;
-      font-size: 0.8rem;
+      width: 26px;
+      height: 26px;
+      border-radius: 8px;
+      font-size: 0.78rem;
       font-weight: 700;
       display: inline-flex;
       align-items: center;
@@ -233,9 +300,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .step-card.warn .step-badge { background: var(--warn-soft); color: var(--warn); }
     .step-card.err .step-badge { background: var(--err-soft); color: var(--err); }
     .step-title {
-      font-size: 0.87rem;
+      font-size: 0.86rem;
       font-weight: 700;
       color: var(--text);
+      white-space: nowrap;
+      flex-shrink: 0;
     }
     .step-desc {
       font-size: 0.78rem;
@@ -333,10 +402,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       display: inline-flex;
       align-items: center;
       gap: 5px;
-      padding: 3px 10px;
+      height: 22px;
+      padding: 0 9px;
       border-radius: 999px;
-      font-size: 0.76rem;
+      font-size: 0.74rem;
       font-weight: 600;
+      white-space: nowrap;
+      flex-shrink: 0;
       background: var(--surface-muted);
       color: var(--text-sub);
     }
@@ -345,13 +417,92 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .chip.warn { background: var(--warn-soft); color: var(--warn); }
     .chip.purple { background: #eef2ff; color: var(--indigo); }
 
-    /* Context Pool Banner & Seat Grid */
-    .ctx-banner {
+    /* Seat Detail Panel & 4-Column Seat Grid */
+    .seat-detail-panel {
       margin-top: 16px;
-      padding: 14px 16px;
       border-radius: var(--radius-lg);
       background: linear-gradient(180deg, #f8faff 0%, #f3f7fe 100%);
       border: 1px solid #e1eaf8;
+      transition: all 0.18s ease;
+    }
+    .seat-detail-empty {
+      padding: 12px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 0.83rem;
+      color: var(--muted);
+    }
+    .seat-detail-empty-left {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      min-width: 0;
+    }
+    .seat-detail-hint-dot {
+      width: 24px;
+      height: 24px;
+      border-radius: 7px;
+      background: #e8effc;
+      color: var(--primary);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.78rem;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+    .seat-detail-content {
+      padding: 15px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .seat-detail-content[hidden],
+    .seat-detail-empty[hidden] {
+      display: none;
+    }
+    .seat-detail-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .seat-detail-title-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      flex: 1;
+      flex-wrap: wrap;
+    }
+    .seat-detail-badge {
+      padding: 3px 9px;
+      border-radius: 7px;
+      background: var(--primary);
+      color: #ffffff;
+      font-size: 0.76rem;
+      font-weight: 700;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .seat-detail-title {
+      font-size: 0.94rem;
+      font-weight: 750;
+      color: var(--text);
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 460px;
+    }
+    .seat-detail-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-shrink: 0;
     }
     .ctx-row {
       display: flex;
@@ -359,15 +510,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       align-items: center;
       gap: 10px;
       flex-wrap: wrap;
-      font-size: 0.85rem;
+      font-size: 0.8rem;
+      color: var(--text-sub);
     }
     .ctx-track {
       width: 100%;
-      height: 9px;
+      height: 8px;
       border-radius: 999px;
       background: #e5ecf6;
       overflow: hidden;
-      margin-top: 9px;
+      margin-top: 6px;
     }
     .ctx-fill {
       height: 100%;
@@ -379,35 +531,101 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .ctx-fill.warn { background: linear-gradient(90deg, #f59e0b, #ea580c); }
     .ctx-fill.danger { background: linear-gradient(90deg, #ef4444, #e11d48); }
 
+    .seat-detail-kpis {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+    }
+    @media (max-width: 920px) {
+      .seat-detail-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 560px) {
+      .seat-detail-kpis { grid-template-columns: 1fr; }
+    }
+    .detail-kpi {
+      padding: 10px 12px;
+      border-radius: 11px;
+      background: #ffffff;
+      border: 1px solid #e3ebf8;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      min-width: 0;
+    }
+    .detail-kpi .k {
+      font-size: 0.73rem;
+      font-weight: 600;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .detail-kpi .v {
+      font-size: 0.83rem;
+      font-weight: 700;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .detail-kpi .s {
+      font-size: 0.73rem;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
     .seats-grid {
       margin-top: 14px;
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(188px, 1fr));
+      grid-template-columns: repeat(5, minmax(0, 1fr));
       gap: 11px;
+      align-items: stretch;
+    }
+    @media (max-width: 1020px) {
+      .seats-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    }
+    @media (max-width: 720px) {
+      .seats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 480px) {
+      .seats-grid { grid-template-columns: 1fr; }
     }
     .seat-card {
       background: var(--surface-soft);
       border: 1px solid var(--border);
       border-radius: 14px;
-      padding: 12px 13px;
+      padding: 12px;
       display: flex;
       flex-direction: column;
       gap: 9px;
-      transition: all 0.16s ease;
+      min-width: 0;
+      cursor: pointer;
+      user-select: none;
+      transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease, background 0.15s ease;
     }
     .seat-card:hover {
       background: #ffffff;
       box-shadow: var(--shadow-hover);
-      border-color: #d0dcf0;
+      border-color: #c7d6ee;
+      transform: translateY(-1px);
+    }
+    .seat-card:focus-visible {
+      outline: 2px solid var(--primary);
+      outline-offset: 2px;
     }
     .seat-card.busy {
       background: linear-gradient(165deg, #eff6ff 0%, #f8fbff 100%);
-      border-color: rgba(37, 99, 235, 0.48);
-      box-shadow: 0 10px 26px -12px rgba(37, 99, 235, 0.28);
+      border-color: rgba(37, 99, 235, 0.44);
+      box-shadow: 0 10px 24px -14px rgba(37, 99, 235, 0.28);
     }
     .seat-card.active-idle {
       background: #ffffff;
       border-color: #d5e0f2;
+    }
+    .seat-card.selected {
+      background: #ffffff;
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14), 0 12px 26px -14px rgba(37, 99, 235, 0.28);
     }
     @keyframes seatPulse {
       0%, 100% { transform: scale(1); opacity: 1; }
@@ -425,30 +643,29 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       display: flex;
       justify-content: space-between;
       align-items: center;
-      gap: 8px;
+      gap: 6px;
+      height: 24px;
+      min-width: 0;
     }
     .seat-name {
       font-weight: 700;
-      font-size: 0.9rem;
+      font-size: 0.85rem;
       color: var(--text);
-      display: flex;
+      display: inline-flex;
       align-items: center;
-      gap: 6px;
-    }
-    .seat-id {
-      font-size: 0.72rem;
-      font-weight: 500;
-      color: var(--muted);
+      gap: 5px;
+      white-space: nowrap;
+      flex-shrink: 0;
     }
     .seat-topic {
-      min-height: 2.55em;
-      padding: 6px 8px;
+      height: 46px;
+      padding: 7px 9px;
       border-radius: 9px;
       background: rgba(241, 245, 251, 0.72);
       border: 1px solid #e9eef8;
-      font-size: 0.79rem;
+      font-size: 0.8rem;
       font-weight: 650;
-      line-height: 1.36;
+      line-height: 16px;
       color: var(--text);
       display: -webkit-box;
       -webkit-line-clamp: 2;
@@ -470,8 +687,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .seat-meta {
       display: flex;
       justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      height: 18px;
       font-size: 0.78rem;
       color: var(--muted);
+      white-space: nowrap;
+    }
+    .seat-meta span {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     .seat-mini-track {
       width: 100%;
@@ -486,29 +712,57 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       border-radius: 999px;
       background: linear-gradient(90deg, #10b981, #3b82f6);
     }
-    .seat-foot {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 8px;
-      padding-top: 4px;
-    }
-    .seat-rem {
-      font-size: 0.72rem;
-      color: var(--muted);
-      white-space: nowrap;
+    .idle-fold-wrap {
+      margin-top: 12px;
+      border-radius: 13px;
+      border: 1px solid var(--border);
+      background: #fafcff;
       overflow: hidden;
-      text-overflow: ellipsis;
+    }
+    .idle-fold-Wrap-hidden,
+    .idle-fold-wrap[hidden] {
+      display: none;
+    }
+    .idle-fold-btn {
+      width: 100%;
+      border: none;
+      background: transparent;
+      padding: 10px 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      font: inherit;
+      font-size: 0.82rem;
+      font-weight: 650;
+      color: var(--text-sub);
+      cursor: pointer;
+      transition: background 0.15s ease;
+    }
+    .idle-fold-btn:hover {
+      background: #f1f6fd;
+    }
+    .idle-fold-hint {
+      font-size: 0.77rem;
+      font-weight: 600;
+      color: var(--muted);
+    }
+    .idle-fold-body {
+      padding: 0 14px 14px;
+      border-top: 1px dashed var(--border);
+    }
+    .idle-fold-body[hidden] {
+      display: none;
     }
     .empty-seats {
       grid-column: 1 / -1;
       text-align: center;
-      padding: 24px 16px;
-      border-radius: 14px;
+      padding: 16px;
+      border-radius: 13px;
       background: var(--surface-soft);
       border: 1px dashed var(--border-strong);
       color: var(--muted);
-      font-size: 0.88rem;
+      font-size: 0.84rem;
     }
 
     /* One-Click Health Test */
@@ -539,9 +793,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       background: #ffffff;
       color: var(--text);
       font: inherit;
-      font-size: 0.86rem;
+      font-size: 0.85rem;
       outline: none;
       transition: border-color 0.15s ease;
+    }
+    select.clean-select,
+    input.clean-input {
+      height: 36px;
+      padding: 0 12px;
     }
     select.clean-select:focus,
     input.clean-input:focus,
@@ -632,13 +891,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
 
     .period-bar {
-      margin-top: 16px;
+      margin-top: 14px;
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 10px;
       flex-wrap: wrap;
-      padding: 8px 10px;
+      padding: 6px 10px;
       border-radius: 12px;
       background: var(--surface-soft);
       border: 1px solid var(--border);
@@ -653,9 +912,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       color: var(--muted);
       border: none;
       border-radius: 8px;
-      padding: 5px 12px;
+      height: 28px;
+      padding: 0 10px;
+      display: inline-flex;
+      align-items: center;
       font: inherit;
-      font-size: 0.82rem;
+      font-size: 0.79rem;
       font-weight: 600;
       cursor: pointer;
       transition: all 0.14s ease;
@@ -673,93 +935,137 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       display: flex;
       align-items: center;
       gap: 7px;
-      font-size: 0.8rem;
+      font-size: 0.78rem;
       color: var(--muted);
     }
     input[type="date"].date-input {
-      padding: 4px 9px;
+      height: 28px;
+      padding: 0 8px;
       border-radius: 8px;
       border: 1px solid var(--border);
       background: #ffffff;
       color: var(--text);
       font: inherit;
-      font-size: 0.8rem;
+      font-size: 0.78rem;
     }
 
     .ledger-hero {
-      margin-top: 14px;
+      margin-top: 12px;
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 12px;
+      gap: 11px;
+      align-items: stretch;
     }
-    @media (max-width: 920px) {
+    @media (max-width: 980px) {
       .ledger-hero { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
-    @media (max-width: 540px) {
+    @media (max-width: 560px) {
       .ledger-hero { grid-template-columns: 1fr; }
     }
     .stat-tile {
-      padding: 15px 16px;
-      border-radius: 15px;
+      padding: 12px 13px;
+      border-radius: 14px;
       background: var(--surface-soft);
       border: 1px solid var(--border);
       display: flex;
       flex-direction: column;
-      gap: 4px;
+      justify-content: space-between;
+      gap: 5px;
+      min-width: 0;
+      transition: background 0.15s ease, border-color 0.15s ease;
     }
-    .stat-tile.highlight {
-      background: linear-gradient(155deg, #ecfdf5 0%, #f4fdf9 100%);
-      border-color: var(--ok-border);
+    .stat-tile:hover {
+      background: #ffffff;
+      border-color: #d5e0f2;
+    }
+    .stat-icon-box {
+      width: 22px;
+      height: 22px;
+      flex-shrink: 0;
+      border-radius: 7px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .stat-icon-box.emerald {
+      background: var(--ok-soft);
+      color: var(--ok);
+    }
+    .stat-icon-box.blue {
+      background: var(--primary-soft);
+      color: var(--primary);
+    }
+    .stat-icon-box.teal {
+      background: #f0fdfa;
+      color: #0d9488;
+    }
+    .stat-icon-box.indigo {
+      background: #eef2ff;
+      color: var(--indigo);
     }
     .stat-head {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 6px;
-      font-size: 0.79rem;
-      font-weight: 600;
-      color: var(--muted);
-    }
-    .stat-tile.highlight .stat-head { color: #047857; }
-    .stat-big {
-      font-size: 1.52rem;
-      font-weight: 800;
-      letter-spacing: -0.02em;
-      color: var(--text);
-      margin: 2px 0;
-    }
-    .stat-tile.highlight .stat-big { color: var(--ok); }
-    .stat-sub {
+      gap: 8px;
+      height: 22px;
       font-size: 0.77rem;
+      font-weight: 650;
       color: var(--muted);
-      line-height: 1.45;
+      white-space: nowrap;
+    }
+    .stat-big {
+      height: 24px;
+      line-height: 24px;
+      font-size: 1.06rem;
+      font-weight: 750;
+      letter-spacing: -0.015em;
+      color: var(--text);
+      margin: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-variant-numeric: tabular-nums;
+    }
+    .stat-sub {
+      height: 17px;
+      line-height: 17px;
+      font-size: 0.73rem;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-variant-numeric: tabular-nums;
     }
 
     /* Visual Charts Grid */
     .charts-grid {
-      margin-top: 14px;
+      margin-top: 12px;
       display: grid;
-      grid-template-columns: 1.35fr 1fr;
-      gap: 14px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 11px;
+      align-items: stretch;
     }
     @media (max-width: 860px) {
       .charts-grid { grid-template-columns: 1fr; }
     }
     .chart-box {
-      padding: 15px 16px;
-      border-radius: 15px;
+      padding: 12px 14px;
+      border-radius: 14px;
       background: var(--surface-soft);
       border: 1px solid var(--border);
       display: flex;
       flex-direction: column;
-      gap: 12px;
+      gap: 10px;
+      min-width: 0;
     }
     .chart-title-row {
       display: flex;
       justify-content: space-between;
       align-items: center;
       gap: 8px;
-      font-size: 0.85rem;
+      min-height: 20px;
+      font-size: 0.83rem;
       font-weight: 700;
       color: var(--text);
     }
@@ -779,11 +1085,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       vertical-align: middle;
     }
     .bars-stage {
-      height: 142px;
+      flex: 1;
+      min-height: 132px;
       display: flex;
       align-items: flex-end;
       gap: 8px;
-      padding: 12px 4px 0;
+      padding: 10px 4px 0;
       border-bottom: 1px solid var(--border);
     }
     .bar-col {
@@ -800,7 +1107,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .bar-stack {
       width: 100%;
       max-width: 34px;
-      height: 96px;
+      flex: 1;
+      min-height: 96px;
+      max-height: 156px;
       display: flex;
       flex-direction: column;
       justify-content: flex-end;
@@ -823,14 +1132,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       color: var(--primary);
       font-weight: 700;
     }
-    .bar-seg-saved {
-      background: #34d399;
-      width: 100%;
-      transition: height 0.25s ease;
-    }
     .bar-seg-actual {
-      background: #2563eb;
+      background: linear-gradient(180deg, #3b82f6 0%, #2563eb 100%);
       width: 100%;
+      border-radius: 6px 6px 2px 2px;
       transition: height 0.25s ease;
     }
     .bar-lbl {
@@ -880,23 +1185,33 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
     details.sub-panel summary {
       cursor: pointer;
-      font-size: 0.85rem;
+      font-size: 0.83rem;
       font-weight: 650;
       color: var(--text-sub);
       user-select: none;
     }
     .table-scroll { overflow-x: auto; margin-top: 10px; }
+    .sub-table-title {
+      margin: 14px 0 6px;
+      font-size: 0.78rem;
+      font-weight: 700;
+      color: var(--text-sub);
+    }
     table.clean-table {
       width: 100%;
       border-collapse: collapse;
-      font-size: 0.81rem;
+      font-size: 0.8rem;
     }
     table.clean-table th,
     table.clean-table td {
-      padding: 9px 10px;
+      padding: 8px 10px;
       text-align: left;
       border-bottom: 1px solid #edf2f9;
       white-space: nowrap;
+    }
+    table.clean-table th.num,
+    table.clean-table td.num {
+      text-align: right;
     }
     table.clean-table th {
       color: var(--muted);
@@ -911,18 +1226,26 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .diag-kv-grid {
       margin-top: 14px;
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 10px;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      align-items: stretch;
+    }
+    @media (max-width: 920px) {
+      .diag-kv-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 560px) {
+      .diag-kv-grid { grid-template-columns: 1fr; }
     }
     .diag-kv {
-      padding: 10px 12px;
-      border-radius: 11px;
+      padding: 11px 14px;
+      border-radius: 12px;
       background: var(--surface-soft);
       border: 1px solid var(--border);
       font-size: 0.8rem;
+      min-width: 0;
     }
-    .diag-kv .k { color: var(--muted); font-size: 0.74rem; }
-    .diag-kv .v { font-weight: 600; color: var(--text); margin-top: 2px; word-break: break-all; }
+    .diag-kv .k { color: var(--muted); font-size: 0.74rem; white-space: nowrap; }
+    .diag-kv .v { font-weight: 650; color: var(--text); margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .logs-box {
       margin-top: 12px;
       max-height: 180px;
@@ -1004,7 +1327,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
         <div>
           <h1>Gemini Enterprise</h1>
-          <div class="brand-sub">本地智能网关控制台 · 默认模型 Carbon · 免密直连</div>
+          <div class="brand-sub">本地网关控制台 · 默认 Carbon</div>
         </div>
       </div>
       <div class="topbar-actions">
@@ -1012,8 +1335,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <span class="dot" id="connDot"></span>
           <span id="connText">正在同步状态...</span>
         </div>
-        <button type="button" class="btn soft" id="openGuideBtn">接入指南 · 一键复制</button>
-        <button type="button" class="btn" id="refreshBtn">刷新</button>
+        <button type="button" class="btn soft" id="openGuideBtn">接入指南</button>
+        <button type="button" class="btn btn-refresh" id="refreshBtn" title="立即同步最新状态">
+          <svg class="refresh-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M20 11A8 8 0 0 0 6.34 6.34L4 8.68M4 4.5V8.7H8.2M4 13A8 8 0 0 0 17.66 17.66L20 15.32M20 19.5V15.3H15.8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <span id="refreshBtnText">刷新</span>
+        </button>
       </div>
     </header>
 
@@ -1022,35 +1350,41 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="step-card ok" id="stepServiceCard">
         <div class="step-left">
           <span class="step-badge" id="stepServiceIcon">✓</span>
-          <div>
-            <div class="step-title">1. 本地服务在线</div>
-            <div class="step-desc" id="stepServiceDesc">127.0.0.1:8000 · 默认 Carbon</div>
+          <div class="step-text">
+            <div class="step-title">本地服务</div>
+            <div class="step-desc" id="stepServiceDesc">8000 · Carbon</div>
           </div>
         </div>
-        <span class="chip ok" id="stepServiceTag">正常</span>
+        <div class="step-right">
+          <span class="chip ok" id="stepServiceTag">在线</span>
+        </div>
       </div>
 
       <div class="step-card" id="stepExtCard">
         <div class="step-left">
           <span class="step-badge" id="stepExtIcon">2</span>
-          <div>
-            <div class="step-title">2. 浏览器插件桥接</div>
-            <div class="step-desc" id="stepExtDesc">正在检测浏览器扩展连接...</div>
+          <div class="step-text">
+            <div class="step-title">浏览器插件</div>
+            <div class="step-desc" id="stepExtDesc">检测中</div>
           </div>
         </div>
-        <span class="chip" id="stepExtTag">检测中</span>
+        <div class="step-right">
+          <span class="chip" id="stepExtTag">待连接</span>
+        </div>
       </div>
 
       <div class="step-card" id="stepAuthCard">
         <div class="step-left">
           <span class="step-badge" id="stepAuthIcon">3</span>
-          <div>
-            <div class="step-title">3. Google 登录工作页</div>
-            <div class="step-desc" id="stepAuthDesc">正在检查可用工作网页...</div>
+          <div class="step-text">
+            <div class="step-title">工作页面</div>
+            <div class="step-desc" id="stepAuthDesc">检测中</div>
           </div>
         </div>
-        <a href="https://vertexaisearch.cloud.google.com/" target="_blank" rel="noopener" class="btn sm soft" id="stepAuthBtn" hidden>去打开 ↗</a>
-        <span class="chip" id="stepAuthTag">检测中</span>
+        <div class="step-right">
+          <a href="https://vertexaisearch.cloud.google.com/" target="_blank" rel="noopener" class="btn sm soft" id="stepAuthBtn" hidden>去打开 ↗</a>
+          <span class="chip" id="stepAuthTag">待检测</span>
+        </div>
       </div>
     </section>
 
@@ -1060,8 +1394,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="fold-title-wrap">
           <span class="sec-icon">✦</span>
           <div>
-            <h2 class="fold-title">并行工作席位 &amp; 记忆容量</h2>
-            <div class="fold-subtitle">工作中席位自动置顶 · 实时展示当前会话标题、状态与记忆余量</div>
+            <h2 class="fold-title">并行工作席位</h2>
+            <div class="fold-subtitle">仅展开展示活跃席位 · 点击任意席位卡片查看完整详情与会话操作</div>
           </div>
         </div>
         <div class="fold-right">
@@ -1070,18 +1404,72 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
       <div class="fold-body">
-        <div class="ctx-banner">
-          <div class="ctx-row">
-            <strong id="ledgerCtxTitle">主活跃对话记忆池 · 空闲待命 (自动整理线 300.0K)</strong>
-            <span class="muted" id="ledgerCtxPct">已用 0 / 自动整理线 300.0K (0.0%) · 总容量上限 1.05M</span>
+        <div class="seat-detail-panel" id="seatDetailPanel">
+          <div class="seat-detail-empty" id="seatDetailEmpty">
+            <div class="seat-detail-empty-left">
+              <span class="seat-detail-hint-dot" aria-hidden="true">i</span>
+              <span>点击下方任意席位小卡片，在此查看记忆池余量、本轮收发明细、网页标签状态与重置操作</span>
+            </div>
           </div>
-          <div class="ctx-track" title="进度条满格为本地自动整理记忆线 (300.0K)，总上下文容量 1,048,576">
-            <div id="ledgerCtxFill" class="ctx-fill"></div>
+          <div class="seat-detail-content" id="seatDetailContent" hidden>
+            <div class="seat-detail-head">
+              <div class="seat-detail-title-group">
+                <span class="seat-detail-badge" id="detailSeatBadge">1 号席位</span>
+                <span class="seat-detail-title" id="detailSeatTitle">暂无活跃会话</span>
+                <span class="chip" id="detailSourceChip">待命页</span>
+                <span class="chip" id="detailStatusChip">空闲待命</span>
+              </div>
+              <div class="seat-detail-actions">
+                <button type="button" class="btn sm soft" id="detailResetBtn">开启新对话</button>
+                <button type="button" class="btn sm" id="detailCloseBtn">收起</button>
+              </div>
+            </div>
+            <div>
+              <div class="ctx-row">
+                <strong id="detailCtxLeft">记忆池占用：已用 0 / 自动整理线 300.0K (0.0%)</strong>
+                <span class="muted" id="detailCtxRight">距自动整理还剩 300.0K · 总容量上限 1.05M</span>
+              </div>
+              <div class="ctx-track" title="进度条满格为本地自动整理记忆线 (300.0K)，总上下文容量 1,048,576">
+                <div id="detailCtxFill" class="ctx-fill"></div>
+              </div>
+            </div>
+            <div class="seat-detail-kpis">
+              <div class="detail-kpi">
+                <div class="k">最近一轮收发</div>
+                <div class="v" id="detailTurnIo">暂无记录</div>
+                <div class="s" id="detailStrategy">等待首轮调用</div>
+              </div>
+              <div class="detail-kpi">
+                <div class="k">会话轮次与步数</div>
+                <div class="v" id="detailTurns">0 轮提问 · 0 步交互</div>
+                <div class="s" id="detailReqs">本页累计完成 0 次请求</div>
+              </div>
+              <div class="detail-kpi">
+                <div class="k">浏览器工作页</div>
+                <div class="v" id="detailTabInfo">标签页 -</div>
+                <div class="s" id="detailTabSub">等待状态同步</div>
+              </div>
+              <div class="detail-kpi">
+                <div class="k">绑定会话与活跃时间</div>
+                <div class="v" id="detailSessionId">未绑定固定会话</div>
+                <div class="s" id="detailUpdatedAt">最近活跃 -</div>
+              </div>
+            </div>
           </div>
         </div>
 
         <div class="seats-grid" id="seatsGrid">
           <div class="empty-seats">正在读取工作席位状态...</div>
+        </div>
+
+        <div class="idle-fold-wrap" id="idleSeatsWrap" hidden>
+          <button type="button" class="idle-fold-btn" id="idleSeatsToggle" aria-expanded="false">
+            <span id="idleSeatsLabel">空闲待命席位（0 个）</span>
+            <span class="idle-fold-hint" id="idleSeatsHint">展开查看 ▾</span>
+          </button>
+          <div class="idle-fold-body" id="idleSeatsBody" hidden>
+            <div class="seats-grid" id="idleSeatsGrid"></div>
+          </div>
         </div>
       </div>
     </section>
@@ -1147,14 +1535,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       </div>
     </section>
 
-    <!-- Section 3: Usage & Cost Savings Ledger -->
+    <!-- Section 3: Usage & Reference Cost Ledger -->
     <section class="fold-section" data-sec="ledger" id="secLedger">
       <div class="fold-head" data-fold-toggle="ledger">
         <div class="fold-title-wrap">
           <span class="sec-icon indigo">¥</span>
           <div>
-            <h2 class="fold-title">用量与省钱账本</h2>
-            <div class="fold-subtitle">本地字数折算参考账单（非 Google 实际扣费）· 直观对比多轮续聊省下的花费</div>
+            <h2 class="fold-title">用量与费用账本</h2>
+            <div class="fold-subtitle">基于本地字数估算与参考价格表折算（非 Google 实际扣费）</div>
           </div>
         </div>
         <div class="fold-right">
@@ -1184,47 +1572,72 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
 
         <div class="ledger-hero">
-          <div class="stat-tile highlight">
-            <div class="stat-head">
-              <span id="cardSavedLabel">多轮续聊累计省下</span>
-              <span class="chip ok" id="reuseRateChip">省流 0%</span>
-            </div>
-            <div class="stat-big" id="ledgerSavedMain">¥0.00</div>
-            <div class="stat-sub" id="ledgerSavedSub">若每次重发原价约 ¥0.00</div>
-          </div>
-
           <div class="stat-tile">
             <div class="stat-head">
-              <span id="cardActualLabel">实际续聊折算消耗</span>
+              <span id="cardActualLabel">预估等效花费</span>
+              <div class="stat-icon-box emerald" aria-hidden="true">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
+                  <rect x="3" y="6" width="18" height="13" rx="3" stroke="currentColor" stroke-width="2"/>
+                  <path d="M16 12.5H21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                  <circle cx="16" cy="12.5" r="1.2" fill="currentColor"/>
+                  <path d="M6 6L14.5 3.4C15.6 3.1 16.7 3.9 16.7 5V6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                </svg>
+              </div>
             </div>
             <div class="stat-big" id="ledgerActualMain">¥0.00</div>
-            <div class="stat-sub" id="ledgerActualSub">仅按每轮新增内容与缓存价折算</div>
+            <div class="stat-sub" id="ledgerActualSub">输入 / 缓存 / 输出单价折算</div>
           </div>
 
           <div class="stat-tile">
             <div class="stat-head">
-              <span id="cardCallsLabel">期间调用总次数</span>
+              <span id="cardCallsLabel">调用总次数</span>
+              <div class="stat-icon-box blue" aria-hidden="true">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
+                  <path d="M13 2L4.5 13.2H11.5L10.5 22L19.5 10.6H12.5L13 2Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+                </svg>
+              </div>
             </div>
             <div class="stat-big" id="ledgerCallsMain">0 次</div>
-            <div class="stat-sub" id="ledgerCallsSub">Codex 0 · 对话 0 · 记忆整理 0</div>
+            <div class="stat-sub" id="ledgerCallsSub">Codex 0 / 对话 0 / 整理 0</div>
           </div>
 
           <div class="stat-tile">
             <div class="stat-head">
-              <span id="cardWordsLabel">累计处理内容规模</span>
+              <span id="cardCacheLabel">缓存命中率</span>
+              <div class="stat-icon-box teal" aria-hidden="true">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
+                  <path d="M12 3L4 7.5L12 12L20 7.5L12 3Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+                  <path d="M4 12.5L12 17L20 12.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                  <path d="M4 17L12 21.5L20 17" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </div>
             </div>
-            <div class="stat-big" id="ledgerWordsMain">约 0 字</div>
-            <div class="stat-sub" id="ledgerWordsSub">输入 0 · 记忆复用 0 · 输出 0</div>
+            <div class="stat-big" id="ledgerCacheMain">0.0%</div>
+            <div class="stat-sub" id="ledgerCacheSub">缓存 0 / 总输入 0</div>
+          </div>
+
+          <div class="stat-tile">
+            <div class="stat-head">
+              <span id="cardTokensLabel">累计 Token</span>
+              <div class="stat-icon-box indigo" aria-hidden="true">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
+                  <ellipse cx="12" cy="5.5" rx="7.5" ry="3" stroke="currentColor" stroke-width="2"/>
+                  <path d="M4.5 8.8C4.5 10.46 7.86 11.8 12 11.8C16.14 11.8 19.5 10.46 19.5 8.8V12.2C19.5 13.86 16.14 15.2 12 15.2C7.86 15.2 4.5 13.86 4.5 12.2V8.8Z" fill="currentColor"/>
+                  <path d="M4.5 14.6C4.5 16.26 7.86 17.6 12 17.6C16.14 17.6 19.5 16.26 19.5 14.6V18C19.5 19.66 16.14 21 12 21C7.86 21 4.5 19.66 4.5 18V14.6Z" fill="currentColor"/>
+                </svg>
+              </div>
+            </div>
+            <div class="stat-big" id="ledgerTokensMain">0</div>
+            <div class="stat-sub" id="ledgerTokensSub">输入 0 / 输出 0 / 缓存 0</div>
           </div>
         </div>
 
         <div class="charts-grid">
           <div class="chart-box">
             <div class="chart-title-row">
-              <span>每日折算趋势（点击柱子可看当天明细）</span>
+              <span>每日花费趋势（点击柱子可看当天明细）</span>
               <div class="chart-legend">
-                <span><i class="leg-dot" style="background:#34d399;"></i>续聊省下</span>
-                <span><i class="leg-dot" style="background:#2563eb;"></i>实际折算</span>
+                <span><i class="leg-dot" style="background:#2563eb;"></i>等效花费</span>
               </div>
             </div>
             <div class="bars-stage" id="dailyBarsStage"></div>
@@ -1242,16 +1655,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
         <details class="sub-panel">
           <summary>查看分模型统计、按日汇总与最近调用流水</summary>
+          <div class="sub-table-title">按模型汇总</div>
           <div class="table-scroll">
             <table class="clean-table">
               <thead>
                 <tr>
                   <th>模型名称</th>
-                  <th>调用次数</th>
-                  <th>处理量（总输入 / 记忆复用 / 输出）</th>
+                  <th class="num">调用次数</th>
+                  <th class="num">累计 Token</th>
+                  <th>输入 / 输出 / 缓存</th>
                   <th>专项生成</th>
-                  <th>全量重发原价</th>
-                  <th>续聊折算（已省下）</th>
+                  <th class="num">等效花费</th>
                 </tr>
               </thead>
               <tbody id="ledgerModelBody">
@@ -1260,16 +1674,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             </table>
           </div>
 
+          <div class="sub-table-title">按日期汇总</div>
           <div class="table-scroll">
             <table class="clean-table">
               <thead>
                 <tr>
                   <th>日期</th>
-                  <th>调用次数</th>
+                  <th class="num">调用次数</th>
+                  <th class="num">累计 Token</th>
+                  <th>输入 / 输出 / 缓存</th>
                   <th>专项统计</th>
-                  <th>全量重发原价</th>
-                  <th>实际续聊折算</th>
-                  <th>省下金额（复用率）</th>
+                  <th class="num">等效花费</th>
                 </tr>
               </thead>
               <tbody id="ledgerDailyBody">
@@ -1278,6 +1693,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             </table>
           </div>
 
+          <div class="sub-table-title">最近调用流水</div>
           <div class="table-scroll">
             <table class="clean-table">
               <thead>
@@ -1286,9 +1702,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                   <th>用途</th>
                   <th>模型 · 工作席位</th>
                   <th>对话方式</th>
-                  <th>本轮新增 / 记忆复用 / 回复</th>
-                  <th>折算花费（已省）</th>
-                  <th>耗时</th>
+                  <th>总计（输入 / 输出 / 缓存）</th>
+                  <th class="num">等效花费</th>
+                  <th class="num">耗时</th>
                 </tr>
               </thead>
               <tbody id="ledgerRecentBody">
@@ -1382,6 +1798,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       let lastCtxSnapshot = null;
       let seatIndexByTabId = {};
       let seatIndexBySlotKey = {};
+      let selectedSlotKey = null;
+      let idleSeatsExpanded = false;
+      let enrichedBySlotKey = {};
+      let refreshResetTimer = null;
 
       const PERIOD_LABELS = {
         today: '今日',
@@ -1454,12 +1874,23 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         return String(Math.round(v));
       }
 
-      function fmtWordsScale(tokens) {
-        const chars = Math.round(Number(tokens || 0) * 1.4);
-        if (chars <= 0) return '约 0 字';
-        if (chars >= 100000000) return '约 ' + (chars / 100000000).toFixed(2) + ' 亿字';
-        if (chars >= 10000) return '约 ' + (chars / 10000).toFixed(1) + ' 万字';
-        return '约 ' + chars.toLocaleString() + ' 字';
+      function fmtLedgerTok(n) {
+        const v = Math.max(0, Number(n || 0));
+        if (v >= 1000000000) return (v / 1000000000).toFixed(2) + 'B';
+        if (v >= 1000000) return (v / 1000000).toFixed(1) + 'M';
+        if (v >= 1000) return (v / 1000).toFixed(1) + 'K';
+        return String(Math.round(v));
+      }
+
+      function resolveTokenParts(b) {
+        const obj = b || {};
+        const cached = Math.max(0, Number(obj.cached_tokens || 0));
+        const input = obj.delta_prompt_tokens !== undefined
+          ? Math.max(0, Number(obj.delta_prompt_tokens || 0))
+          : Math.max(0, Number(obj.prompt_tokens || 0) - cached);
+        const output = Math.max(0, Number(obj.completion_tokens || 0));
+        const total = input + output + cached;
+        return { input: input, output: output, cached: cached, total: total };
       }
 
       function fmtMoney(usdVal, cnyVal) {
@@ -1509,6 +1940,24 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           span.textContent = '单次直发';
         }
         return span;
+      }
+
+      function friendlyStrategyLabel(strategy) {
+        const s = String(strategy || '').toLowerCase();
+        if (!s || s === '-') return '尚未发送对话';
+        if (s.includes('incremental') || s.includes('delta')) return '智能增量续聊';
+        if (s.includes('compact') || s.includes('checkpoint')) return '自动记忆整理';
+        if (s.includes('bootstrap') || s.includes('reset') || s.includes('new') || s.includes('full')) return '新开完整对话';
+        if (s.includes('recover')) return '断点恢复续接';
+        return '单次直发';
+      }
+
+      function shortWorkLabel(phase, waitingCnt) {
+        if (phase === 'generating') return '模型回复';
+        if (phase === 'running_tool') return '执行命令';
+        if (phase === 'waiting_model') return '等待回复';
+        if (phase === 'queued' || waitingCnt > 0) return '排队 ' + Math.max(1, waitingCnt);
+        return '工作中';
       }
 
       function friendlySeatLabel(slotKey, tabId) {
@@ -1579,6 +2028,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           }
           btn.textContent = seatNum + '号已换新 ✓';
           setTimeout(function () {
+            btn.textContent = '开启新对话';
+            btn.disabled = false;
             refreshStatus();
           }, 600);
         } catch (_) {
@@ -1590,11 +2041,210 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         }
       }
 
+      function renderSeatDetailPanel() {
+        const emptyEl = document.getElementById('seatDetailEmpty');
+        const contentEl = document.getElementById('seatDetailContent');
+        const item = selectedSlotKey ? enrichedBySlotKey[selectedSlotKey] : null;
+        if (!item) {
+          selectedSlotKey = null;
+          emptyEl.hidden = false;
+          contentEl.hidden = true;
+          return;
+        }
+        emptyEl.hidden = true;
+        contentEl.hidden = false;
+
+        const s = item.slot;
+        const cs = item.cs;
+        const usedTok = Number(cs.total_context_tokens || 0);
+        const cmpTok = Number(cs.compact_threshold_tokens || 300000);
+        const limTok = Number(cs.context_limit_tokens || 1048576);
+        const remTok = cs.remaining_to_compact_tokens !== undefined
+          ? Number(cs.remaining_to_compact_tokens)
+          : Math.max(0, cmpTok - usedTok);
+        const cmpPct = Math.min(100, Math.max(0, Number(cs.compact_pct || 0)));
+        const utilPct = cs.utilization_pct !== undefined
+          ? Number(cs.utilization_pct)
+          : ((usedTok / Math.max(1, limTok)) * 100);
+
+        document.getElementById('detailSeatBadge').textContent = item.seatNum + ' 号席位';
+        const titleEl = document.getElementById('detailSeatTitle');
+        titleEl.textContent = item.topic || '暂无活跃会话 · 空闲待命页';
+        titleEl.title = item.topic || '空闲待命页';
+
+        const srcMap = {
+          codex: 'Codex 会话',
+          prompt: '首条提问',
+          web: '网页标题',
+          task: '专项任务'
+        };
+        const srcChip = document.getElementById('detailSourceChip');
+        srcChip.textContent = item.topic ? (srcMap[item.titleSource] || '活跃会话') : '空白待命';
+        srcChip.className = item.topic ? 'chip purple' : 'chip';
+
+        const stChip = document.getElementById('detailStatusChip');
+        if (item.isWorking) {
+          stChip.className = 'chip busy';
+          stChip.textContent = item.activityLabel + (item.toolName ? (' · ' + item.toolName) : '');
+        } else if (item.hasActiveConv) {
+          stChip.className = 'chip purple';
+          stChip.textContent = '会话待命';
+        } else {
+          stChip.className = 'chip ok';
+          stChip.textContent = '空闲待命';
+        }
+
+        const rstBtn = document.getElementById('detailResetBtn');
+        if (rstBtn.textContent !== '重置中...' && !rstBtn.textContent.includes('✓')) {
+          rstBtn.disabled = Boolean(item.isWorking);
+          rstBtn.textContent = item.isWorking ? '工作中不可重置' : '开启新对话';
+        }
+
+        document.getElementById('detailCtxLeft').textContent =
+          '记忆池占用：已用 ' + fmtTok(usedTok) + ' / 自动整理线 ' + fmtTok(cmpTok) + ' (' + cmpPct.toFixed(1) + '%)';
+        document.getElementById('detailCtxRight').textContent =
+          '距自动整理还剩 ' + fmtTok(remTok) + ' · 总容量上限 ' + fmtTok(limTok) + ' (' + utilPct.toFixed(1) + '%)';
+        const fill = document.getElementById('detailCtxFill');
+        fill.style.width = cmpPct.toFixed(1) + '%';
+        fill.className = cmpPct >= 100 ? 'ctx-fill danger' : (cmpPct >= 80 ? 'ctx-fill warn' : 'ctx-fill');
+
+        const lastIn = Number(cs.last_delta_tokens || 0);
+        const lastOut = Number(cs.last_completion_tokens || 0);
+        document.getElementById('detailTurnIo').textContent =
+          (lastIn > 0 || lastOut > 0) ? ('输入 +' + fmtTok(lastIn) + ' / 输出 ' + fmtTok(lastOut)) : '暂无本轮收发';
+        document.getElementById('detailStrategy').textContent =
+          friendlyStrategyLabel(cs.last_strategy) + ' · ' + friendlyModel(s.active_model || cs.active_model);
+
+        const uTurns = Number(cs.user_turns || 0);
+        const tSteps = Number(cs.turn_count || 0);
+        document.getElementById('detailTurns').textContent =
+          uTurns + ' 轮提问 · ' + tSteps + ' 步交互';
+        document.getElementById('detailReqs').textContent =
+          '本页累计完成 ' + Number(s.completed_requests || 0) + ' 次请求';
+
+        const tabInfoEl = document.getElementById('detailTabInfo');
+        tabInfoEl.textContent = s.tab_id ? ('标签页 #' + s.tab_id) : '自动分配工作页';
+        const cleanWebTitle = String(s.tab_title || '').replace(/\s*-\s*Gemini Enterprise\s*$/i, '').trim();
+        tabInfoEl.title = cleanWebTitle ? ('网页标题：' + cleanWebTitle) : '';
+        document.getElementById('detailTabSub').textContent =
+          (s.captured_rpc ? '流式通道已就绪' : '页面组件监听') + (s.tab_ready === false ? ' · 页面加载中' : ' · 登录正常');
+
+        const sidEl = document.getElementById('detailSessionId');
+        if (s.pinned_session_id) {
+          const sid = String(s.pinned_session_id);
+          sidEl.textContent = sid.length > 16 ? ('会话 ' + sid.slice(0, 8) + '…' + sid.slice(-4)) : ('会话 ' + sid);
+          sidEl.title = '绑定会话 ID: ' + sid;
+        } else {
+          sidEl.textContent = '未绑定固定会话';
+          sidEl.title = '';
+        }
+        document.getElementById('detailUpdatedAt').textContent =
+          item.lastTs > 0 ? ('最近活跃 ' + new Date(item.lastTs * 1000).toLocaleTimeString()) : '尚未产生调用';
+      }
+
+      function buildSeatCard(item) {
+        const s = item.slot;
+        const cs = item.cs;
+        const seatNum = item.seatNum;
+        const turns = item.turns;
+        const cmpPct = Math.min(100, Math.max(0, Number(cs.compact_pct || 0)));
+        const isSelected = Boolean(s.slot_key && selectedSlotKey === s.slot_key);
+
+        const card = document.createElement('div');
+        card.className = 'seat-card'
+          + (item.isWorking ? ' busy' : (item.hasActiveConv ? ' active-idle' : ''))
+          + (isSelected ? ' selected' : '');
+        card.setAttribute('role', 'button');
+        card.setAttribute('tabindex', '0');
+        card.setAttribute('aria-pressed', isSelected ? 'true' : 'false');
+
+        const top = document.createElement('div');
+        top.className = 'seat-top';
+        const nameWrap = document.createElement('div');
+        nameWrap.className = 'seat-name';
+        nameWrap.textContent = seatNum + ' 号席位';
+
+        const stateChip = document.createElement('span');
+        if (item.isWorking) {
+          stateChip.className = 'chip busy';
+          const pulse = document.createElement('i');
+          pulse.className = 'live-work-dot';
+          stateChip.appendChild(pulse);
+          stateChip.appendChild(document.createTextNode(shortWorkLabel(item.activityPhase, item.waitingCnt)));
+        } else if (item.hasActiveConv) {
+          stateChip.className = 'chip purple';
+          stateChip.textContent = '会话待命';
+        } else {
+          stateChip.className = 'chip ok';
+          stateChip.textContent = '空闲待命';
+        }
+        top.appendChild(nameWrap);
+        top.appendChild(stateChip);
+
+        const topicDiv = document.createElement('div');
+        if (item.topic) {
+          topicDiv.className = 'seat-topic';
+          topicDiv.textContent = item.topic;
+          topicDiv.title = item.topic;
+        } else {
+          topicDiv.className = 'seat-topic empty';
+          topicDiv.textContent = item.isWorking ? '正在处理当前请求…' : '暂无活跃会话 · 随时待命';
+        }
+
+        const meta = document.createElement('div');
+        meta.className = 'seat-meta';
+        const modelSpan = document.createElement('span');
+        modelSpan.textContent = friendlyModel(s.active_model || cs.active_model);
+        const turnSpan = document.createElement('span');
+        turnSpan.textContent = turns > 0 ? ('第 ' + turns + ' 轮') : (item.isWorking ? '进行中' : '待命');
+        meta.appendChild(modelSpan);
+        meta.appendChild(turnSpan);
+
+        const track = document.createElement('div');
+        track.className = 'seat-mini-track';
+        const fill = document.createElement('div');
+        fill.className = 'seat-mini-fill';
+        fill.style.width = cmpPct.toFixed(1) + '%';
+        if (cmpPct >= 85) fill.style.background = '#f59e0b';
+        track.appendChild(fill);
+
+        card.appendChild(top);
+        card.appendChild(topicDiv);
+        card.appendChild(meta);
+        card.appendChild(track);
+
+        function toggleSelect() {
+          if (!s.slot_key) return;
+          selectedSlotKey = (selectedSlotKey === s.slot_key) ? null : s.slot_key;
+          document.querySelectorAll('.seat-card[data-slot-key]').forEach(function (el) {
+            const active = el.getAttribute('data-slot-key') === selectedSlotKey;
+            el.classList.toggle('selected', active);
+            el.setAttribute('aria-pressed', active ? 'true' : 'false');
+          });
+          renderSeatDetailPanel();
+        }
+        if (s.slot_key) {
+          card.setAttribute('data-slot-key', s.slot_key);
+        }
+        card.addEventListener('click', toggleSelect);
+        card.addEventListener('keydown', function (ev) {
+          if (ev.key === 'Enter' || ev.key === ' ') {
+            ev.preventDefault();
+            toggleSelect();
+          }
+        });
+        return card;
+      }
+
       function renderSeatsGrid(slots, ctxMon) {
         const grid = document.getElementById('seatsGrid');
+        const idleWrap = document.getElementById('idleSeatsWrap');
+        const idleBody = document.getElementById('idleSeatsBody');
+        const idleGrid = document.getElementById('idleSeatsGrid');
         const chip = document.getElementById('seatsSummaryChip');
         seatIndexByTabId = {};
         seatIndexBySlotKey = {};
+        enrichedBySlotKey = {};
 
         const ctxSlotsMap = {};
         if (ctxMon && Array.isArray(ctxMon.slots)) {
@@ -1606,12 +2256,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         if (!Array.isArray(slots) || slots.length === 0) {
           chip.textContent = '0 个席位在线';
           chip.className = 'chip warn';
+          idleWrap.hidden = true;
+          selectedSlotKey = null;
+          renderSeatDetailPanel();
           grid.replaceChildren();
           const empty = document.createElement('div');
           empty.className = 'empty-seats';
           empty.textContent = '当前还没有挂载 Google 工作页。请在 Chrome 打开并登录 vertexaisearch.cloud.google.com，席位会自动出现。';
           grid.appendChild(empty);
-          return;
+          return 0;
         }
 
         let busyCount = 0;
@@ -1621,24 +2274,38 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           if (s.tab_id) seatIndexByTabId[String(s.tab_id)] = num;
           const cs = ctxSlotsMap[s.slot_key] || {};
           const waitingCnt = Number(s.waiting_count || cs.waiting_count || 0);
-          const isWorking = Boolean(s.busy) || waitingCnt > 0;
+          const sessionActive = Boolean(cs.session_active);
+          const isWorking = Boolean(s.busy) || waitingCnt > 0 || sessionActive;
           if (isWorking) busyCount += 1;
+          const activityPhase = String(
+            cs.activity_phase || (s.busy ? 'generating' : (waitingCnt > 0 ? 'queued' : (isWorking ? 'waiting_model' : 'idle')))
+          );
+          const activityLabel = String(
+            cs.activity_label || (s.busy ? '工作中 · 模型回复' : (waitingCnt > 0 ? ('工作中 · 排队 ' + waitingCnt) : (isWorking ? '工作中' : '空闲待命')))
+          );
+          const toolName = String(cs.tool_name || '');
           const topic = String(cs.session_title || '').trim();
           const turns = Number(cs.user_turns || cs.turn_count || 0);
-          const hasActiveConv = Boolean(topic) || turns > 0 || Boolean(s.pinned_session_id);
+          const usedTok = Number(cs.total_context_tokens || 0);
+          const hasActiveConv = Boolean(topic) || turns > 0 || usedTok > 0 || Boolean(s.pinned_session_id);
           const lastTs = Math.max(Number(cs.updated_at || 0), Number(s.last_used_at || 0));
-          return {
+          const enriched = {
             slot: s,
             cs: cs,
             seatNum: num,
             waitingCnt: waitingCnt,
             isWorking: isWorking,
+            activityPhase: activityPhase,
+            activityLabel: activityLabel,
+            toolName: toolName,
             topic: topic,
             titleSource: String(cs.title_source || ''),
             turns: turns,
             hasActiveConv: hasActiveConv,
             lastTs: lastTs
           };
+          if (s.slot_key) enrichedBySlotKey[s.slot_key] = enriched;
+          return enriched;
         });
 
         // Auto-sort: working seats at the very top, then active conversations by recency, then standby seats
@@ -1646,9 +2313,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           const rankA = a.isWorking ? 0 : (a.hasActiveConv ? 1 : 2);
           const rankB = b.isWorking ? 0 : (b.hasActiveConv ? 1 : 2);
           if (rankA !== rankB) return rankA - rankB;
-          if (a.isWorking && b.isWorking) {
-            if (Boolean(a.slot.busy) !== Boolean(b.slot.busy)) return a.slot.busy ? -1 : 1;
-            if (b.lastTs !== a.lastTs) return b.lastTs - a.lastTs;
+          if (rankA === 0) {
+            return a.seatNum - b.seatNum;
           }
           if (rankA === 1 && b.lastTs !== a.lastTs) {
             return b.lastTs - a.lastTs;
@@ -1656,116 +2322,47 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           return a.seatNum - b.seatNum;
         });
 
-        chip.textContent = busyCount > 0
-          ? (slots.length + ' 个席位在线 · ' + busyCount + ' 个工作中')
-          : (slots.length + ' 个席位空闲待命');
+        const activeItems = enrichedSlots.filter(function (x) { return x.isWorking || x.hasActiveConv; });
+        const idleItems = enrichedSlots.filter(function (x) { return !x.isWorking && !x.hasActiveConv; });
+
+        if (busyCount > 0) {
+          chip.textContent = activeItems.length + ' 活跃 (' + busyCount + ' 工作中) · ' + idleItems.length + ' 空闲';
+        } else if (activeItems.length > 0) {
+          chip.textContent = activeItems.length + ' 活跃 · ' + idleItems.length + ' 空闲';
+        } else {
+          chip.textContent = slots.length + ' 个空闲待命';
+        }
         chip.className = busyCount > 0 ? 'chip busy' : 'chip ok';
 
         grid.replaceChildren();
-        enrichedSlots.forEach(function (item) {
-          const s = item.slot;
-          const cs = item.cs;
-          const seatNum = item.seatNum;
-          const turns = item.turns;
-          const usedTok = Number(cs.total_context_tokens || 0);
-          const cmpTok = Number(cs.compact_threshold_tokens || 300000);
-          const remTok = cs.remaining_to_compact_tokens !== undefined
-            ? Number(cs.remaining_to_compact_tokens)
-            : Math.max(0, cmpTok - usedTok);
-          const cmpPct = Math.min(100, Math.max(0, Number(cs.compact_pct || 0)));
-
-          const card = document.createElement('div');
-          card.className = 'seat-card' + (item.isWorking ? ' busy' : (item.hasActiveConv ? ' active-idle' : ''));
-
-          const top = document.createElement('div');
-          top.className = 'seat-top';
-          const nameWrap = document.createElement('div');
-          nameWrap.className = 'seat-name';
-          nameWrap.textContent = seatNum + ' 号席位';
-          if (s.tab_id) {
-            const idSpan = document.createElement('span');
-            idSpan.className = 'seat-id';
-            idSpan.textContent = '#' + String(s.tab_id).slice(-4);
-            nameWrap.appendChild(idSpan);
-          }
-          const stateChip = document.createElement('span');
-          if (item.isWorking) {
-            stateChip.className = 'chip busy';
-            const pulse = document.createElement('i');
-            pulse.className = 'live-work-dot';
-            stateChip.appendChild(pulse);
-            stateChip.appendChild(document.createTextNode(s.busy ? '工作中' : ('排队 ' + item.waitingCnt)));
-          } else {
-            stateChip.className = 'chip ok';
-            stateChip.textContent = '空闲待命';
-          }
-          top.appendChild(nameWrap);
-          top.appendChild(stateChip);
-
-          const topicDiv = document.createElement('div');
-          if (item.topic) {
-            topicDiv.className = 'seat-topic';
-            topicDiv.textContent = item.topic;
-            const srcMap = {
-              codex: 'Codex 会话标题',
-              prompt: '首条提问摘要',
-              web: 'Gemini 网页标题',
-              task: '专项任务'
-            };
-            const srcLabel = srcMap[item.titleSource] || '当前会话';
-            topicDiv.title = srcLabel + '：' + item.topic +
-              (s.tab_id ? ('\n标签页 ID: #' + s.tab_id) : '');
-          } else {
-            topicDiv.className = 'seat-topic empty';
-            topicDiv.textContent = '暂无活跃会话 · 随时待命';
-            topicDiv.title = s.tab_id ? ('空闲工作页 #' + s.tab_id) : '空闲工作页';
-          }
-
-          const meta = document.createElement('div');
-          meta.className = 'seat-meta';
-          const modelSpan = document.createElement('span');
-          modelSpan.textContent = '模型: ' + friendlyModel(s.active_model || cs.active_model);
-          const turnSpan = document.createElement('span');
-          turnSpan.textContent = turns > 0 ? ('已聊 ' + turns + ' 轮') : ('累计 ' + (s.completed_requests || 0) + ' 次');
-          meta.appendChild(modelSpan);
-          meta.appendChild(turnSpan);
-
-          const track = document.createElement('div');
-          track.className = 'seat-mini-track';
-          const fill = document.createElement('div');
-          fill.className = 'seat-mini-fill';
-          fill.style.width = cmpPct.toFixed(1) + '%';
-          if (cmpPct >= 85) fill.style.background = '#f59e0b';
-          track.appendChild(fill);
-
-          const foot = document.createElement('div');
-          foot.className = 'seat-foot';
-          const remSpan = document.createElement('span');
-          remSpan.className = 'seat-rem';
-          remSpan.textContent = usedTok > 0
-            ? ('已用 ' + fmtTok(usedTok) + ' · 剩 ' + fmtTok(remTok))
-            : '全新空白会话';
-
-          const rstBtn = document.createElement('button');
-          rstBtn.type = 'button';
-          rstBtn.className = 'btn sm';
-          rstBtn.textContent = item.isWorking ? '工作中' : '开启新对话';
-          rstBtn.disabled = Boolean(item.isWorking);
-          rstBtn.title = item.isWorking ? '当前席位正在执行任务，完成后可重置' : '清空该席位上下文并开启全新对话';
-          rstBtn.addEventListener('click', function () {
-            resetSingleSeat(s.slot_key, seatNum, rstBtn);
+        if (activeItems.length === 0) {
+          const empty = document.createElement('div');
+          empty.className = 'empty-seats';
+          empty.textContent = '当前暂无进行中的活跃对话 · 新请求将自动分配席位，也可展开下方空闲席位查看';
+          grid.appendChild(empty);
+        } else {
+          activeItems.forEach(function (item) {
+            grid.appendChild(buildSeatCard(item));
           });
+        }
 
-          foot.appendChild(remSpan);
-          foot.appendChild(rstBtn);
+        if (idleItems.length === 0) {
+          idleWrap.hidden = true;
+          idleGrid.replaceChildren();
+        } else {
+          idleWrap.hidden = false;
+          document.getElementById('idleSeatsLabel').textContent = '空闲待命席位（' + idleItems.length + ' 个）';
+          document.getElementById('idleSeatsHint').textContent = idleSeatsExpanded ? '收起列表 ▴' : '展开查看 ▾';
+          document.getElementById('idleSeatsToggle').setAttribute('aria-expanded', idleSeatsExpanded ? 'true' : 'false');
+          idleBody.hidden = !idleSeatsExpanded;
+          idleGrid.replaceChildren();
+          idleItems.forEach(function (item) {
+            idleGrid.appendChild(buildSeatCard(item));
+          });
+        }
 
-          card.appendChild(top);
-          card.appendChild(topicDiv);
-          card.appendChild(meta);
-          card.appendChild(track);
-          card.appendChild(foot);
-          grid.appendChild(card);
-        });
+        renderSeatDetailPanel();
+        return busyCount;
       }
 
       function syncPeriodControls(usage) {
@@ -1852,8 +2449,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         days.forEach(function (dk) {
           const s = (dailyMap[dk] && dailyMap[dk].summary) || {};
           const tot = selectedCurrency === 'USD'
-            ? Number(s.equivalent_cost_usd || 0)
-            : Number(s.equivalent_cost_cny || 0);
+            ? Number(s.cached_equivalent_cost_usd || 0)
+            : Number(s.cached_equivalent_cost_cny || 0);
           if (tot > maxTotal) maxTotal = tot;
         });
 
@@ -1862,21 +2459,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           const actual = selectedCurrency === 'USD'
             ? Number(s.cached_equivalent_cost_usd || 0)
             : Number(s.cached_equivalent_cost_cny || 0);
-          const saved = selectedCurrency === 'USD'
-            ? Number(s.saved_cost_usd || 0)
-            : Number(s.saved_cost_cny || 0);
-          const total = Math.max(actual + saved, 0);
-          const totalPct = total > 0 ? Math.max(8, (total / maxTotal) * 100) : 3;
-          const savedH = total > 0 ? (saved / total) * totalPct : 0;
-          const actualH = total > 0 ? (actual / total) * totalPct : 3;
+          const reqCnt = Number(s.requests || 0);
+          const actualH = reqCnt > 0 ? Math.max(8, (actual / maxTotal) * 100) : 3;
+          const tp = resolveTokenParts(s);
 
           const col = document.createElement('div');
           col.className = 'bar-col' + (activeFilterDay === dk ? ' selected' : '');
-          const reqCnt = Number(s.requests || 0);
           col.title = reqCnt > 0
-            ? (dk + ' · ' + reqCnt + ' 次调用\n实际折算: ' +
+            ? (dk + ' · ' + reqCnt + ' 次调用\n等效花费: ' +
               fmtMoney(s.cached_equivalent_cost_usd, s.cached_equivalent_cost_cny) +
-              '\n续聊省下: ' + fmtMoney(s.saved_cost_usd, s.saved_cost_cny))
+              '\n缓存命中率: ' + Number(s.cache_hit_pct || 0).toFixed(1) + '%' +
+              '\n累计 Token: ' + fmtLedgerTok(tp.total) +
+              '（输入 ' + fmtLedgerTok(tp.input) + ' / 输出 ' + fmtLedgerTok(tp.output) + ' / 缓存 ' + fmtLedgerTok(tp.cached) + '）')
             : (dk + ' · 无调用记录');
 
           const valTop = document.createElement('span');
@@ -1887,13 +2481,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
           const stack = document.createElement('div');
           stack.className = 'bar-stack';
-          const segSaved = document.createElement('div');
-          segSaved.className = 'bar-seg-saved';
-          segSaved.style.height = savedH.toFixed(1) + '%';
           const segActual = document.createElement('div');
           segActual.className = 'bar-seg-actual';
           segActual.style.height = actualH.toFixed(1) + '%';
-          stack.appendChild(segSaved);
           stack.appendChild(segActual);
 
           const lbl = document.createElement('span');
@@ -1991,22 +2581,24 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         const fx = Number(usage.usd_to_cny_rate || 6.8);
 
         if (ap.display_name) {
+          const rParts = (
+            ap.input_rate_per_1m !== undefined &&
+            ap.cached_input_rate_per_1m !== undefined &&
+            ap.output_rate_per_1m !== undefined
+          )
+            ? (' ($' + ap.input_rate_per_1m + ' / $' + ap.cached_input_rate_per_1m + ' / $' + ap.output_rate_per_1m + ')')
+            : '';
           document.getElementById('ledgerRateBadge').textContent =
-            friendlyModel(ap.display_name) + ' · 汇率 ' + fx;
+            friendlyModel(ap.display_name) + rParts + ' · 汇率 ' + fx;
         }
 
         document.getElementById('activePeriodTag').textContent = pLabel;
-        document.getElementById('reuseRateChip').textContent = '记忆复用 ' + (curSummary.cache_hit_pct || 0) + '%';
-
-        document.getElementById('ledgerSavedMain').textContent =
-          fmtMoney(curSummary.saved_cost_usd, curSummary.saved_cost_cny);
-        document.getElementById('ledgerSavedSub').textContent =
-          '若每次全量重发原价约 ' + fmtMoney(curSummary.equivalent_cost_usd, curSummary.equivalent_cost_cny);
 
         document.getElementById('ledgerActualMain').textContent =
           fmtMoney(curSummary.cached_equivalent_cost_usd, curSummary.cached_equivalent_cost_cny);
-        document.getElementById('ledgerActualSub').textContent =
-          '本地字数估算折算 · 并非 Google 真实扣费';
+        const actualSubEl = document.getElementById('ledgerActualSub');
+        actualSubEl.textContent = '输入 / 缓存 / 输出单价折算';
+        actualSubEl.title = '按每轮新增输入、同对话缓存与回复输出参考单价折算（非网页真实扣费）';
 
         const reqCount = Number(curSummary.requests || 0);
         const respCnt = (byTask.responses && byTask.responses.requests) || 0;
@@ -2014,34 +2606,34 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         const cmpCnt = Number(curSummary.compactions || 0);
         const mediaCnt = Number(curSummary.images_generated || 0) + Number(curSummary.videos_generated || 0) + Number(curSummary.audio_requests || 0);
         document.getElementById('ledgerCallsMain').textContent = reqCount.toLocaleString() + ' 次';
-        document.getElementById('ledgerCallsSub').textContent =
-          'Codex ' + respCnt + ' · 对话 ' + chatCnt + ' · 记忆整理 ' + cmpCnt + (mediaCnt > 0 ? (' · 多媒体 ' + mediaCnt) : '');
+        let callsThirdLabel = '整理 ' + cmpCnt;
+        if (cmpCnt > 0 && mediaCnt > 0) {
+          callsThirdLabel = '专项 ' + (cmpCnt + mediaCnt);
+        } else if (mediaCnt > 0) {
+          callsThirdLabel = '媒体 ' + mediaCnt;
+        }
+        const callsSubText = 'Codex ' + respCnt + ' / 对话 ' + chatCnt + ' / ' + callsThirdLabel;
+        const callsFullTip = 'Codex ' + respCnt + ' · 对话 ' + chatCnt + ' · 记忆整理 ' + cmpCnt + (mediaCnt > 0 ? (' · 多媒体 ' + mediaCnt) : '');
+        const callsSubEl = document.getElementById('ledgerCallsSub');
+        callsSubEl.textContent = callsSubText;
+        callsSubEl.title = callsFullTip;
 
-        document.getElementById('ledgerWordsMain').textContent = fmtWordsScale(curSummary.total_tokens);
-        document.getElementById('ledgerWordsSub').textContent =
-          '新增 ' + fmtTok(curSummary.delta_prompt_tokens) + ' · 复用 ' + fmtTok(curSummary.cached_tokens) + ' · 回复 ' + fmtTok(curSummary.completion_tokens);
+        const sumTok = resolveTokenParts(curSummary);
+        const promptTokTotal = sumTok.input + sumTok.cached;
+        const hitPct = curSummary.cache_hit_pct !== undefined
+          ? Number(curSummary.cache_hit_pct || 0)
+          : (promptTokTotal > 0 ? (sumTok.cached / promptTokTotal) * 100 : 0);
+        document.getElementById('ledgerCacheMain').textContent = hitPct.toFixed(1) + '%';
+        const cacheSubText = '缓存 ' + fmtLedgerTok(sumTok.cached) + ' / 总输入 ' + fmtLedgerTok(promptTokTotal);
+        const cacheSubEl = document.getElementById('ledgerCacheSub');
+        cacheSubEl.textContent = cacheSubText;
+        cacheSubEl.title = '同对话复用缓存 ' + fmtLedgerTok(sumTok.cached) + ' / 新增输入 ' + fmtLedgerTok(sumTok.input) + ' / 总输入上下文 ' + fmtLedgerTok(promptTokTotal);
 
-        // Primary Context Monitor Bar
-        const cm = ctxMon || {};
-        const prim = cm.primary || {};
-        const cTok = Number(prim.total_context_tokens || 0);
-        const cLim = Number(prim.context_limit_tokens || 1048576);
-        const cCmp = Number(prim.compact_threshold_tokens || 300000);
-        const remCmp = prim.remaining_to_compact_tokens !== undefined
-          ? Number(prim.remaining_to_compact_tokens)
-          : Math.max(0, cCmp - cTok);
-        const cmpPct = Number(prim.compact_pct || 0);
-
-        document.getElementById('ledgerCtxPct').textContent =
-          '已用 ' + fmtTok(cTok) + ' / 自动整理线 ' + fmtTok(cCmp) + ' (' + cmpPct.toFixed(1) + '% · 还剩 ' + fmtTok(remCmp) + ') · 总容量 ' + fmtTok(cLim);
-        const fill = document.getElementById('ledgerCtxFill');
-        fill.style.width = Math.min(100, Math.max(0, cmpPct)).toFixed(1) + '%';
-        fill.className = cmpPct >= 100 ? 'ctx-fill danger' : (cmpPct >= 80 ? 'ctx-fill warn' : 'ctx-fill');
-        const primTopic = prim.session_title ? (' · 「' + prim.session_title.slice(0, 22) + (prim.session_title.length > 22 ? '…' : '') + '」') : '';
-        document.getElementById('ledgerCtxTitle').textContent =
-          ((prim.turn_count || 0) > 0 || prim.busy || prim.session_title)
-            ? ('主活跃对话（' + friendlySeatLabel(prim.slot_key, prim.tab_id) + primTopic + ' · ' + friendlyModel(prim.active_model) + ((prim.user_turns || prim.turn_count) > 0 ? (' · 第 ' + (prim.user_turns || prim.turn_count) + ' 轮') : ' · 工作中') + '）')
-            : ('主活跃对话记忆池 · 空闲待命 (自动整理线 ' + fmtTok(cCmp) + ')');
+        document.getElementById('ledgerTokensMain').textContent = fmtLedgerTok(sumTok.total);
+        const tokSubText = '输入 ' + fmtLedgerTok(sumTok.input) + ' / 输出 ' + fmtLedgerTok(sumTok.output) + ' / 缓存 ' + fmtLedgerTok(sumTok.cached);
+        const tokSubEl = document.getElementById('ledgerTokensSub');
+        tokSubEl.textContent = tokSubText;
+        tokSubEl.title = tokSubText;
 
         renderDailyBars(usage, resolved.filterDay);
         renderTaskBreakdown(byTask, reqCount);
@@ -2055,21 +2647,19 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           modelBody.replaceChildren();
           modelKeys.forEach(function (mk) {
             const m = byModel[mk] || {};
+            const mt = resolveTokenParts(m);
             const tr = document.createElement('tr');
             tr.appendChild(makeCell(m.display_name || friendlyModel(mk)));
-            tr.appendChild(makeCell((m.requests || 0) + ' 次'));
-            tr.appendChild(makeCell(fmtTok(m.prompt_tokens) + ' / ' + fmtTok(m.cached_tokens) + ' / ' + fmtTok(m.completion_tokens)));
+            tr.appendChild(makeCell((m.requests || 0) + ' 次', 'num'));
+            tr.appendChild(makeCell(fmtLedgerTok(mt.total), 'num'));
+            tr.appendChild(makeCell(fmtLedgerTok(mt.input) + ' / ' + fmtLedgerTok(mt.output) + ' / ' + fmtLedgerTok(mt.cached)));
             const mediaParts = [];
             if (m.images_generated) mediaParts.push(m.images_generated + ' 张图');
             if (m.videos_generated) mediaParts.push(m.videos_generated + ' 条视频');
             if (m.audio_requests) mediaParts.push(m.audio_requests + ' 次语音');
             if (m.compactions) mediaParts.push(m.compactions + ' 次整理');
             tr.appendChild(makeCell(mediaParts.length > 0 ? mediaParts.join(' · ') : '-'));
-            tr.appendChild(makeCell(fmtMoney(m.equivalent_cost_usd, m.equivalent_cost_cny)));
-            tr.appendChild(makeCell(
-              fmtMoney(m.cached_equivalent_cost_usd, m.cached_equivalent_cost_cny) +
-              '（省 ' + fmtMoney(m.saved_cost_usd, m.saved_cost_cny) + '）'
-            ));
+            tr.appendChild(makeCell(fmtMoney(m.cached_equivalent_cost_usd, m.cached_equivalent_cost_cny), 'num'));
             modelBody.appendChild(tr);
           });
         }
@@ -2084,21 +2674,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           dailyBody.replaceChildren();
           sortedDays.forEach(function (dk) {
             const ds = (dailyMap[dk] && dailyMap[dk].summary) || {};
+            const dt = resolveTokenParts(ds);
             const tr = document.createElement('tr');
             if (resolved.filterDay === dk) tr.style.background = '#eff6ff';
             tr.appendChild(makeCell(dk));
-            tr.appendChild(makeCell((ds.requests || 0) + ' 次'));
+            tr.appendChild(makeCell((ds.requests || 0) + ' 次', 'num'));
+            tr.appendChild(makeCell(fmtLedgerTok(dt.total), 'num'));
+            tr.appendChild(makeCell(fmtLedgerTok(dt.input) + ' / ' + fmtLedgerTok(dt.output) + ' / ' + fmtLedgerTok(dt.cached)));
             const dParts = [];
             if (ds.compactions) dParts.push(ds.compactions + ' 次整理');
             if (ds.images_generated) dParts.push(ds.images_generated + ' 张图');
             if (ds.videos_generated) dParts.push(ds.videos_generated + ' 条视频');
             if (ds.audio_requests) dParts.push(ds.audio_requests + ' 次语音');
             tr.appendChild(makeCell(dParts.length > 0 ? dParts.join(' · ') : '常规对话与编程'));
-            tr.appendChild(makeCell(fmtMoney(ds.equivalent_cost_usd, ds.equivalent_cost_cny)));
-            tr.appendChild(makeCell(fmtMoney(ds.cached_equivalent_cost_usd, ds.cached_equivalent_cost_cny)));
-            tr.appendChild(makeCell(
-              fmtMoney(ds.saved_cost_usd, ds.saved_cost_cny) + '（' + (ds.cache_hit_pct || 0) + '%）'
-            ));
+            tr.appendChild(makeCell(fmtMoney(ds.cached_equivalent_cost_usd, ds.cached_equivalent_cost_cny), 'num'));
             dailyBody.appendChild(tr);
           });
         }
@@ -2130,23 +2719,34 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             const tr = document.createElement('tr');
             const tStr = r.ts ? ((r.day ? r.day.slice(5) + ' ' : '') + new Date(r.ts * 1000).toLocaleTimeString()) : '-';
             const tMeta = TASK_META[r.task_type] || { label: r.task_label || '常规调用' };
+            const rt = resolveTokenParts(r);
             tr.appendChild(makeCell(tStr));
             tr.appendChild(makeCell(tMeta.label));
             tr.appendChild(makeCell(friendlyModel(r.display_name || r.model) + ' · ' + friendlySeatLabel(r.slot_key, r.tab_id)));
             tr.appendChild(makeCell(friendlyStrategyBadge(r.strategy)));
-            const newTok = r.delta_prompt_tokens !== undefined ? r.delta_prompt_tokens : r.prompt_tokens;
-            tr.appendChild(makeCell(fmtTok(newTok) + ' / ' + fmtTok(r.cached_tokens) + ' / ' + fmtTok(r.completion_tokens)));
             tr.appendChild(makeCell(
-              fmtMoney(r.cached_equivalent_cost_usd, r.cached_equivalent_cost_cny) +
-              '（省 ' + fmtMoney(r.saved_cost_usd, r.saved_cost_cny) + '）'
+              fmtLedgerTok(rt.total) + '（' + fmtLedgerTok(rt.input) + ' / ' + fmtLedgerTok(rt.output) + ' / ' + fmtLedgerTok(rt.cached) + '）'
             ));
-            tr.appendChild(makeCell(((Number(r.duration_ms || 0)) / 1000).toFixed(1) + ' 秒'));
+            tr.appendChild(makeCell(fmtMoney(r.cached_equivalent_cost_usd, r.cached_equivalent_cost_cny), 'num'));
+            tr.appendChild(makeCell(((Number(r.duration_ms || 0)) / 1000).toFixed(1) + ' 秒', 'num'));
             recentBody.appendChild(tr);
           });
         }
       }
 
-      async function refreshStatus() {
+      async function refreshStatus(isManual) {
+        const manual = isManual === true;
+        const refBtn = document.getElementById('refreshBtn');
+        const refTxt = document.getElementById('refreshBtnText');
+        const badge = document.getElementById('connBadge');
+        const t0 = performance.now();
+        if (manual) {
+          if (refreshResetTimer) clearTimeout(refreshResetTimer);
+          refBtn.classList.remove('is-refreshed', 'is-error');
+          refBtn.classList.add('is-refreshing');
+          refTxt.textContent = '同步中';
+        }
+        let refreshOk = false;
         try {
           const res = await fetch('/api/status');
           const data = await res.json();
@@ -2161,52 +2761,58 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           // Step 1: Local Service
           setStepState(
             'stepServiceCard', 'stepServiceIcon', 'stepServiceDesc', 'stepServiceTag',
-            'ok', '✓', '127.0.0.1:8000 · 默认 ' + defModelName, '运行正常'
+            'ok', '✓', '8000 · ' + defModelName, '在线'
           );
 
           // Step 2 & 3: Extension & Google Tabs
           const extOnline = clients.length > 0 || slots.length > 0 || Boolean(active);
+          const extParallelCap = (active && active.max_parallel_tabs)
+            || hub.client_max_parallel_tabs
+            || hub.max_parallel_tabs
+            || 10;
           const authBtn = document.getElementById('stepAuthBtn');
+
+          const workingTotal = renderSeatsGrid(slots, data.context_monitor) || 0;
 
           if (!extOnline) {
             setStepState(
               'stepExtCard', 'stepExtIcon', 'stepExtDesc', 'stepExtTag',
-              'warn', '!', '请检查 Chrome 右上角桥接插件是否开启', '待连接'
+              'warn', '!', '请开启浏览器扩展', '待连接'
             );
             setStepState(
               'stepAuthCard', 'stepAuthIcon', 'stepAuthDesc', 'stepAuthTag',
-              'warn', '3', '插件连接后自动识别 Google 页面', '等待中'
+              'warn', '3', '等待插件识别', '待检测'
             );
             authBtn.hidden = false;
             dot.className = 'dot err';
-            txt.textContent = '等待浏览器插件连接';
+            txt.textContent = '等待插件连接';
           } else if (slots.length === 0) {
             setStepState(
               'stepExtCard', 'stepExtIcon', 'stepExtDesc', 'stepExtTag',
-              'ok', '✓', '浏览器插件已连接 · 支持自动扩容', '已连通'
+              'ok', '✓', '上限 ' + extParallelCap + ' 路并行', '已连接'
             );
             setStepState(
               'stepAuthCard', 'stepAuthIcon', 'stepAuthDesc', 'stepAuthTag',
-              'warn', '!', '尚未打开或登录 Google Enterprise 网页', '需打开页面'
+              'warn', '!', '请打开并登录网页', '待打开'
             );
             authBtn.hidden = false;
             dot.className = 'dot';
-            txt.textContent = '插件已连 · 请打开 Google 工作页';
+            txt.textContent = '请打开工作页';
           } else {
             setStepState(
               'stepExtCard', 'stepExtIcon', 'stepExtDesc', 'stepExtTag',
-              'ok', '✓', '实时通道在线 · 上限 ' + (hub.max_parallel_tabs || 10) + ' 页并行', '已连通'
+              'ok', '✓', '上限 ' + extParallelCap + ' 路并行', '已连接'
             );
             setStepState(
               'stepAuthCard', 'stepAuthIcon', 'stepAuthDesc', 'stepAuthTag',
-              'ok', '✓', '已就绪 ' + slots.length + ' 个工作页 · 可随时对话', '登录有效'
+              'ok', '✓', slots.length + ' 页已登录', '就绪'
             );
             authBtn.hidden = true;
             dot.className = 'dot ok';
-            txt.textContent = '一切就绪 · ' + slots.length + ' 个工作页待命';
+            txt.textContent = workingTotal > 0
+              ? (workingTotal + ' 工作中 · 共 ' + slots.length + ' 页')
+              : (slots.length + ' 页就绪待命');
           }
-
-          renderSeatsGrid(slots, data.context_monitor);
 
           if (data.usage) {
             renderLedger(data.usage, data.context_monitor);
@@ -2215,11 +2821,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           // Diagnostics drawer
           document.getElementById('modeVal').textContent = '浏览器桥接 · 智能增量记忆';
           document.getElementById('transportVal').textContent =
-            extOnline ? ('WebSocket 实时双工 · 上限 ' + (hub.max_parallel_tabs || 10) + ' 并发') : '未连接';
+            extOnline ? ('WebSocket 实时双工 · 上限 ' + extParallelCap + ' 并发') : '未连接';
           document.getElementById('rpcVal').textContent =
             (active && active.captured_rpc) ? '已捕获流式通道' : '页面组件与流式双监听';
+          const effBusy = Math.max(Number(hub.working_slots || 0), Number(hub.active_slots_busy || 0), workingTotal);
           document.getElementById('statsVal').textContent =
-            (hub.active_slots_busy || 0) + ' 进行中 / ' + (hub.queued_requests || 0) + ' 排队 / ' + (hub.total_requests || 0) + ' 累计';
+            effBusy + ' 工作中 / ' + (hub.queued_requests || 0) + ' 排队 / ' + (hub.total_requests || 0) + ' 累计';
           document.getElementById('diagStatsChip').textContent = '累计 ' + (hub.total_requests || 0) + ' 次请求';
 
           const logs = hub.recent_logs || [];
@@ -2236,13 +2843,29 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
               logsBox.appendChild(div);
             });
           }
+          refreshOk = true;
         } catch (_) {
           document.getElementById('connDot').className = 'dot err';
           document.getElementById('connText').textContent = '本地服务未响应';
           setStepState(
             'stepServiceCard', 'stepServiceIcon', 'stepServiceDesc', 'stepServiceTag',
-            'err', '✕', '本地 8000 服务未启动或正在重启', '离线'
+            'err', '✕', '8000 未响应', '离线'
           );
+        }
+        if (manual) {
+          const waitMs = Math.max(0, 460 - (performance.now() - t0));
+          await new Promise(function (resolve) { setTimeout(resolve, waitMs); });
+          refBtn.classList.remove('is-refreshing');
+          refBtn.classList.add(refreshOk ? 'is-refreshed' : 'is-error');
+          refTxt.textContent = refreshOk ? '已同步 ✓' : '重试';
+          if (refreshOk) {
+            badge.classList.add('flash');
+            setTimeout(function () { badge.classList.remove('flash'); }, 600);
+          }
+          refreshResetTimer = setTimeout(function () {
+            refBtn.classList.remove('is-refreshed', 'is-error');
+            refTxt.textContent = '刷新';
+          }, 950);
         }
       }
 
@@ -2382,7 +3005,28 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       document.getElementById('sendBtn').addEventListener('click', function () {
         executeTestRequest(false);
       });
-      document.getElementById('refreshBtn').addEventListener('click', refreshStatus);
+      document.getElementById('refreshBtn').addEventListener('click', function () {
+        refreshStatus(true);
+      });
+      document.getElementById('idleSeatsToggle').addEventListener('click', function () {
+        idleSeatsExpanded = !idleSeatsExpanded;
+        document.getElementById('idleSeatsBody').hidden = !idleSeatsExpanded;
+        document.getElementById('idleSeatsHint').textContent = idleSeatsExpanded ? '收起列表 ▴' : '展开查看 ▾';
+        document.getElementById('idleSeatsToggle').setAttribute('aria-expanded', idleSeatsExpanded ? 'true' : 'false');
+      });
+      document.getElementById('detailCloseBtn').addEventListener('click', function () {
+        selectedSlotKey = null;
+        document.querySelectorAll('.seat-card[data-slot-key]').forEach(function (el) {
+          el.classList.remove('selected');
+          el.setAttribute('aria-pressed', 'false');
+        });
+        renderSeatDetailPanel();
+      });
+      document.getElementById('detailResetBtn').addEventListener('click', function () {
+        const item = selectedSlotKey ? enrichedBySlotKey[selectedSlotKey] : null;
+        if (!item || item.isWorking) return;
+        resetSingleSeat(item.slot.slot_key, item.seatNum, document.getElementById('detailResetBtn'));
+      });
 
       document.getElementById('periodTabs').addEventListener('click', function (ev) {
         const btn = ev.target && ev.target.closest('.period-tab');
@@ -2444,3 +3088,22 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </body>
 </html>
 """
+
+_CACHED_HTML = DASHBOARD_HTML
+_CACHED_MTIME_NS = 0
+
+
+def get_dashboard_html() -> str:
+    global _CACHED_HTML, _CACHED_MTIME_NS
+    try:
+        p = Path(__file__)
+        st = p.stat()
+        if st.st_mtime_ns != _CACHED_MTIME_NS:
+            ns: dict = {}
+            exec(compile(p.read_text(encoding="utf-8"), str(p), "exec"), ns)
+            if isinstance(ns.get("DASHBOARD_HTML"), str):
+                _CACHED_HTML = ns["DASHBOARD_HTML"]
+                _CACHED_MTIME_NS = st.st_mtime_ns
+    except Exception:
+        pass
+    return _CACHED_HTML

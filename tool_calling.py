@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import json
+import posixpath
 import re
 import shlex
 import uuid
@@ -213,12 +214,12 @@ def build_tool_system_instructions(
         )
     else:
         rules.append(
-            "- If multiple independent read calls are needed at once, emit separate codex_tool_call code blocks back-to-back."
+            "- Default to ONE codex_tool_call code block per turn. Emit multiple codex_tool_call blocks ONLY for independent pure read-only lookups (such as read_thread, view_image, codegraph_explore, list_*, or simple read-only rg/nl/sed -n/cat/ls/git status/diff/log commands); NEVER emit multiple blocks when any call runs scripts/tests/builds (node, python, npm, swift, curl) or modifies files/state."
         )
 
     rules.extend(
         [
-            "- Send file changes or shell commands one at a time; wait for the real client result before issuing dependent checks. Only independent read operations may run together.",
+            "- Send file changes or shell commands one at a time; wait for the real client result before issuing dependent checks.",
             "- Place one JSON object per codex_tool_call block. `arguments` MUST be a valid RFC 8259 JSON object matching the tool's `parameters` schema (never backslash-escape markdown or shell characters such as `*`, `_`, `|`, `#`, `[`, `]`, `'`, space, or backtick inside JSON strings).",
             "- Output only brief user-facing progress, tool calls, or the final answer. Never output an internal thinking transcript or a 'Thinking Process:' / '思考过程：' section.",
             "- Never fabricate client results and never emit a `suggested_questions` block on a tool-call turn. Stop immediately after the closing fence of your codex_tool_call block(s); the client must execute them first.",
@@ -259,7 +260,7 @@ def build_tool_delta_reminder(
     else:
         action = "Continue from the real client results above." if has_tool_results else "Continue the current task."
     return (CLIENT_TOOL_BOUNDARY + "\n" + action + "\n"
-            "For another tool step, emit fenced codex_tool_call JSON block(s) (multiple blocks only for independent read-only queries; strictly one block for edits or side-effecting commands) and stop immediately after the closing fence without suggested_questions. "
+            "For another tool step, emit one fenced codex_tool_call JSON block and stop immediately after the closing fence without suggested_questions. "
             "For file changes, prefer a small patch and wait before checking. "
             "Otherwise give the final answer. Example format:\n" + CLIENT_CALL_EXAMPLE)
 
@@ -470,7 +471,7 @@ def parse_assistant_output(
     norm_tools = list(tools or [])
 
     if clean_web_text(text).strip() == _BROWSER_TASK_FAILURE:
-        raise BrowserTaskFailure("Gemini 网页未能完成本次操作；已拒绝将失败提示当作正常答复。已执行的本机操作不会重放，下一次续接将重建网页上下文。")
+        raise BrowserTaskFailure("Gemini 网页未能完成本次操作；已拒绝将失败提示当作正常答复。已执行的本机操作不会重放，下一次续接将优先在原会话纠正，连续失败再重建网页上下文。")
 
     if _thinking_prefix(text).startswith(_THINKING_PREFIXES):
         raise ToolProtocolError("网页返回了内部思考文字，未交付为答复。")
@@ -511,10 +512,7 @@ def parse_assistant_output(
     extracted_calls = _normalize_query_calls(extracted_calls)
     if parallel_tool_calls is False and len(extracted_calls) > 1:
         raise ToolProtocolError("客户端要求逐项执行，未执行同批的多个请求。")
-    if len(extracted_calls) > 1 and any(
-        c["function"]["name"].rsplit(".", 1)[-1] in {"exec_command", "apply_patch", "write_file", "edit_file", "write_stdin"}
-        and not _is_read_query(c) for c in extracted_calls
-    ):
+    if len(extracted_calls) > 1 and _has_conflicting_parallel_calls(extracted_calls):
         raise ToolProtocolError("文件修改或命令执行必须等待真实结果后再检查；未执行这批可能互相依赖的请求。")
 
     cleaned_preamble = clean_web_text(remaining_text).strip()
@@ -543,6 +541,17 @@ _READ_ONLY_TOOL_NAMES = {
     "get_goal",
 }
 
+_WORKSPACE_TOOLS = {
+    "exec_command",
+    "apply_patch",
+    "write_file",
+    "edit_file",
+    "write_stdin",
+    "read_file",
+    "read_text_file",
+    "codegraph_explore",
+}
+
 _SIMPLE_READ_BINS = {
     "cat",
     "ls",
@@ -552,16 +561,91 @@ _SIMPLE_READ_BINS = {
     "nl",
     "pwd",
     "which",
+    "type",
     "realpath",
+    "readlink",
     "basename",
     "dirname",
     "diff",
+    "cmp",
+    "comm",
+    "cut",
+    "tr",
+    "paste",
+    "column",
+    "fold",
+    "rev",
+    "jq",
     "echo",
+    "printf",
     "true",
+    "false",
+    "test",
+    "[",
+    "uname",
+    "whoami",
+    "id",
+    "hostname",
+    "sw_vers",
+    "date",
+    "printenv",
+    "du",
+    "df",
+    "ps",
+    "pgrep",
+    "lsof",
+    "tree",
+    "md5",
+    "shasum",
+    "sha256sum",
+    "strings",
+    "hexdump",
+    "od",
 }
 
 _SEARCH_READ_BINS = {"rg", "grep", "egrep", "fgrep"}
-_GIT_READ_SUBCOMMANDS = {"status", "diff", "log", "show", "rev-parse", "ls-files"}
+_GIT_READ_SUBCOMMANDS = {
+    "status",
+    "diff",
+    "log",
+    "show",
+    "rev-parse",
+    "ls-files",
+    "ls-tree",
+    "grep",
+    "blame",
+    "shortlog",
+    "describe",
+    "cat-file",
+    "for-each-ref",
+    "check-ignore",
+    "rev-list",
+    "name-rev",
+}
+_VERSION_CHECK_BINS = {
+    "node",
+    "npm",
+    "npx",
+    "pnpm",
+    "yarn",
+    "bun",
+    "deno",
+    "python",
+    "python3",
+    "pip",
+    "pip3",
+    "pytest",
+    "rg",
+    "git",
+    "go",
+    "rustc",
+    "cargo",
+    "swift",
+    "java",
+    "javac",
+    "clang",
+    "gcc",
+}
 _FIND_UNSAFE_FLAGS = {
     "-exec",
     "-execdir",
@@ -573,10 +657,18 @@ _FIND_UNSAFE_FLAGS = {
     "-fprintf",
     "-fls",
 }
+_SAFE_REDIRECT_RE = re.compile(
+    r"(?:[12]>&[12]|(?:[12&]?>>?|<)[ \t]*/dev/null)(?=$|\s|[|;&])"
+)
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_APPLY_PATCH_HEADER_RE = re.compile(
+    r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)$",
+    re.MULTILINE,
+)
 
 
 def _split_safe_read_pipeline(cmd: str) -> Optional[List[List[str]]]:
-    if not isinstance(cmd, str) or "`" in cmd:
+    if not isinstance(cmd, str):
         return None
     stages: List[List[str]] = []
     current_stage: List[str] = []
@@ -600,7 +692,7 @@ def _split_safe_read_pipeline(cmd: str) -> Optional[List[List[str]]]:
                 quote = None
                 i += 1
                 continue
-            if ch in "\r\n":
+            if ch in "`\r\n":
                 return None
             if ch == "$" and i + 1 < n and (
                 cmd[i + 1] in "({0123456789?@#*$!-" or cmd[i + 1].isalpha() or cmd[i + 1] == "_"
@@ -628,19 +720,8 @@ def _split_safe_read_pipeline(cmd: str) -> Optional[List[List[str]]]:
             in_token = True
             i += 2
             continue
-        if (
-            not in_token
-            and cmd.startswith("2>/dev/null", i)
-            and (i + 11 == n or cmd[i + 11].isspace() or cmd[i + 11] in "|;&\r\n")
-        ):
-            i += 11
-            continue
-        if (
-            not in_token
-            and cmd.startswith("2>&1", i)
-            and (i + 4 == n or cmd[i + 4].isspace() or cmd[i + 4] in "|;&\r\n")
-        ):
-            i += 4
+        if not in_token and (redir := _SAFE_REDIRECT_RE.match(cmd, i)):
+            i = redir.end()
             continue
         if cmd.startswith("&&", i) or cmd.startswith("||", i):
             if in_token:
@@ -663,7 +744,7 @@ def _split_safe_read_pipeline(cmd: str) -> Optional[List[List[str]]]:
                 return None
             i += 1
             continue
-        if ch == "$" or ch in ";&<>()":
+        if ch == "$" or ch in ";&<>()`":
             return None
         if ch == "|":
             if i + 1 < n and cmd[i + 1] in "|&":
@@ -697,12 +778,53 @@ def _split_safe_read_pipeline(cmd: str) -> Optional[List[List[str]]]:
     return stages
 
 
+def _is_safe_sed_script(script: str) -> bool:
+    stripped = re.sub(r"/(?:\\.|[^/])*/", "", script)
+    return bool(stripped.strip()) and bool(re.fullmatch(r"[0-9,$+~!;pq=dn{}\s]+", stripped))
+
+
 def _is_safe_read_stage(tokens: List[str]) -> bool:
+    while tokens and _ENV_ASSIGN_RE.match(tokens[0]):
+        tokens = tokens[1:]
     if not tokens:
         return False
     prog = tokens[0].rsplit("/", 1)[-1]
     if prog in _SIMPLE_READ_BINS:
         return True
+    if prog == "cd":
+        return len(tokens) <= 3 and not any(t.startswith("-") and t not in {"-P", "-L"} for t in tokens[1:])
+    if prog == "env":
+        rest = list(tokens[1:])
+        while rest and _ENV_ASSIGN_RE.match(rest[0]):
+            rest = rest[1:]
+        return True if not rest else _is_safe_read_stage(rest)
+    if prog == "sort":
+        return not any(
+            t in {"-o", "--output"} or t.startswith(("-o", "--output="))
+            for t in tokens[1:]
+        )
+    if prog == "uniq":
+        return sum(1 for t in tokens[1:] if not t.startswith("-")) <= 1
+    if prog in {"awk", "gawk", "mawk"}:
+        return not any(
+            t in {"-f", "--file", "-i", "--include"} or t.startswith(("-f", "--file=", "-i"))
+            or "inplace" in t
+            or "system" in t
+            or bool(re.search(r"\bprintf?\b[^;}\r\n]*>|(?<!\|)\|(?!\|)", t))
+            for t in tokens[1:]
+        )
+    if prog == "codegraph":
+        return len(tokens) >= 2 and tokens[1] in {
+            "explore", "search", "status", "context", "callers", "callees", "symbols"
+        }
+    if prog in _VERSION_CHECK_BINS and len(tokens) == 2 and tokens[1] in {"-v", "-V", "--version", "version"}:
+        return True
+    if prog == "node" and len(tokens) >= 3 and tokens[1] in {"--check", "-c"}:
+        return not any(
+            t in {"-e", "--eval", "-p", "--print", "-r", "--require", "--import"}
+            or t.startswith(("--eval=", "--print=", "--require=", "--import="))
+            for t in tokens[1:]
+        )
     if prog == "tail":
         return not any(
             t in {"-f", "-F", "--follow"} or t.startswith("--follow=")
@@ -740,7 +862,7 @@ def _is_safe_read_stage(tokens: List[str]) -> bool:
             elif not scripts:
                 scripts.append(tok)
             idx += 1
-        return quiet and bool(scripts) and all(bool(re.fullmatch(r"[0-9,$;pq\s]+", s)) for s in scripts)
+        return quiet and bool(scripts) and all(_is_safe_sed_script(s) for s in scripts)
     if prog == "git":
         idx = 1
         while idx < len(tokens):
@@ -757,11 +879,119 @@ def _is_safe_read_stage(tokens: List[str]) -> bool:
                 return False
             sub = tok
             rest = tokens[idx + 1 :]
-            return sub in _GIT_READ_SUBCOMMANDS and not any(
+            if any(
                 r in {"--output", "--ext-diff"} or r.startswith("--output=") for r in rest
-            )
+            ):
+                return False
+            if sub in _GIT_READ_SUBCOMMANDS:
+                return True
+            if sub == "branch":
+                return all(
+                    r in {"-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "--show-current", "-l", "--list"}
+                    for r in rest
+                )
+            if sub == "remote":
+                return all(r in {"-v", "--verbose"} for r in rest)
+            if sub == "tag":
+                return not rest or rest[0] in {"-l", "--list"}
+            if sub == "config":
+                return any(r in {"--get", "--get-all", "--get-regexp", "-l", "--list"} for r in rest)
+            return False
         return False
     return False
+
+
+def _normalize_edit_path(raw: str) -> Optional[str]:
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    return posixpath.normpath(cleaned)
+
+
+def _extract_edit_paths(call: dict) -> Optional[set[str]]:
+    fn = call["function"]
+    name = fn["name"].rsplit(".", 1)[-1]
+    try:
+        args = json.loads(fn["arguments"])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(args, dict):
+        return None
+    if name == "apply_patch":
+        patch_text = args.get("input")
+        if not isinstance(patch_text, str) or "*** Begin Patch" not in patch_text:
+            return None
+        paths = {
+            norm
+            for m in _APPLY_PATCH_HEADER_RE.finditer(patch_text)
+            if (norm := _normalize_edit_path(m.group(1)))
+        }
+        return paths or None
+    if name in {"write_file", "edit_file"}:
+        raw_path = args.get("path") or args.get("file_path")
+        if not isinstance(raw_path, str):
+            return None
+        norm = _normalize_edit_path(raw_path)
+        return {norm} if norm else None
+    return None
+
+
+def _paths_may_alias(p1: str, p2: str) -> bool:
+    if p1 == p2:
+        return True
+    abs1, abs2 = p1.startswith("/"), p2.startswith("/")
+    if abs1 != abs2:
+        full, rel = (p1, p2) if abs1 else (p2, p1)
+        if rel == "." or full.endswith("/" + rel):
+            return True
+    return False
+
+
+def _are_disjoint_file_edits(calls: List[Dict[str, Any]]) -> bool:
+    seen_sets: List[set[str]] = []
+    for call in calls:
+        paths = _extract_edit_paths(call)
+        if not paths:
+            return False
+        for prev in seen_sets:
+            if any(_paths_may_alias(p1, p2) for p1 in paths for p2 in prev):
+                return False
+        seen_sets.append(paths)
+    return len(seen_sets) > 1
+
+
+def _canonical_call_key(call: dict) -> Tuple[str, str]:
+    fn = call["function"]
+    try:
+        canon_args = json.dumps(json.loads(fn["arguments"]), sort_keys=True, ensure_ascii=False)
+    except (ValueError, TypeError):
+        canon_args = str(fn.get("arguments") or "")
+    return (fn["name"], canon_args)
+
+
+def _has_conflicting_parallel_calls(calls: List[Dict[str, Any]]) -> bool:
+    if len(calls) <= 1:
+        return False
+    if all(_is_read_query(c) for c in calls):
+        return False
+    seen_non_read: set[Tuple[str, str]] = set()
+    for c in calls:
+        if not _is_read_query(c):
+            key = _canonical_call_key(c)
+            if key in seen_non_read:
+                return True
+            seen_non_read.add(key)
+    workspace_calls = [
+        c for c in calls
+        if c["function"]["name"].rsplit(".", 1)[-1] in _WORKSPACE_TOOLS
+    ]
+    if len(workspace_calls) <= 1:
+        return False
+    if all(_is_read_query(c) for c in workspace_calls):
+        return False
+    if _are_disjoint_file_edits(workspace_calls):
+        return False
+    return True
 
 
 def _is_read_query(call: dict) -> bool:
