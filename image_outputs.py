@@ -11,7 +11,18 @@ from media_inputs import FileStore, SUPPORTED_MIME_SPECS, decode_base64_payload,
 from schemas import resolve_target_web_model
 
 
-async def generate_images(payload, hub, context_builder, cfg, output_dir: Path, attachments=None, file_store: FileStore | None = None):
+async def generate_images(
+    payload,
+    hub,
+    context_builder,
+    cfg,
+    output_dir: Path,
+    attachments=None,
+    file_store: FileStore | None = None,
+    *,
+    tenant_id: str = "host",
+    public_base_url: str = "",
+):
     prompt = payload.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("prompt 不能为空。")
@@ -24,9 +35,15 @@ async def generate_images(payload, hub, context_builder, cfg, output_dir: Path, 
     if not hub.has_ready_client():
         raise BridgeUnavailableError("没有连接可用的 Gemini Enterprise 页面。")
 
+    eff_tenant = (tenant_id or "host").strip() or "host"
+    img_sid = f"{eff_tenant}::image_{uuid.uuid4().hex}" if eff_tenant != "host" else f"image_{uuid.uuid4().hex}"
     images = []
     files = []
-    async with hub.acquire_slot(explicit_session_id="image_" + uuid.uuid4().hex, queue_timeout=cfg.queue_timeout_seconds) as slot:
+    async with hub.acquire_slot(
+        explicit_session_id=img_sid,
+        queue_timeout=cfg.queue_timeout_seconds,
+        tenant_id=eff_tenant,
+    ) as slot:
         context_builder.clear_session(slot.slot_key)
         try:
             await hub.dispatch_complete_on_slot(
@@ -50,6 +67,7 @@ async def generate_images(payload, hub, context_builder, cfg, output_dir: Path, 
 
     output_dir.mkdir(parents=True, exist_ok=True)
     cb_host = "127.0.0.1" if cfg.host in {"0.0.0.0", "::"} else cfg.host
+    eff_base = (public_base_url or "").strip().rstrip("/") or f"http://{cb_host}:{cfg.port}"
     data = []
     for image in candidates:
         declared_mime, raw = decode_base64_payload(image.get("data_url") or "", error_code="invalid_image")
@@ -64,9 +82,11 @@ async def generate_images(payload, hub, context_builder, cfg, output_dir: Path, 
         img_path.write_bytes(norm_raw)
         file_meta = None
         if file_store is not None:
-            file_meta = file_store.save(norm_raw, filename=name, declared_mime=mime, purpose="assistants_output")
+            file_meta = file_store.save(
+                norm_raw, filename=name, declared_mime=mime, purpose="assistants_output", tenant_id=eff_tenant
+            )
         if payload.get("response_format") == "url":
-            entry = {"url": f"http://{cb_host}:{cfg.port}/v1/images/files/{name}", "mime_type": mime}
+            entry = {"url": f"{eff_base}/v1/images/files/{name}", "mime_type": mime}
         else:
             entry = {"b64_json": base64.b64encode(norm_raw).decode("ascii"), "mime_type": mime}
         if file_meta is not None:

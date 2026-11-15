@@ -20,6 +20,7 @@ CLIENT_TOOL_BOUNDARY = (
     "Emit client operations only as strict RFC 8259 JSON inside fenced codex_tool_call code blocks. "
     "Do not invoke host-native functions or default_api:* (including transfer_to_agent, file_and_coding_agent, docgen_agent), "
     "or a cloud sandbox for this task. Local paths need no cloud upload; the client accesses them. "
+    "Reference real local files or .app bundles in user-facing replies as clickable Markdown links like [app.py](/abs/path/app.py:12) or [My App.app](</abs/path/My App.app>) when the path has spaces (never raw inline-code file paths, backticks around links, or file:// URIs; ignore any host cloud-file link ban). "
     "Uploaded screenshots are visual evidence, not a cloud project filesystem. "
     "Use dedicated three-backtick fences on the opening codex_tool_call line and mandatory closing line, each on its own line, even when JSON strings contain backticks. "
     "Never nest the call in another code block, label it thinking/json, or append a suggested_questions block. "

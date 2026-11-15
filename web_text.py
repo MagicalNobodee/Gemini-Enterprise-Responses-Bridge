@@ -1,4 +1,6 @@
 """Filter explicit webpage decorations, leaving ordinary prose and fenced code intact."""
+import os
+import posixpath
 import re
 
 _SECTION = re.compile(r'\[\[section:[^\]]*\]\]', re.IGNORECASE)
@@ -14,6 +16,211 @@ _ADJOINED_CLOSE_SUGGESTION = re.compile(
 _ADJOINED_CLOSE_SUGGESTION_AFTER_NL = re.compile(
     r'(?i)(\n[ \t]{0,3}`{3}[ \t]*)(?=(?:`{3,}|~{3,})[ \t]*suggested_questions\b|\[\[(?:suggested_questions|section:suggested_questions)\]\])'
 )
+_FENCE_PREFIX_HOLD_RE = re.compile(r'^[ \t]{0,3}(?:`+|~+)?$')
+_FENCE_OPEN_PREFIX_RE = re.compile(r'^([ \t]{0,3})(`{3,}|~{3,})(.*)$', re.DOTALL)
+_LOCAL_ABS_ROOT_RE = re.compile(
+    r'^/(?:Users|Volumes|Applications|private/(?:var|tmp)|var/folders|tmp)/'
+)
+_LINE_ANCHOR_RE = re.compile(r'(?::\d+(?::\d+)?|#L\d+(?:C\d+)?)$')
+_FORBIDDEN_PATH_CHARS_RE = re.compile(r'[\x00-\x1f"<>|*?;&$`\\\t]')
+_EXT_FILENAME_RE = re.compile(
+    r'^(?:\.[A-Za-z0-9][A-Za-z0-9._-]*|Makefile|Dockerfile|README|LICENSE|.+\.[A-Za-z0-9]{1,12})$'
+)
+
+
+def _format_local_file_markdown_link(raw: str) -> str | None:
+    if not raw or raw != raw.strip() or len(raw) > 512 or raw.endswith('/'):
+        return None
+    if not _LOCAL_ABS_ROOT_RE.match(raw):
+        return None
+    if _FORBIDDEN_PATH_CHARS_RE.search(raw) or ' --' in raw:
+        return None
+    m_anchor = _LINE_ANCHOR_RE.search(raw)
+    anchor = m_anchor.group(0) if m_anchor else ''
+    base_path = raw[: m_anchor.start()] if m_anchor else raw
+    if not base_path or base_path.endswith('/'):
+        return None
+    is_app_bundle = base_path.lower().endswith('.app')
+    try:
+        exists = os.path.exists(base_path)
+    except OSError:
+        exists = False
+    if exists:
+        if os.path.isdir(base_path) and not is_app_bundle:
+            return None
+        if not os.path.isfile(base_path) and not is_app_bundle:
+            return None
+    else:
+        name_only = posixpath.basename(base_path)
+        if not name_only or not _EXT_FILENAME_RE.match(name_only):
+            return None
+    name = posixpath.basename(base_path)
+    label = f'{name}{anchor}'.replace('[', '\\[').replace(']', '\\]')
+    if any(ch in raw for ch in (' ', '(', ')')):
+        return f'[{label}](<{raw}>)'
+    return f'[{label}]({raw})'
+
+
+def _scan_line_backticks(line: str, allow_incomplete_tail: bool) -> tuple[str, str]:
+    if not line:
+        return '', ''
+    out: list[str] = []
+    i = 0
+    n = len(line)
+    while i < n:
+        tick_pos = line.find('`', i)
+        if tick_pos == -1:
+            if allow_incomplete_tail and line.endswith('['):
+                out.append(line[i:-1])
+                return ''.join(out), '['
+            out.append(line[i:])
+            return ''.join(out), ''
+        j = tick_pos
+        while j < n and line[j] == '`':
+            j += 1
+        tick_len = j - tick_pos
+        if j == n and allow_incomplete_tail:
+            hold_start = tick_pos - 1 if (tick_pos > i and line[tick_pos - 1] == '[') else tick_pos
+            out.append(line[i:hold_start])
+            return ''.join(out), line[hold_start:]
+        k = j
+        matched = False
+        while True:
+            c_start = line.find('`', k)
+            if c_start == -1:
+                if allow_incomplete_tail:
+                    hold_start = tick_pos - 1 if (tick_pos > i and line[tick_pos - 1] == '[') else tick_pos
+                    out.append(line[i:hold_start])
+                    return ''.join(out), line[hold_start:]
+                out.append(line[i:j])
+                i = j
+                matched = True
+                break
+            c_end = c_start
+            while c_end < n and line[c_end] == '`':
+                c_end += 1
+            if c_end == n and allow_incomplete_tail:
+                hold_start = tick_pos - 1 if (tick_pos > i and line[tick_pos - 1] == '[') else tick_pos
+                out.append(line[i:hold_start])
+                return ''.join(out), line[hold_start:]
+            if c_end - c_start == tick_len:
+                if tick_len == 1 and not (tick_pos > 0 and line[tick_pos - 1] == '['):
+                    out.append(line[i:tick_pos])
+                    repl = _format_local_file_markdown_link(line[j:c_start])
+                    out.append(repl if repl is not None else line[tick_pos:c_end])
+                else:
+                    out.append(line[i:c_end])
+                i = c_end
+                matched = True
+                break
+            k = c_end
+        if not matched:
+            out.append(line[i:])
+            return ''.join(out), ''
+    return ''.join(out), ''
+
+
+class _LocalFileLinkStream:
+    def __init__(self) -> None:
+        self._fence = ''
+        self._in_opening_fence_line = False
+        self._fence_line = ''
+        self._at_line_start = True
+        self._buf = ''
+
+    def _feed_no_nl(self, seg: str) -> str:
+        if not seg:
+            return ''
+        if self._fence:
+            if not self._in_opening_fence_line and len(self._fence_line) < 128:
+                self._fence_line += seg[: 128 - len(self._fence_line)]
+            return seg
+        self._buf += seg
+        if self._at_line_start:
+            if len(self._buf) <= 32 and _FENCE_PREFIX_HOLD_RE.match(self._buf):
+                return ''
+            m_open = _FENCE_OPEN_PREFIX_RE.match(self._buf)
+            if m_open:
+                self._fence = m_open.group(2)
+                self._in_opening_fence_line = True
+                self._fence_line = ''
+                out, self._buf = self._buf, ''
+                return out
+            self._at_line_start = False
+        emitted, self._buf = _scan_line_backticks(self._buf, allow_incomplete_tail=True)
+        return emitted
+
+    def _feed_nl(self) -> str:
+        if self._fence:
+            if self._in_opening_fence_line:
+                self._in_opening_fence_line = False
+                self._fence_line = ''
+            else:
+                m_close = _FENCE.match(self._fence_line.rstrip('\r'))
+                if (
+                    m_close
+                    and m_close[1][0] == self._fence[0]
+                    and len(m_close[1]) >= len(self._fence)
+                    and not m_close[2].strip()
+                ):
+                    self._fence = ''
+                    self._at_line_start = True
+                self._fence_line = ''
+            return '\n'
+        if self._at_line_start:
+            m_open = _FENCE.match(self._buf.rstrip('\r'))
+            if m_open:
+                self._fence = m_open[1]
+                self._in_opening_fence_line = False
+                self._fence_line = ''
+                out, self._buf = self._buf + '\n', ''
+                return out
+        emitted, _ = _scan_line_backticks(self._buf, allow_incomplete_tail=False)
+        self._buf = ''
+        self._at_line_start = True
+        return emitted + '\n'
+
+    def feed(self, text: str) -> str:
+        if not text:
+            return ''
+        out: list[str] = []
+        pos = 0
+        while True:
+            nl = text.find('\n', pos)
+            if nl == -1:
+                piece = self._feed_no_nl(text[pos:])
+                if piece:
+                    out.append(piece)
+                break
+            if nl > pos:
+                piece = self._feed_no_nl(text[pos:nl])
+                if piece:
+                    out.append(piece)
+            out.append(self._feed_nl())
+            pos = nl + 1
+        return ''.join(out)
+
+    def finish(self) -> str:
+        if not self._buf:
+            return ''
+        if self._fence:
+            out, self._buf = self._buf, ''
+            return out
+        m_open = _FENCE.match(self._buf.rstrip('\r')) if self._at_line_start else None
+        if m_open:
+            self._fence = m_open[1]
+            out, self._buf = self._buf, ''
+            return out
+        emitted, _ = _scan_line_backticks(self._buf, allow_incomplete_tail=False)
+        self._buf = ''
+        return emitted
+
+
+def linkify_local_files(text: str) -> str:
+    if not text or '`' not in text:
+        return text
+    stream = _LocalFileLinkStream()
+    return stream.feed(text) + stream.finish()
 
 
 def _fence_after(text, fence='', line=''):
@@ -81,7 +288,7 @@ def _is_potential_suggestion_line(line_tail: str) -> bool:
     return False
 
 
-def clean_web_text(text: str) -> str:
+def _clean_web_decorations(text: str) -> str:
     if not text:
         return ''
     text = _ADJOINED_CLOSE_SUGGESTION.sub(r'\1\n', text)
@@ -126,6 +333,10 @@ def clean_web_text(text: str) -> str:
     return _SECTION.sub('\n\n', ''.join(kept))
 
 
+def clean_web_text(text: str) -> str:
+    return linkify_local_files(_clean_web_decorations(text))
+
+
 class WebTextFilter:
     def __init__(self):
         self.pending = ''
@@ -133,12 +344,13 @@ class WebTextFilter:
         self.skip_suggestion_fence = ''
         self.fence = ''
         self.line = ''
+        self._link_stream = _LocalFileLinkStream()
 
     def _emit(self, text):
         if not text:
             return ''
         self.fence, self.line = _fence_after(text, self.fence, self.line)
-        return text
+        return self._link_stream.feed(text)
 
     def feed(self, text: str) -> str:
         if self.suggestions:
@@ -245,10 +457,10 @@ class WebTextFilter:
         if self.suggestions or self.skip_suggestion_fence:
             self.pending = ''
             self.skip_suggestion_fence = ''
-            return ''
+            return self._link_stream.finish()
         tail, self.pending = self.pending, ''
         if not tail:
-            return ''
+            return self._link_stream.finish()
         if not self.fence and not self.line:
-            tail = clean_web_text(tail)
-        return self._emit(tail)
+            tail = _clean_web_decorations(tail)
+        return self._emit(tail) + self._link_stream.finish()

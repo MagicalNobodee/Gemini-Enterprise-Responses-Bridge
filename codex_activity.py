@@ -33,6 +33,8 @@ _CACHE_LOCK = RLock()
 _ROLLOUT_PATH_CACHE: Dict[Tuple[str, str], Tuple[float, str]] = {}
 # rollout_path_str -> (mtime_ns, file_size, raw_active, phase, tool_name, last_lifecycle)
 _ROLLOUT_STATE_CACHE: Dict[str, Tuple[int, int, bool, str, str, str]] = {}
+# rollout_path_str -> (scanned_offset, cnt_top, max_window_number, cnt_event)
+_ROLLOUT_COMPACT_CACHE: Dict[str, Tuple[int, int, int, int]] = {}
 # codeisland_sessions_json_path -> (mtime_ns, file_size, {sid: transcript_path})
 _CODEISLAND_MAP_CACHE: Dict[str, Tuple[int, int, Dict[str, str]]] = {}
 
@@ -272,6 +274,76 @@ def _scan_rollout_tail(
             pass
 
 
+def _count_rollout_compactions(path: str, file_size: int) -> int:
+    """Incrementally count compaction checkpoints in an append-only Codex rollout JSONL."""
+    if file_size <= 0:
+        return 0
+    with _CACHE_LOCK:
+        cached = _ROLLOUT_COMPACT_CACHE.get(path)
+    if cached is not None and cached[0] == file_size:
+        _, cnt_top, max_win, cnt_ev = cached
+        return max(cnt_top, max_win) if (cnt_top or max_win) else cnt_ev
+
+    if cached is not None and 0 <= cached[0] < file_size:
+        offset, cnt_top, max_win, cnt_ev = cached
+    else:
+        offset, cnt_top, max_win, cnt_ev = (0, 0, 0, 0)
+
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return max(cnt_top, max_win) if (cnt_top or max_win) else cnt_ev
+
+    try:
+        os.lseek(fd, offset, os.SEEK_SET)
+        carry = b""
+        carry_start = offset
+        cursor = offset
+        while cursor < file_size:
+            chunk = os.read(fd, min(524288, file_size - cursor))
+            if not chunk:
+                break
+            cursor += len(chunk)
+            buf = carry + chunk
+            nl = buf.rfind(b"\n")
+            if nl < 0:
+                carry = buf
+                continue
+            process_part = buf[:nl]
+            carry = buf[nl + 1 :]
+            carry_start = cursor - len(carry)
+            if b'"compacted"' not in process_part and b'"context_compacted"' not in process_part:
+                continue
+            for raw_line in process_part.split(b"\n"):
+                head = raw_line[:260]
+                if b'"compacted"' not in head and b'"context_compacted"' not in head:
+                    continue
+                try:
+                    obj = json.loads(raw_line)
+                except Exception:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                rt = obj.get("type")
+                if rt == "compacted":
+                    cnt_top += 1
+                    pl = obj.get("payload")
+                    if isinstance(pl, dict) and isinstance(pl.get("window_number"), int):
+                        max_win = max(max_win, pl["window_number"])
+                elif rt == "event_msg":
+                    pl = obj.get("payload")
+                    if isinstance(pl, dict) and pl.get("type") in ("context_compacted", "compacted"):
+                        cnt_ev += 1
+        with _CACHE_LOCK:
+            _ROLLOUT_COMPACT_CACHE[path] = (carry_start, cnt_top, max_win, cnt_ev)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    return max(cnt_top, max_win) if (cnt_top or max_win) else cnt_ev
+
+
 def lookup_codex_thread_activity(
     session_id: Optional[str],
     codex_home: Optional[Path] = None,
@@ -290,6 +362,7 @@ def lookup_codex_thread_activity(
             "last_lifecycle": "",
             "updated_at": 0,
             "stale": False,
+            "compaction_count": 0,
         }
 
     root = codex_home or (Path.home() / ".codex")
@@ -303,6 +376,7 @@ def lookup_codex_thread_activity(
             "last_lifecycle": "",
             "updated_at": 0,
             "stale": False,
+            "compaction_count": 0,
         }
 
     try:
@@ -316,6 +390,7 @@ def lookup_codex_thread_activity(
             "last_lifecycle": "",
             "updated_at": 0,
             "stale": False,
+            "compaction_count": 0,
         }
 
     with _CACHE_LOCK:
@@ -343,6 +418,7 @@ def lookup_codex_thread_activity(
     is_stale = bool(raw_active and max_idle_age_seconds > 0 and age_sec > max_idle_age_seconds)
     effective_active = bool(raw_active and not is_stale)
     effective_phase = raw_phase if effective_active else "idle"
+    compaction_count = _count_rollout_compactions(rollout_path, st.st_size)
 
     return {
         "known": True,
@@ -352,6 +428,7 @@ def lookup_codex_thread_activity(
         "last_lifecycle": lifecycle,
         "updated_at": int(file_mtime),
         "stale": is_stale,
+        "compaction_count": compaction_count,
     }
 
 
@@ -386,6 +463,7 @@ def resolve_slot_activity(
             "activity_source": "bridge_http",
             "tool_name": "",
             "codex_updated_at": codex_info["updated_at"],
+            "compaction_count": codex_info["compaction_count"],
         }
 
     if waiting_count > 0:
@@ -396,6 +474,7 @@ def resolve_slot_activity(
             "activity_source": "bridge_queue",
             "tool_name": "",
             "codex_updated_at": codex_info["updated_at"],
+            "compaction_count": codex_info["compaction_count"],
         }
 
     if codex_info["known"]:
@@ -408,6 +487,7 @@ def resolve_slot_activity(
                     "activity_source": "codex_rollout",
                     "tool_name": codex_info["tool_name"],
                     "codex_updated_at": codex_info["updated_at"],
+                    "compaction_count": codex_info["compaction_count"],
                 }
             return {
                 "session_active": True,
@@ -416,6 +496,7 @@ def resolve_slot_activity(
                 "activity_source": "codex_rollout",
                 "tool_name": "",
                 "codex_updated_at": codex_info["updated_at"],
+                "compaction_count": codex_info["compaction_count"],
             }
         return {
             "session_active": False,
@@ -424,6 +505,7 @@ def resolve_slot_activity(
             "activity_source": "codex_rollout",
             "tool_name": "",
             "codex_updated_at": codex_info["updated_at"],
+            "compaction_count": codex_info["compaction_count"],
         }
 
     if pending_tool_until > now_val:
@@ -434,6 +516,7 @@ def resolve_slot_activity(
             "activity_source": "pending_tool_window",
             "tool_name": "",
             "codex_updated_at": 0,
+            "compaction_count": 0,
         }
 
     return {
@@ -443,4 +526,5 @@ def resolve_slot_activity(
         "activity_source": "bridge_idle",
         "tool_name": "",
         "codex_updated_at": 0,
+        "compaction_count": 0,
     }

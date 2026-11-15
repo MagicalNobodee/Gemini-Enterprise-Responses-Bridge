@@ -15,6 +15,7 @@ import tomllib
 from agent_policy import (
     CARBON_CONTEXT_WINDOW, CARBON_AUTO_COMPACT_TOKENS,
     CARBON_EFFECTIVE_CONTEXT_PERCENT, CODING_WORKFLOW,
+    GEMINI_DESKTOP_BASE_INSTRUCTIONS, upgrade_desktop_agent_instructions,
 )
 
 
@@ -35,9 +36,18 @@ def update_catalog(text: str) -> str:
             if required not in modalities:
                 modalities.append(required)
         model['input_modalities'] = modalities
+        if not isinstance(model.get('base_instructions'), str) or not model['base_instructions'].strip():
+            model['base_instructions'] = GEMINI_DESKTOP_BASE_INSTRUCTIONS
+        mm = model.get('model_messages')
+        if isinstance(mm, dict):
+            for incompatible_key in ('persistent_instructions', 'token_budget', 'guardian_v2', 'confirmation_policies'):
+                mm.pop(incompatible_key, None)
+            if not isinstance(mm.get('instructions_template'), str) or not mm['instructions_template'].strip():
+                mm['instructions_template'] = GEMINI_DESKTOP_BASE_INSTRUCTIONS
         for container, key in [(model, 'base_instructions'), (model.get('model_messages') or {}, 'instructions_template')]:
             if isinstance(container.get(key), str):
                 old = re.sub(r'\n*\[Coding workflow\].*?\[/Coding workflow\]\n*', '', container[key], flags=re.S)
+                old = upgrade_desktop_agent_instructions(old)
                 container[key] = old.rstrip() + '\n\n' + CODING_WORKFLOW
         changed = True
     return json.dumps(document, ensure_ascii=False, indent=2) + '\n' if changed else text

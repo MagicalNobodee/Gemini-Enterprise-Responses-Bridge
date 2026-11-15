@@ -53,6 +53,8 @@ def test_dashboard_ui_structure_and_slot_reset_api(tmp_path: Path) -> None:
             "seatDetailEmpty",
             "seatDetailContent",
             "detailResetBtn",
+            "detailCompactions",
+            "detailCompactionSub",
             "seatsGrid",
             "idleSeatsWrap",
             "idleSeatsToggle",
@@ -68,6 +70,11 @@ def test_dashboard_ui_structure_and_slot_reset_api(tmp_path: Path) -> None:
             "dailyBarsStage",
             "taskRatioBar",
             "guideModal",
+            "secDist",
+            "distSavePolicyBtn",
+            "distCreateClientBtn",
+            "distClientsTable",
+            "detailTenantChip",
             "secDiag",
         ):
             assert required_id in html
@@ -362,3 +369,85 @@ def test_status_reflects_extension_max_parallel_tabs(tmp_path: Path) -> None:
             assert hub["client_max_parallel_tabs"] == 6
             assert hub["server_max_parallel_tabs"] == 10
             assert hub["active_client"]["max_parallel_tabs"] == 6
+
+
+def test_slot_compaction_count_tracks_rollout_and_inline_summaries(tmp_path: Path) -> None:
+    codex_dir = tmp_path / ".codex"
+    rollout_dir = codex_dir / "sessions" / "2026" / "11" / "14"
+    rollout_dir.mkdir(parents=True)
+    tid = "01a1d888-2222-7333-8444-555566667777"
+    rollout_file = rollout_dir / f"rollout-2026-11-14T18-00-00-{tid}.jsonl"
+
+    def append_rows(*rows: dict) -> None:
+        with rollout_file.open("a", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    con = sqlite3.connect(str(codex_dir / "state_5.sqlite"))
+    con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT, title TEXT, rollout_path TEXT)")
+    con.execute(
+        "INSERT INTO threads (id, name, title, rollout_path) VALUES (?, ?, ?, ?)",
+        (tid, "压缩计数测试会话", "prompt", str(rollout_file)),
+    )
+    con.commit()
+    con.close()
+
+    cb = ConversationContextBuilder(
+        codex_home=codex_dir,
+        archive_path=tmp_path / "archive.sqlite3",
+    )
+    try:
+        append_rows(
+            {"type": "event_msg", "payload": {"type": "task_started"}},
+            {"type": "compacted", "payload": {"window_number": 1, "message": "summary 1"}},
+            {"type": "event_msg", "payload": {"type": "task_complete"}},
+        )
+        snap1 = cb.get_context_snapshot(
+            [
+                {
+                    "slot_key": "ext:501",
+                    "tab_id": 501,
+                    "busy": False,
+                    "pinned_session_id": tid,
+                }
+            ]
+        )
+        assert snap1["slots"][0]["compaction_count"] == 1
+
+        append_rows(
+            {"type": "compacted", "payload": {"window_number": 2, "message": "summary 2"}},
+        )
+        snap2 = cb.get_context_snapshot(
+            [
+                {
+                    "slot_key": "ext:501",
+                    "tab_id": 501,
+                    "busy": False,
+                    "pinned_session_id": tid,
+                }
+            ]
+        )
+        assert snap2["slots"][0]["compaction_count"] == 2
+
+        # Non-Codex inline compaction summary tracking across multiple compactions
+        cb.record_completed_turn(
+            session_key="ext:502",
+            sent_history=[("user", "[Previous session summary]\nCheckpoint A"), ("user", "继续任务")],
+            assistant_reply="好的",
+            last_strategy="smart_packed_context",
+            session_url="https://vertexaisearch.cloud.google.com/u/1/home/cid/x/r/session/1001",
+            explicit_session_id="custom-sess-1",
+        )
+        assert cb.get_slot_context_metrics("ext:502")["compaction_count"] == 1
+
+        cb.record_completed_turn(
+            session_key="ext:502",
+            sent_history=[("user", "[Previous session summary]\nCheckpoint B"), ("user", "第二步")],
+            assistant_reply="完成",
+            last_strategy="smart_packed_context",
+            session_url="https://vertexaisearch.cloud.google.com/u/1/home/cid/x/r/session/1002",
+            explicit_session_id="custom-sess-1",
+        )
+        assert cb.get_slot_context_metrics("ext:502")["compaction_count"] == 2
+    finally:
+        cb.close()

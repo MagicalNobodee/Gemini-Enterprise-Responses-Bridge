@@ -144,3 +144,101 @@ def test_new_copy_of_cached_image_does_not_require_old_cache_file():
               ChatMessage(role='assistant', content='inspected'), ChatMessage(role='user', content=[part])]
     attachments = collect_attachments(stored, pending_images_only=True)
     assert len(attachments) == 1 and attachments[0]['data_url'] == part['image_url']
+
+
+def _long_tool_image_history(total_images: int = 12):
+    items = [
+        {'role': 'user', 'content': 'Refactor the 8 dungeon biome scenes and inspect screenshots.'},
+    ]
+    for idx in range(total_images):
+        cid = f'call_img_{idx}'
+        items.append({'type': 'function_call', 'call_id': cid, 'name': 'view_image', 'arguments': json.dumps({'path': f'/shot_{idx}.png'})})
+        items.append({'type': 'function_call_output', 'call_id': cid, 'output': [
+            {'type': 'input_text', 'text': f'Viewed shot {idx}'}, image(16 + idx),
+        ]})
+        if idx < total_images - 1:
+            items.append({'role': 'assistant', 'content': f'Checked biome shot {idx}.'})
+    return items
+
+
+@pytest.mark.parametrize('stream', [False, True])
+def test_inline_compaction_without_tools_skips_over_ten_historical_images(stream):
+    items = _long_tool_image_history(14)
+    items.append({
+        'role': 'user',
+        'content': 'You are performing a context checkpoint compaction. Create a handoff summary for another LLM that will resume the task.',
+    })
+    with browser(['Checkpoint summary: plague alchemica props updated.'], auto_reset_new_chat=True) as (client, commands):
+        res = client.post('/v1/responses', json={'input': items, 'tools': [], 'stream': stream})
+        assert res.status_code == 200
+        payload = packets(res.text)[-1]['response'] if stream else res.json()
+        assert payload['status'] == 'completed'
+        assert not commands[0].get('attachments')
+        assert '[Image attachment ' not in commands[0]['prompt']
+        assert commands[0]['prompt'].count('[Historical image reference ') == 14
+
+
+def test_compact_endpoint_skips_over_ten_historical_images():
+    items = _long_tool_image_history(13)
+    items.append({'role': 'assistant', 'content': 'Updated biome_props.js.'})
+    with browser(['Compacted summary ready.'], auto_reset_new_chat=True) as (client, commands):
+        res = client.post('/v1/responses/compact', json={'input': items})
+        assert res.status_code == 200
+        assert res.json()['object'] == 'response.compaction'
+        assert not commands[0].get('attachments')
+        assert '[Image attachment ' not in commands[0]['prompt']
+
+
+def test_toolless_followup_on_tool_history_skips_over_ten_historical_images():
+    items = _long_tool_image_history(12)
+    items.append({'role': 'assistant', 'content': 'All 12 shots inspected.'})
+    items.append({'role': 'user', 'content': 'Explain what changed in plain Chinese without running tools.'})
+    with browser(['用中文总结完成。'], auto_reset_new_chat=True) as (client, commands):
+        res = client.post('/v1/responses', json={'input': items, 'tools': []})
+        assert res.status_code == 200
+        assert not commands[0].get('attachments')
+        assert commands[0]['prompt'].count('[Historical image reference ') == 12
+
+
+def test_long_normal_multimodal_chat_incremental_and_rebuild_over_ten_images():
+    # 1) Incremental continuation on the same browser tab across >10 cumulative images
+    with browser(['seen 5', 'seen 10', 'seen 13'], auto_reset_new_chat=True) as (client, commands):
+        t1 = [{'role': 'user', 'content': [{'type': 'input_text', 'text': 'Batch 1'}] + [image(16 + i) for i in range(5)]}]
+        r1 = client.post('/v1/responses', json={'input': t1})
+        assert r1.status_code == 200 and len(commands[0]['attachments']) == 5
+
+        r2 = client.post('/v1/responses', json={
+            'previous_response_id': r1.json()['id'],
+            'input': [{'role': 'user', 'content': [{'type': 'input_text', 'text': 'Batch 2'}] + [image(24 + i) for i in range(5)]}],
+        })
+        assert r2.status_code == 200 and len(commands[1]['attachments']) == 5
+        assert not commands[1]['reset_chat']
+
+        r3 = client.post('/v1/responses', json={
+            'previous_response_id': r2.json()['id'],
+            'input': [{'role': 'user', 'content': [{'type': 'input_text', 'text': 'Batch 3'}] + [image(32 + i) for i in range(3)]}],
+        })
+        assert r3.status_code == 200 and len(commands[2]['attachments']) == 3
+        assert not commands[2]['reset_chat']
+
+    # 2) Fresh-tab rebuild of a normal chat with 12 old images + 2 new images caps to 10 without 400
+    packed = [
+        {'role': 'user', 'content': [{'type': 'input_text', 'text': 'Old batch'}] + [image(40 + i) for i in range(12)]},
+        {'role': 'assistant', 'content': 'Reviewed 12 old photos.'},
+        {'role': 'user', 'content': [{'type': 'input_text', 'text': 'Compare with 2 new photos'}] + [image(60 + i) for i in range(2)]},
+    ]
+    with browser(['rebuilt cleanly'], auto_reset_new_chat=True) as (client, commands):
+        res = client.post('/v1/responses', json={'input': packed})
+        assert res.status_code == 200
+        atts = commands[0]['attachments']
+        assert len(atts) == 10
+        assert len({a['name'] for a in atts}) == 10
+        assert commands[0]['prompt'].count('[Historical image reference ') == 4
+
+    # 3) Single turn genuinely supplying 11 brand-new images still triggers the 10-attachment guardrail
+    with browser([]) as (client, commands):
+        over = [{'role': 'user', 'content': [{'type': 'input_text', 'text': '11 fresh images'}] + [image(70 + i) for i in range(11)]}]
+        res = client.post('/v1/responses', json={'input': over, 'tools': TOOLS})
+        assert res.status_code == 400
+        assert '一次请求最多上传 10 个附件' in res.text
+        assert not commands

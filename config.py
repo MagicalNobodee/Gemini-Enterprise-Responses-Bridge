@@ -82,6 +82,8 @@ class BridgeSettings:
     response_store_ttl_seconds: float = 86400.0
     session_archive_path: str = ""
     usage_ledger_path: str = ""
+    distribution_path: str = ""
+    host_reserved_slots: int = 2
     usd_to_cny_rate: float = 6.8
     price_overrides_json: str = ""
 
@@ -141,6 +143,10 @@ class BridgeSettings:
             usage_ledger_path=os.getenv(
                 "BRIDGE_USAGE_LEDGER_PATH", str(root / ".cache" / "usage_ledger.json")
             ).strip(),
+            distribution_path=os.getenv(
+                "BRIDGE_DISTRIBUTION_PATH", str(root / ".cache" / "distribution.json")
+            ).strip(),
+            host_reserved_slots=max(0, _env_int("BRIDGE_HOST_RESERVED_SLOTS", 2)),
             usd_to_cny_rate=_env_float("BRIDGE_USD_TO_CNY_RATE", 6.8),
             price_overrides_json=os.getenv("BRIDGE_PRICE_OVERRIDES_JSON", "").strip(),
             gcp_project_id=os.getenv("GCP_PROJECT_ID", "").strip(),

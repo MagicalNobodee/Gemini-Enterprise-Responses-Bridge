@@ -36,11 +36,17 @@ class ResponseStore:
         self.db = sqlite3.connect(str(database), check_same_thread=False)
         if database != ":memory:":
             database.chmod(0o600)
-        self.db.execute("CREATE TABLE IF NOT EXISTS responses (id TEXT PRIMARY KEY, created REAL, checkpoint INTEGER, payload BLOB)")
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS responses (id TEXT PRIMARY KEY, created REAL, checkpoint INTEGER, payload BLOB, tenant_id TEXT NOT NULL DEFAULT 'host')"
+        )
+        cols = {str(r[1]) for r in self.db.execute("PRAGMA table_info(responses)").fetchall()}
+        if "tenant_id" not in cols:
+            self.db.execute("ALTER TABLE responses ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'host'")
         self.db.commit()
 
-    def put(self, key: str, response: dict, history: list) -> None:
+    def put(self, key: str, response: dict, history: list, tenant_id: str = "host") -> None:
         payload = json.dumps([response, history], ensure_ascii=False).encode()
+        eff_tenant = (tenant_id or "host").strip() or "host"
         if len(payload) > self.MAX_ENTRY_BYTES:
             raise ResponsesError("会话记录过大，未保存续接记录；请缩短输入后重试。")
         try:
@@ -55,8 +61,10 @@ class ResponseStore:
                     total -= size
                 if total + len(payload) > self.MAX_TOTAL_BYTES:
                     raise ResponsesError("会话存储容量不足，原有摘要已保留；请清理不再需要的记录。")
-                self.db.execute("INSERT INTO responses VALUES (?, ?, ?, ?)",
-                                (key, time.time(), key.startswith("bridge_compact_"), payload))
+                self.db.execute(
+                    "INSERT INTO responses (id, created, checkpoint, payload, tenant_id) VALUES (?, ?, ?, ?, ?)",
+                    (key, time.time(), key.startswith("bridge_compact_"), payload, eff_tenant),
+                )
         except sqlite3.Error as exc:
             raise ResponsesError("会话记录保存失败，请检查本地存储空间。") from exc
 
@@ -64,19 +72,31 @@ class ResponseStore:
         with self.lock:
             self.db.execute("DELETE FROM responses WHERE checkpoint = 0 AND created < ?", (time.time() - self.ttl_seconds,))
 
-    def get(self, key: str) -> tuple[dict, list]:
+    def get(self, key: str, tenant_id: str | None = None) -> tuple[dict, list]:
         if not isinstance(key, str):
             raise ResponsesError("会话记录编号必须是文字。")
         with self.lock, self.db:
             self.prune()
-            entry = self.db.execute("SELECT payload FROM responses WHERE id = ?", (key,)).fetchone()
+            if tenant_id is not None:
+                entry = self.db.execute(
+                    "SELECT payload FROM responses WHERE id = ? AND tenant_id = ?", (key, tenant_id)
+                ).fetchone()
+            else:
+                entry = self.db.execute("SELECT payload FROM responses WHERE id = ?", (key,)).fetchone()
         if entry is None:
             raise ResponsesError("会话记录不存在或已过期，请发送完整对话。")
         response, history = json.loads(entry[0])
         return response, history
 
-    def delete(self, key: str) -> bool:
+    def delete(self, key: str, tenant_id: str | None = None) -> bool:
         with self.lock, self.db:
+            if tenant_id is not None:
+                return (
+                    self.db.execute(
+                        "DELETE FROM responses WHERE id = ? AND tenant_id = ?", (key, tenant_id)
+                    ).rowcount
+                    > 0
+                )
             return self.db.execute("DELETE FROM responses WHERE id = ?", (key,)).rowcount > 0
 
     def close(self) -> None:
@@ -224,7 +244,7 @@ def content_parts(content: Any) -> Any:
     return parts
 
 
-def input_messages(items: Any, mapping: dict, store: ResponseStore) -> list[ChatMessage]:
+def input_messages(items: Any, mapping: dict, store: ResponseStore, tenant_id: str = "host") -> list[ChatMessage]:
     if isinstance(items, str):
         return [ChatMessage(role="user", content=items)]
     if not isinstance(items, list):
@@ -258,7 +278,7 @@ def input_messages(items: Any, mapping: dict, store: ResponseStore) -> list[Chat
             # Reasoning is private provider state, not user-visible conversation.
             continue
         elif kind == "compaction":
-            _, compacted = store.get(item.get("encrypted_content", ""))
+            _, compacted = store.get(item.get("encrypted_content", ""), tenant_id=tenant_id)
             messages.extend(ChatMessage(**msg) for msg in compacted)
         elif kind == "item_reference":
             raise ResponsesError("请发送完整消息内容，不支持 item_reference。")
@@ -276,7 +296,7 @@ def input_messages(items: Any, mapping: dict, store: ResponseStore) -> list[Chat
     return merged
 
 
-def prepare_request(payload: dict, store: ResponseStore) -> tuple[ChatCompletionRequest, dict, list]:
+def prepare_request(payload: dict, store: ResponseStore, tenant_id: str = "host") -> tuple[ChatCompletionRequest, dict, list]:
     for field, expected in {"model": str, "instructions": str, "previous_response_id": str, "prompt_cache_key": str,
                             "text": dict, "metadata": dict, "tools": list, "stream": bool, "store": bool}.items():
         if payload.get(field) is not None and not isinstance(payload[field], expected):
@@ -287,14 +307,14 @@ def prepare_request(payload: dict, store: ResponseStore) -> tuple[ChatCompletion
     messages = []
     previous = {}
     if payload.get("previous_response_id"):
-        previous, history = store.get(payload["previous_response_id"])
+        previous, history = store.get(payload["previous_response_id"], tenant_id=tenant_id)
         # Only top-level instructions expire; explicit developer messages remain conversation history.
         if previous.get("instructions") and history and history[0].get("role") == "developer" and history[0].get("content") == previous["instructions"]:
             history = history[1:]
         messages.extend(ChatMessage(**m) for m in history)
     if payload.get("instructions"):
         messages.insert(0, ChatMessage(role="developer", content=payload["instructions"]))
-    messages.extend(input_messages(payload.get("input", []), mapping, store))
+    messages.extend(input_messages(payload.get("input", []), mapping, store, tenant_id=tenant_id))
     if not messages:
         raise ResponsesError("input 不能为空。")
     choice = payload.get("tool_choice", "auto")
@@ -370,16 +390,17 @@ def usage_from_chat(usage: dict) -> dict:
             "output_tokens_details": {"reasoning_tokens": 0}}
 
 
-def remember(response: dict, history: list, store: ResponseStore) -> None:
+def remember(response: dict, history: list, store: ResponseStore, tenant_id: str = "host") -> None:
     if not response["store"]:
         return
     from media_inputs import compact_messages_for_store
-    messages = input_messages(response["output"], {}, store)
+    messages = input_messages(response["output"], {}, store, tenant_id=tenant_id)
     combined = compact_messages_for_store(
         history + [m.model_dump(exclude_none=True) for m in messages],
         getattr(store, "file_store", None),
+        tenant_id=tenant_id,
     )
-    store.put(response["id"], response, combined)
+    store.put(response["id"], response, combined, tenant_id=tenant_id)
 
 
 async def chat_packets(body: AsyncIterator) -> AsyncIterator[dict]:
@@ -397,7 +418,18 @@ async def chat_packets(body: AsyncIterator) -> AsyncIterator[dict]:
                 yield {}
 
 
-async def translate_response(upstream: Any, payload: dict, model: str, mapping: dict, history: list, store: ResponseStore, image_generator=None) -> Any:
+async def translate_response(
+    upstream: Any,
+    payload: dict,
+    model: str,
+    mapping: dict,
+    history: list,
+    store: ResponseStore,
+    image_generator=None,
+    *,
+    tenant_id: str = "host",
+) -> Any:
+    eff_tenant = (tenant_id or "host").strip() or "host"
     async def resolve_image(item):
         if image_generator is None:
             raise ResponsesError("生图执行器未连接。")
@@ -412,7 +444,7 @@ async def translate_response(upstream: Any, payload: dict, model: str, mapping: 
     inherited_cache_key = payload.get("prompt_cache_key")
     if not inherited_cache_key and payload.get("previous_response_id"):
         try:
-            prev_resp, _ = store.get(payload["previous_response_id"])
+            prev_resp, _ = store.get(payload["previous_response_id"], tenant_id=eff_tenant)
             inherited_cache_key = prev_resp.get("prompt_cache_key")
         except Exception:
             inherited_cache_key = None
@@ -422,7 +454,8 @@ async def translate_response(upstream: Any, payload: dict, model: str, mapping: 
         msg = upstream["choices"][0]["message"]
         annotations = [
             {"type": "file_path", "file_id": a.get("file_id"), "filename": a.get("filename"),
-             "mime_type": a.get("mime_type"), "url": a.get("url"), "path": a.get("path")}
+             "mime_type": a.get("mime_type"), "url": a.get("url"),
+             **({"path": a.get("path")} if eff_tenant == "host" and a.get("path") else {})}
             for a in (msg.get("attachments") or []) if isinstance(a, dict)
         ]
         if msg.get("content") or annotations:
@@ -435,7 +468,7 @@ async def translate_response(upstream: Any, payload: dict, model: str, mapping: 
                 item = await resolve_image(item)
             response["output"].append(item)
         response.update(status="completed", usage=usage_from_chat(upstream.get("usage", {})))
-        remember(response, history, store)
+        remember(response, history, store, tenant_id=eff_tenant)
         return JSONResponse(response)
 
     sequence = 0
@@ -470,7 +503,8 @@ async def translate_response(upstream: Any, payload: dict, model: str, mapping: 
                     if delta.get("attachments"):
                         ann_list = [
                             {"type": "file_path", "file_id": a.get("file_id"), "filename": a.get("filename"),
-                             "mime_type": a.get("mime_type"), "url": a.get("url"), "path": a.get("path")}
+                             "mime_type": a.get("mime_type"), "url": a.get("url"),
+                             **({"path": a.get("path")} if eff_tenant == "host" and a.get("path") else {})}
                             for a in delta["attachments"] if isinstance(a, dict)
                         ]
                         if message is None:
@@ -531,7 +565,7 @@ async def translate_response(upstream: Any, payload: dict, model: str, mapping: 
                 yield event("response.output_item.done", output_index=output_index, item=item)
             response["status"] = "completed"
             response["usage"] = response["usage"] or usage_from_chat({})
-            remember(response, history, store)
+            remember(response, history, store, tenant_id=eff_tenant)
             yield event("response.completed", response=response)
         except Exception as exc:
             response.update(status="failed", error={"code": "bridge_error", "message": str(exc)})

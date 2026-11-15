@@ -59,6 +59,7 @@ class WorkerSlot:
     completed_requests: int = 0
     last_used_at: float = 0.0
     pinned_session_id: Optional[str] = None
+    owner_tenant_id: Optional[str] = None
     pending_tool_call_until: float = 0.0
     in_flight_request_id: Optional[str] = None
     waiting_count: int = 0
@@ -83,6 +84,7 @@ class WorkerSlot:
             "busy": self.is_busy,
             "waiting_count": self.waiting_count,
             "pinned_session_id": self.pinned_session_id,
+            "owner_tenant_id": self.owner_tenant_id,
             "pending_tool_call_until": round(self.pending_tool_call_until, 3) if self.pending_tool_call_until > 0 else 0.0,
             "completed_requests": self.completed_requests,
             "last_used_at": int(self.last_used_at) if self.last_used_at else 0,
@@ -194,6 +196,7 @@ class BrowserBridgeHub:
         self.on_slot_migrated: Optional[Callable[[str, str], None]] = None
         self.on_slot_evicted: Optional[Callable[[WorkerSlot], None]] = None
         self.has_slot_conversation: Optional[Callable[[str], bool]] = None
+        self.is_slot_ephemeral_probe: Optional[Callable[[str], bool]] = None
         self.is_slot_session_active: Optional[Callable[[WorkerSlot], bool]] = None
 
     def record_reply_error(self, slot: WorkerSlot, message: str) -> None:
@@ -282,6 +285,7 @@ class BrowserBridgeHub:
                 pass
         old_sid = slot.pinned_session_id
         slot.pinned_session_id = None
+        slot.owner_tenant_id = None
         slot.pending_tool_call_until = 0.0
         if old_sid and self._session_affinity.get(old_sid) == slot.slot_key:
             self._session_affinity.pop(old_sid, None)
@@ -289,11 +293,32 @@ class BrowserBridgeHub:
             if mapped == slot.slot_key:
                 self._session_affinity.pop(sid, None)
 
-    def restore_slot_affinity(self, slot_key: str, explicit_session_id: Optional[str]) -> None:
-        if not explicit_session_id:
-            return
+    def clear_slot_affinity_only(self, slot: WorkerSlot) -> None:
+        old_sid = slot.pinned_session_id
+        slot.pinned_session_id = None
+        slot.owner_tenant_id = None
+        slot.pending_tool_call_until = 0.0
+        if old_sid and self._session_affinity.get(old_sid) == slot.slot_key:
+            self._session_affinity.pop(old_sid, None)
+        for sid, mapped in list(self._session_affinity.items()):
+            if mapped == slot.slot_key:
+                self._session_affinity.pop(sid, None)
+
+    def restore_slot_affinity(
+        self,
+        slot_key: str,
+        explicit_session_id: Optional[str],
+        last_used_at: float = 0.0,
+        owner_tenant_id: Optional[str] = None,
+    ) -> None:
         slot = self._slots.get(slot_key)
         if slot is None:
+            return
+        if owner_tenant_id:
+            slot.owner_tenant_id = owner_tenant_id
+        if last_used_at and last_used_at > 0.0:
+            slot.last_used_at = max(slot.last_used_at, float(last_used_at))
+        if not explicit_session_id:
             return
         sid = explicit_session_id.strip()
         if not sid:
@@ -388,6 +413,18 @@ class BrowserBridgeHub:
 
     def ready_slot_url_map(self) -> Dict[str, str]:
         return {s.slot_key: (s.tab_url or "") for s in self._get_alive_ready_slots()}
+
+    def hydratable_slot_url_map(self) -> Dict[str, str]:
+        return {
+            s.slot_key: (s.tab_url or "")
+            for s in self._get_alive_ready_slots()
+            if not s.is_busy
+            and s.waiting_count == 0
+            and not s.lock.locked()
+            and s.completed_requests == 0
+            and s.last_used_at == 0.0
+            and not s.pinned_session_id
+        }
 
     # ------------------------------------------------------------------
     # Client registration & lifecycle
@@ -563,6 +600,23 @@ class BrowserBridgeHub:
 
     def has_ready_client(self) -> bool:
         return len(self._get_alive_ready_slots()) > 0 or self.select_active_client() is not None
+
+    def effective_pool_capacity(self) -> int:
+        """Return max parallel browser slots available right now (accounting for auto-spawn when supported)."""
+        slots = self._get_alive_ready_slots()
+        active = self.select_active_client()
+        if not slots and active is None:
+            return 0
+        eff_max = self._effective_client_tab_cap(active) if active is not None else self.max_parallel_tabs
+        now = time.time()
+        can_spawn = self.auto_spawn_tabs and any(
+            c.transport == "websocket" and c.is_alive(now) and "spawn_tab" in c.capabilities
+            for c in self._clients.values()
+        )
+        if can_spawn:
+            return max(min(len(slots), eff_max), eff_max)
+        live_count = len(slots) if slots else (1 if active is not None else 0)
+        return min(live_count, eff_max)
 
     def status_snapshot(self) -> Dict[str, Any]:
         self._prune_stale_http_clients()
@@ -950,7 +1004,12 @@ class BrowserBridgeHub:
             ):
                 await self._safe_ws_send(client, payload)
 
-    async def reset_worker_slot(self, slot_key: str) -> Dict[str, Any]:
+    async def reset_worker_slot(
+        self,
+        slot_key: str,
+        reason: Optional[str] = None,
+        on_reset_locked: Optional[Callable[[], None]] = None,
+    ) -> Dict[str, Any]:
         """Reset a single idle worker slot to a fresh conversation without disturbing busy slots."""
         slot = self._slots.get(slot_key)
         if slot is None:
@@ -958,51 +1017,61 @@ class BrowserBridgeHub:
         if slot.is_busy or slot.waiting_count > 0 or self._is_slot_codex_active(slot):
             raise RuntimeError("该工作席位正在执行任务中，请等待本轮任务完成后再开启新对话")
 
-        slot.pinned_session_id = None
-        slot.pending_tool_call_until = 0.0
-        slot.last_used_at = 0.0
-        slot.tab_title = "Gemini Enterprise"
-        if slot.tab_url:
-            slot.tab_url = derive_clean_vertex_url(slot.tab_url)
-        for sid, mapped in list(self._session_affinity.items()):
-            if mapped == slot_key:
-                self._session_affinity.pop(sid, None)
+        async with slot.lock:
+            if slot.waiting_count > 0 or slot.in_flight_request_id is not None:
+                raise RuntimeError("该工作席位正在执行任务中，请等待本轮任务完成后再开启新对话")
+            slot.pinned_session_id = None
+            slot.owner_tenant_id = None
+            slot.pending_tool_call_until = 0.0
+            slot.last_used_at = 0.0
+            slot.tab_title = "Gemini Enterprise"
+            if slot.tab_url:
+                slot.tab_url = derive_clean_vertex_url(slot.tab_url)
+            for sid, mapped in list(self._session_affinity.items()):
+                if mapped == slot_key:
+                    self._session_affinity.pop(sid, None)
 
-        in_tab_reset = False
-        client = self._clients.get(slot.client_id)
-        now = time.time()
-        if (
-            client is not None
-            and client.transport == "websocket"
-            and client.is_alive(now)
-            and slot.tab_id is not None
-            and "reset_tab" in client.capabilities
-        ):
-            reset_id = f"rst-{uuid.uuid4().hex[:10]}"
-            loop = asyncio.get_running_loop()
-            fut: asyncio.Future[Dict[str, Any]] = loop.create_future()
-            self._pending_resets[reset_id] = fut
-            sent = await self._safe_ws_send(
-                client,
-                {
-                    "type": "reset_tab",
-                    "reset_id": reset_id,
-                    "tab_id": slot.tab_id,
-                },
-            )
-            if sent:
-                try:
-                    res = await asyncio.wait_for(fut, timeout=14.0)
-                    in_tab_reset = bool(isinstance(res, dict) and res.get("ok"))
-                except asyncio.TimeoutError:
-                    in_tab_reset = False
-                finally:
+            in_tab_reset = False
+            client = self._clients.get(slot.client_id)
+            now = time.time()
+            if (
+                client is not None
+                and client.transport == "websocket"
+                and client.is_alive(now)
+                and slot.tab_id is not None
+                and "reset_tab" in client.capabilities
+            ):
+                reset_id = f"rst-{uuid.uuid4().hex[:10]}"
+                loop = asyncio.get_running_loop()
+                fut: asyncio.Future[Dict[str, Any]] = loop.create_future()
+                self._pending_resets[reset_id] = fut
+                sent = await self._safe_ws_send(
+                    client,
+                    {
+                        "type": "reset_tab",
+                        "reset_id": reset_id,
+                        "tab_id": slot.tab_id,
+                    },
+                )
+                if sent:
+                    try:
+                        res = await asyncio.wait_for(fut, timeout=14.0)
+                        in_tab_reset = bool(isinstance(res, dict) and res.get("ok"))
+                    except asyncio.TimeoutError:
+                        in_tab_reset = False
+                    finally:
+                        self._pending_resets.pop(reset_id, None)
+                else:
                     self._pending_resets.pop(reset_id, None)
-            else:
-                self._pending_resets.pop(reset_id, None)
+
+            slot.tab_title = "Gemini Enterprise"
+            if slot.tab_url:
+                slot.tab_url = derive_clean_vertex_url(slot.tab_url)
+            if on_reset_locked is not None:
+                on_reset_locked()
 
         label = f"#{slot.tab_id}" if slot.tab_id is not None else slot_key
-        self.add_log("info", f"工作席位 {label} 已重置为新对话", slot.client_id)
+        self.add_log("info", reason or f"工作席位 {label} 已重置为新对话", slot.client_id)
         return {
             "ok": True,
             "slot_key": slot_key,
@@ -1098,10 +1167,16 @@ class BrowserBridgeHub:
         return None
 
     def _is_slot_occupied(self, slot: WorkerSlot) -> bool:
+        if (
+            self.is_slot_ephemeral_probe is not None
+            and self.is_slot_ephemeral_probe(slot.slot_key)
+            and not slot.pinned_session_id
+        ):
+            return False
         if slot.pinned_session_id:
             return True
-        if self.has_slot_conversation is not None and self.has_slot_conversation(slot.slot_key):
-            return True
+        if self.has_slot_conversation is not None:
+            return bool(self.has_slot_conversation(slot.slot_key))
         if slot.last_used_at > 0.0:
             return True
         if extract_vertex_session_id(slot.tab_url):
@@ -1113,8 +1188,11 @@ class BrowserBridgeHub:
         slot: WorkerSlot,
         explicit_session_id: Optional[str],
         now: float,
+        requester_tenant_id: Optional[str] = None,
     ) -> bool:
         if now < slot.pending_tool_call_until:
+            return True
+        if slot.owner_tenant_id and requester_tenant_id and slot.owner_tenant_id != requester_tenant_id:
             return True
         if slot.pinned_session_id and slot.pinned_session_id != explicit_session_id:
             return True
@@ -1130,13 +1208,17 @@ class BrowserBridgeHub:
         queue_timeout: float = 300.0,
         ephemeral_aux: bool = False,
         preferred_session_url: Optional[str] = None,
+        ephemeral_probe: bool = False,
+        tenant_id: str = "host",
     ) -> AsyncIterator[WorkerSlot]:
         """Atomically select/spawn and lock an isolated `WorkerSlot` for parallel execution."""
         queue_deadline = asyncio.get_running_loop().time() + queue_timeout
         chosen: Optional[WorkerSlot] = None
         spawn_target: Optional[tuple[BrowserClientState, str]] = None
-        effective_session_id = None if ephemeral_aux else explicit_session_id
-        preferred_vsid = "" if ephemeral_aux else extract_vertex_session_id(preferred_session_url or "")
+        is_ephemeral = bool(ephemeral_aux or ephemeral_probe)
+        effective_session_id = None if is_ephemeral else explicit_session_id
+        effective_tenant_id = None if is_ephemeral else (tenant_id or "host")
+        preferred_vsid = "" if is_ephemeral else extract_vertex_session_id(preferred_session_url or "")
         reused_existing_session = False
 
         async with self._routing_lock:
@@ -1170,8 +1252,10 @@ class BrowserBridgeHub:
             # 1) Explicit session_id affinity (`X-Session-Id` / `session_id` / `model@session`)
             aff_key = self.get_affinity_slot_key(effective_session_id)
             if aff_key in ready_map:
-                chosen = ready_map[aff_key]
-                reused_existing_session = True
+                cand = ready_map[aff_key]
+                if not cand.owner_tenant_id or not effective_tenant_id or cand.owner_tenant_id == effective_tenant_id:
+                    chosen = cand
+                    reused_existing_session = True
 
             # 2) Multi-turn conversation history prefix affinity (`matching_slot_keys`)
             if chosen is None and matching_slot_keys:
@@ -1186,7 +1270,10 @@ class BrowserBridgeHub:
             # 2.5) Live tab already sitting on the target archived `/r/session/<id>` URL
             if chosen is None and preferred_vsid:
                 url_matches = [
-                    s for s in ready_slots if extract_vertex_session_id(s.tab_url) == preferred_vsid
+                    s
+                    for s in ready_slots
+                    if extract_vertex_session_id(s.tab_url) == preferred_vsid
+                    and (not s.owner_tenant_id or not effective_tenant_id or s.owner_tenant_id == effective_tenant_id)
                 ]
                 if url_matches:
                     idle_url_matches = [
@@ -1202,10 +1289,24 @@ class BrowserBridgeHub:
                     for s in ready_slots
                     if not s.is_busy
                     and s.waiting_count == 0
-                    and not self._is_slot_holding_protected_session(s, effective_session_id, now)
+                    and not self._is_slot_holding_protected_session(
+                        s, effective_session_id, now, requester_tenant_id=effective_tenant_id
+                    )
                 ]
                 if clean_idle:
-                    clean_idle.sort(key=lambda s: (0 if s.last_used_at == 0.0 else 1, s.last_used_at))
+                    def _idle_rank(s: WorkerSlot) -> tuple[int, int, float]:
+                        is_probe = bool(
+                            self.is_slot_ephemeral_probe is not None
+                            and self.is_slot_ephemeral_probe(s.slot_key)
+                        )
+                        is_blank = not bool(extract_vertex_session_id(s.tab_url))
+                        if ephemeral_probe:
+                            tier = 0 if is_probe else (1 if is_blank else 2)
+                        else:
+                            tier = 0 if is_blank else (1 if is_probe else 2)
+                        return (tier, 0 if s.last_used_at == 0.0 else 1, s.last_used_at)
+
+                    clean_idle.sort(key=_idle_rank)
                     chosen = clean_idle[0]
 
             # 4) Auto-spawn a new background worker tab before evicting any occupied session slot
@@ -1221,7 +1322,9 @@ class BrowserBridgeHub:
 
             # 5) Pool at max_parallel_tabs (or spawn unavailable): pick true LRU idle slot, else least-loaded busy slot
             if chosen is None and spawn_target is None:
-                chosen = self._select_fallback_slot(ready_slots, now)
+                chosen = self._select_fallback_slot(
+                    ready_slots, now, requester_tenant_id=effective_tenant_id or "host"
+                )
 
             if chosen is not None:
                 chosen.waiting_count += 1
@@ -1231,6 +1334,8 @@ class BrowserBridgeHub:
                 ):
                     self._session_affinity[effective_session_id] = chosen.slot_key
                     chosen.pinned_session_id = effective_session_id
+                    if effective_tenant_id:
+                        chosen.owner_tenant_id = effective_tenant_id
 
         # Perform async tab auto-spawn outside `_routing_lock` so other parallel requests aren't stalled!
         if spawn_target is not None:
@@ -1262,7 +1367,9 @@ class BrowserBridgeHub:
                     if not fallback_slots:
                         self._total_errors += 1
                         raise BridgeUnavailableError("浏览器标签页池不可用，自动扩容失败。")
-                    chosen = self._select_fallback_slot(fallback_slots, time.time())
+                    chosen = self._select_fallback_slot(
+                        fallback_slots, time.time(), requester_tenant_id=effective_tenant_id or "host"
+                    )
                 chosen.waiting_count += 1
                 if effective_session_id and (
                     reused_existing_session
@@ -1270,6 +1377,8 @@ class BrowserBridgeHub:
                 ):
                     self._session_affinity[effective_session_id] = chosen.slot_key
                     chosen.pinned_session_id = effective_session_id
+                    if effective_tenant_id:
+                        chosen.owner_tenant_id = effective_tenant_id
 
         assert chosen is not None
         acquired = permit_acquired = False
@@ -1298,13 +1407,28 @@ class BrowserBridgeHub:
             waiting = False
             async with self._routing_lock:
                 same_pinned = bool(
-                    effective_session_id and chosen.pinned_session_id == effective_session_id
+                    effective_session_id
+                    and chosen.pinned_session_id == effective_session_id
+                    and (not chosen.owner_tenant_id or not effective_tenant_id or chosen.owner_tenant_id == effective_tenant_id)
                 )
-                if not reused_existing_session and not same_pinned and self._is_slot_occupied(chosen):
+                cross_tenant = bool(
+                    effective_tenant_id
+                    and chosen.owner_tenant_id
+                    and chosen.owner_tenant_id != effective_tenant_id
+                )
+                was_probe = bool(
+                    self.is_slot_ephemeral_probe is not None
+                    and self.is_slot_ephemeral_probe(chosen.slot_key)
+                )
+                if cross_tenant or (not reused_existing_session and not same_pinned and (
+                    self._is_slot_occupied(chosen) or chosen.pinned_session_id or was_probe
+                )):
                     self._evict_slot_binding(chosen)
                 if effective_session_id:
                     self._session_affinity[effective_session_id] = chosen.slot_key
                     chosen.pinned_session_id = effective_session_id
+                if effective_tenant_id:
+                    chosen.owner_tenant_id = effective_tenant_id
             yielded = True
             yield chosen
         finally:
@@ -1322,20 +1446,37 @@ class BrowserBridgeHub:
         self,
         ready_slots: Sequence[WorkerSlot],
         now: float,
+        requester_tenant_id: str = "host",
     ) -> WorkerSlot:
+        def _tenant_tier(s: WorkerSlot) -> int:
+            if not self._is_slot_occupied(s) and not s.owner_tenant_id:
+                return 0
+            owner = s.owner_tenant_id or "host"
+            if requester_tenant_id != "host":
+                if owner == requester_tenant_id:
+                    return 1
+                if owner != "host":
+                    return 2
+                return 3
+            return 1 if owner != "host" else 2
+
         idle_slots = [s for s in ready_slots if not s.is_busy and s.waiting_count == 0]
         if idle_slots:
             idle_slots.sort(
                 key=lambda s: (
                     1 if (now < s.pending_tool_call_until or self._is_slot_codex_active(s, now)) else 0,
-                    1 if self._is_slot_occupied(s) else 0,
+                    _tenant_tier(s),
                     s.last_used_at,
                 )
             )
             return idle_slots[0]
         ranked = sorted(
             ready_slots,
-            key=lambda s: (s.waiting_count + (1 if s.is_busy else 0), s.last_used_at),
+            key=lambda s: (
+                s.waiting_count + (1 if s.is_busy else 0),
+                1 if (requester_tenant_id != "host" and (s.owner_tenant_id or "host") == "host") else 0,
+                s.last_used_at,
+            ),
         )
         return ranked[0]
 

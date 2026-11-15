@@ -23,9 +23,12 @@ def persist_browser_outputs(
     output_dir: Path,
     file_store: FileStore,
     base_url: str,
+    *,
+    tenant_id: str = "host",
 ) -> List[Dict[str, Any]]:
     """Validate, write to disk, register in `file_store`, and return structured artifact records."""
     output_dir.mkdir(parents=True, exist_ok=True)
+    eff_tenant = (tenant_id or "host").strip() or "host"
     saved_artifacts: List[Dict[str, Any]] = []
     seen_hashes: set[str] = set()
 
@@ -54,6 +57,7 @@ def persist_browser_outputs(
             filename=safe_name,
             declared_mime=mime,
             purpose="assistants_output",
+            tenant_id=eff_tenant,
         )
         if meta["id"] in seen_hashes:
             continue
@@ -68,15 +72,17 @@ def persist_browser_outputs(
             "category": category,
             "bytes": meta["bytes"],
             "url": file_url,
-            "path": meta["path"],
         }
+        if eff_tenant == "host":
+            record["path"] = meta["path"]
         if category == "image":
             ext = SUPPORTED_MIME_SPECS.get(mime, ("image", "png"))[1]
             img_name = f"{uuid.uuid4().hex}.{ext}"
             img_path = output_dir / img_name
             img_path.write_bytes(norm_raw)
             record["image_url"] = f"{root_url}/v1/images/files/{img_name}"
-            record["image_path"] = str(img_path)
+            if eff_tenant == "host":
+                record["image_path"] = str(img_path)
             record["b64_json"] = base64.b64encode(norm_raw).decode("ascii")
         saved_artifacts.append(record)
 
@@ -103,7 +109,18 @@ def format_artifacts_markdown(artifacts: List[Dict[str, Any]], existing_text: st
     return "\n\n".join(lines)
 
 
-async def generate_videos(payload: Dict[str, Any], hub, context_builder, cfg, output_dir: Path, file_store: FileStore, attachments=None) -> Dict[str, Any]:
+async def generate_videos(
+    payload: Dict[str, Any],
+    hub,
+    context_builder,
+    cfg,
+    output_dir: Path,
+    file_store: FileStore,
+    attachments=None,
+    *,
+    tenant_id: str = "host",
+    public_base_url: str = "",
+) -> Dict[str, Any]:
     """Execute browser video generation (`Create videos`) and return verified local video artifacts."""
     prompt = payload.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
@@ -113,9 +130,15 @@ async def generate_videos(payload: Dict[str, Any], hub, context_builder, cfg, ou
     if not hub.has_ready_client():
         raise BridgeUnavailableError("没有连接可用的 Gemini Enterprise 页面。")
 
+    eff_tenant = (tenant_id or "host").strip() or "host"
     raw_files: List[Dict[str, Any]] = []
     raw_images: List[Dict[str, Any]] = []
-    async with hub.acquire_slot(explicit_session_id="video_" + uuid.uuid4().hex, queue_timeout=cfg.queue_timeout_seconds) as slot:
+    vid_sid = f"{eff_tenant}::video_{uuid.uuid4().hex}" if eff_tenant != "host" else f"video_{uuid.uuid4().hex}"
+    async with hub.acquire_slot(
+        explicit_session_id=vid_sid,
+        queue_timeout=cfg.queue_timeout_seconds,
+        tenant_id=eff_tenant,
+    ) as slot:
         context_builder.clear_session(slot.slot_key)
         try:
             await hub.dispatch_complete_on_slot(
@@ -134,28 +157,32 @@ async def generate_videos(payload: Dict[str, Any], hub, context_builder, cfg, ou
             context_builder.clear_session(slot.slot_key)
 
     cb_host = "127.0.0.1" if cfg.host in {"0.0.0.0", "::"} else cfg.host
-    artifacts = persist_browser_outputs(raw_images, raw_files, output_dir, file_store, f"http://{cb_host}:{cfg.port}")
+    eff_base = (public_base_url or "").strip().rstrip("/") or f"http://{cb_host}:{cfg.port}"
+    artifacts = persist_browser_outputs(
+        raw_images, raw_files, output_dir, file_store, eff_base, tenant_id=eff_tenant
+    )
     videos = [a for a in artifacts if a["category"] == "video"] or artifacts
     if not videos:
         raise BridgeExecutionError("网页没有返回可下载的真实视频文件。")
 
     data = []
     for vid in videos:
-        _, raw_bytes = file_store.read_bytes(vid["file_id"])
+        _, raw_bytes = file_store.read_bytes(vid["file_id"], tenant_id=eff_tenant)
         if payload.get("response_format") == "b64_json":
-            data.append({
+            item_entry: Dict[str, Any] = {
                 "b64_json": base64.b64encode(raw_bytes).decode("ascii"),
                 "mime_type": vid["mime_type"],
                 "file_id": vid["file_id"],
                 "filename": vid["filename"],
-                "path": vid["path"],
-            })
+            }
         else:
-            data.append({
+            item_entry = {
                 "url": vid["url"],
                 "mime_type": vid["mime_type"],
                 "file_id": vid["file_id"],
                 "filename": vid["filename"],
-                "path": vid["path"],
-            })
+            }
+        if eff_tenant == "host" and vid.get("path"):
+            item_entry["path"] = vid["path"]
+        data.append(item_entry)
     return {"created": int(time.time()), "data": data}

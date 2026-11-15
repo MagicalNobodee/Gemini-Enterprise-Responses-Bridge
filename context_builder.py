@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import re
@@ -16,8 +17,9 @@ from urllib.parse import urlparse
 from schemas import ChatMessage, estimate_tokens, model_requests_new_chat, resolve_target_web_model
 from agent_policy import (CARBON_AUTO_COMPACT_TOKENS, CARBON_CONTEXT_WINDOW, CARBON_EFFECTIVE_CONTEXT_PERCENT,
                           CODING_WORKFLOW, COMPACTION_INSTRUCTIONS,
-                          has_coding_tools, reading_diagnostics, reading_reminder, deduplicate_tool_text)
-from codex_activity import resolve_slot_activity
+                          has_coding_tools, reading_diagnostics, reading_reminder, deduplicate_tool_text,
+                          upgrade_desktop_agent_instructions)
+from codex_activity import lookup_codex_thread_activity, resolve_slot_activity
 from tool_calling import (
     build_response_format_instructions,
     build_tool_delta_reminder,
@@ -111,14 +113,91 @@ def clean_prompt_to_title(raw_text: str, max_chars: int = 64) -> str:
     return ""
 
 
+def _extract_compaction_summary_info(dialogue: Sequence[Tuple[str, str]]) -> Tuple[int, str]:
+    """Count inline compaction checkpoint messages and fingerprint the latest summary."""
+    summaries = [
+        text
+        for role, text in dialogue
+        if role == "user"
+        and (
+            text.startswith("[Previous session summary]")
+            or text.startswith("Another language model started to solve this problem and produced a summary")
+        )
+    ]
+    if not summaries:
+        return (0, "")
+    fp = hashlib.sha1(summaries[-1].encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return (len(summaries), fp)
+
+
+def is_compaction_prompt_text(raw_text: str) -> bool:
+    """Return True when a trailing user message is an automated context compaction prompt."""
+    if not raw_text:
+        return False
+    text = raw_text.strip()
+    tail = text
+    if "[Current User Request]" in tail:
+        tail = tail.rsplit("[Current User Request]", 1)[1].strip()
+    elif "## My request:" in tail:
+        tail = tail.split("## My request:", 1)[1].strip()
+    lower_tail = tail.lower()
+    compact_head = COMPACTION_INSTRUCTIONS.strip()[:36].lower()
+    if compact_head and compact_head in lower_tail:
+        return True
+    if lower_tail.startswith("you are performing a context checkpoint compaction"):
+        return True
+    if (
+        "you are performing a context checkpoint compaction" in lower_tail
+        and "handoff summary" in lower_tail
+    ):
+        return True
+    return False
+
+
+def is_compaction_dialogue(dialogue: Sequence[Tuple[str, str]]) -> bool:
+    """Return True if normalized dialogue ends with a context compaction instruction."""
+    return bool(
+        dialogue
+        and dialogue[-1][0] == "user"
+        and is_compaction_prompt_text(dialogue[-1][1])
+    )
+
+
+def is_completed_compaction_turns(turns: Sequence[Tuple[str, str]]) -> bool:
+    """Return True if archived/tracked turns represent a finished one-off compaction pass."""
+    return bool(
+        len(turns) >= 2
+        and turns[-1][0] == "assistant"
+        and is_compaction_dialogue(turns[:-1])
+    )
+
+
+def extract_summary_anchor(summary_text: str) -> str:
+    """Extract a distinctive normalized snippet from a compaction summary for handoff matching."""
+    if not summary_text:
+        return ""
+    lines: List[str] = []
+    for raw_line in summary_text.splitlines():
+        s = raw_line.strip()
+        if not s:
+            continue
+        low = s.lower()
+        if low.startswith("i will transfer ") or low.startswith("[[section:"):
+            continue
+        if low in {"## context checkpoint handoff summary", "# context checkpoint handoff summary", "[previous session summary]"}:
+            continue
+        lines.append(s)
+        if sum(len(x) for x in lines) >= 140:
+            break
+    joined = _WHITESPACE_RUN_RE.sub(" ", " ".join(lines)).strip()
+    return joined[:120] if len(joined) >= 24 else ""
+
+
 def extract_dialogue_title(dialogue: Sequence[Tuple[str, str]]) -> str:
     """Find the first real user topic in normalized dialogue, handling compaction prompts."""
     if not dialogue:
         return ""
-    is_compacting = (
-        dialogue[-1][0] == "user"
-        and COMPACTION_INSTRUCTIONS.strip()[:36].lower() in dialogue[-1][1].lower()
-    )
+    is_compacting = is_compaction_dialogue(dialogue)
     scan_items = dialogue[:-1] if is_compacting else dialogue
     found = ""
     for role, content in scan_items:
@@ -299,6 +378,22 @@ class SessionRecoveryNotice:
 
 
 @dataclass
+class PendingCompactionCleanup:
+    slot_key: str
+    compaction_seq: int
+    turn_seq: int
+    vertex_session_id: str = ""
+    origin_session_id: Optional[str] = None
+    compaction_token: Optional[str] = None
+    summary_anchor: str = ""
+    pre_compact_turn_count: int = 0
+    completed_at: float = 0.0
+    delivered: bool = False
+    force_superseded: bool = False
+    tenant_id: str = "host"
+
+
+@dataclass
 class ArchivedSessionRecord:
     archive_key: str
     explicit_session_id: Optional[str]
@@ -311,6 +406,7 @@ class ArchivedSessionRecord:
     turns: List[Tuple[str, str]]
     metrics: Dict[str, Any]
     updated_at: float
+    tenant_id: str = "host"
 
 
 class SessionArchiveStore:
@@ -346,10 +442,18 @@ class SessionArchiveStore:
                     system_fp TEXT NOT NULL DEFAULT '',
                     turns_json TEXT NOT NULL,
                     metrics_json TEXT NOT NULL DEFAULT '{}',
-                    updated_at REAL NOT NULL
+                    updated_at REAL NOT NULL,
+                    tenant_id TEXT NOT NULL DEFAULT 'host'
                 )
                 """
             )
+            existing_cols = {
+                str(r[1]) for r in self._db.execute("PRAGMA table_info(session_archive)").fetchall()
+            }
+            if "tenant_id" not in existing_cols:
+                self._db.execute(
+                    "ALTER TABLE session_archive ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'host'"
+                )
             self._db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_sa_explicit_sid ON session_archive(explicit_session_id)"
             )
@@ -388,6 +492,7 @@ class SessionArchiveStore:
             turns=turns,
             metrics=metrics,
             updated_at=float(row[10] or 0.0),
+            tenant_id=str(row[11] or "host") if len(row) > 11 and row[11] else "host",
         )
 
     def _prune_locked(self, now: float) -> None:
@@ -417,18 +522,20 @@ class SessionArchiveStore:
         system_fp: str = "",
         metrics: Optional[Dict[str, Any]] = None,
         updated_at: Optional[float] = None,
+        tenant_id: str = "host",
     ) -> Optional[str]:
         vsid = extract_vertex_session_id(session_url)
         if not vsid or not turns:
             return None
         sid = explicit_session_id.strip() if isinstance(explicit_session_id, str) and explicit_session_id.strip() else None
+        eff_tenant = (tenant_id or "host").strip() or "host"
         now = float(updated_at if updated_at is not None else time.time())
         with self._lock, self._db:
             # Preserve previously learned explicit_session_id if updating the same Vertex session without one
             if not sid:
                 prev_row = self._db.execute(
-                    "SELECT explicit_session_id FROM session_archive WHERE vertex_session_id = ? LIMIT 1",
-                    (vsid,),
+                    "SELECT explicit_session_id FROM session_archive WHERE vertex_session_id = ? AND tenant_id = ? LIMIT 1",
+                    (vsid, eff_tenant),
                 ).fetchone()
                 if prev_row and prev_row[0]:
                     sid = str(prev_row[0])
@@ -449,8 +556,8 @@ class SessionArchiveStore:
                 INSERT OR REPLACE INTO session_archive (
                     archive_key, explicit_session_id, vertex_session_id, session_url,
                     session_title, active_model, tools_fp, system_fp,
-                    turns_json, metrics_json, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    turns_json, metrics_json, updated_at, tenant_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     archive_key,
@@ -464,28 +571,47 @@ class SessionArchiveStore:
                     turns_json,
                     metrics_json,
                     now,
+                    eff_tenant,
                 ),
             )
             self._prune_locked(now)
         return archive_key
 
-    def get_by_explicit_session_id(self, explicit_session_id: Optional[str]) -> Optional[ArchivedSessionRecord]:
+    def get_by_explicit_session_id(
+        self,
+        explicit_session_id: Optional[str],
+        *,
+        tenant_id: Optional[str] = None,
+    ) -> Optional[ArchivedSessionRecord]:
         if not explicit_session_id or not explicit_session_id.strip():
             return None
         sid = explicit_session_id.strip()
         with self._lock, self._db:
             self._prune_locked(time.time())
-            row = self._db.execute(
-                """
-                SELECT archive_key, explicit_session_id, vertex_session_id, session_url,
-                       session_title, active_model, tools_fp, system_fp,
-                       turns_json, metrics_json, updated_at
-                FROM session_archive
-                WHERE explicit_session_id = ?
-                ORDER BY updated_at DESC LIMIT 1
-                """,
-                (sid,),
-            ).fetchone()
+            if tenant_id:
+                row = self._db.execute(
+                    """
+                    SELECT archive_key, explicit_session_id, vertex_session_id, session_url,
+                           session_title, active_model, tools_fp, system_fp,
+                           turns_json, metrics_json, updated_at, tenant_id
+                    FROM session_archive
+                    WHERE explicit_session_id = ? AND tenant_id = ?
+                    ORDER BY updated_at DESC LIMIT 1
+                    """,
+                    (sid, tenant_id),
+                ).fetchone()
+            else:
+                row = self._db.execute(
+                    """
+                    SELECT archive_key, explicit_session_id, vertex_session_id, session_url,
+                           session_title, active_model, tools_fp, system_fp,
+                           turns_json, metrics_json, updated_at, tenant_id
+                    FROM session_archive
+                    WHERE explicit_session_id = ?
+                    ORDER BY updated_at DESC LIMIT 1
+                    """,
+                    (sid,),
+                ).fetchone()
         return self._row_to_record(row) if row else None
 
     def get_by_vertex_session_id(self, vertex_session_id: Optional[str]) -> Optional[ArchivedSessionRecord]:
@@ -498,7 +624,7 @@ class SessionArchiveStore:
                 """
                 SELECT archive_key, explicit_session_id, vertex_session_id, session_url,
                        session_title, active_model, tools_fp, system_fp,
-                       turns_json, metrics_json, updated_at
+                       turns_json, metrics_json, updated_at, tenant_id
                 FROM session_archive
                 WHERE vertex_session_id = ?
                 ORDER BY updated_at DESC LIMIT 1
@@ -514,7 +640,7 @@ class SessionArchiveStore:
                 """
                 SELECT archive_key, explicit_session_id, vertex_session_id, session_url,
                        session_title, active_model, tools_fp, system_fp,
-                       turns_json, metrics_json, updated_at
+                       turns_json, metrics_json, updated_at, tenant_id
                 FROM session_archive
                 ORDER BY updated_at DESC LIMIT ?
                 """,
@@ -568,14 +694,21 @@ class ConversationContextBuilder:
         self._session_titles: Dict[str, str] = {}
         self._session_urls: Dict[str, str] = {}
         self._session_explicit_ids: Dict[str, str] = {}
+        self._session_tenants: Dict[str, str] = {}
         self._session_recovery: Dict[str, SessionRecoveryNotice] = {}
         self._session_force_reset: set[str] = set()
         self._hydration_misses: Dict[str, str] = {}
+        self._evicted_slot_vsids: Dict[str, str] = {}
+        self._ephemeral_probe_slots: set[str] = set()
+        self._session_compactions: Dict[str, Tuple[int, str]] = {}
+        self._compaction_seq_counter: int = 0
+        self._slot_turn_seq: Dict[str, int] = {}
+        self._pending_compactions: Dict[str, PendingCompactionCleanup] = {}
 
     def close(self) -> None:
         self._archive.close()
 
-    def clear_session(self, session_key: str = "default") -> None:
+    def clear_session(self, session_key: str = "default", *, keep_force_reset: bool = False) -> None:
         self._session_turns.pop(session_key, None)
         self._session_models.pop(session_key, None)
         self._session_tools_fp.pop(session_key, None)
@@ -584,9 +717,15 @@ class ConversationContextBuilder:
         self._session_titles.pop(session_key, None)
         self._session_urls.pop(session_key, None)
         self._session_explicit_ids.pop(session_key, None)
+        self._session_tenants.pop(session_key, None)
         self._session_recovery.pop(session_key, None)
-        self._session_force_reset.discard(session_key)
+        self._session_compactions.pop(f"slot:{session_key}", None)
+        if not keep_force_reset:
+            self._session_force_reset.discard(session_key)
         self._hydration_misses.pop(session_key, None)
+        self._ephemeral_probe_slots.discard(session_key)
+        self._pending_compactions.pop(session_key, None)
+        self._slot_turn_seq[session_key] = self._slot_turn_seq.get(session_key, 0) + 1
 
     def invalidate_session(self, session_key: str) -> None:
         """A rejected/failed turn cannot be reused, even with automatic resets disabled."""
@@ -656,19 +795,216 @@ class ConversationContextBuilder:
     def drop_slot(self, session_key: str) -> None:
         self.flush_slot_to_archive(session_key)
         self.clear_session(session_key)
+        self._evicted_slot_vsids.pop(session_key, None)
 
     def migrate_slot_key(self, old_key: str, new_key: str) -> None:
         if old_key == new_key:
             return
         for mapping in (self._session_turns, self._session_models, self._session_tools_fp,
                         self._session_system_fp, self._session_metrics, self._session_titles,
-                        self._session_urls, self._session_explicit_ids, self._session_recovery,
-                        self._hydration_misses):
+                        self._session_urls, self._session_explicit_ids, self._session_tenants,
+                        self._session_recovery,
+                        self._hydration_misses, self._evicted_slot_vsids,
+                        self._slot_turn_seq, self._pending_compactions):
             if old_key in mapping:
                 mapping[new_key] = mapping.pop(old_key)
+        if new_key in self._pending_compactions:
+            self._pending_compactions[new_key].slot_key = new_key
         if old_key in self._session_force_reset:
             self._session_force_reset.discard(old_key)
             self._session_force_reset.add(new_key)
+        if old_key in self._ephemeral_probe_slots:
+            self._ephemeral_probe_slots.discard(old_key)
+            self._ephemeral_probe_slots.add(new_key)
+        old_cmp_key = f"slot:{old_key}"
+        if old_cmp_key in self._session_compactions:
+            self._session_compactions[f"slot:{new_key}"] = self._session_compactions.pop(old_cmp_key)
+
+    def is_probe_messages(self, messages: Sequence[ChatMessage]) -> bool:
+        _, dialogue = self._normalize_messages(messages)
+        return (
+            len(dialogue) == 1
+            and dialogue[0][0] == "user"
+            and "这是一次连通性体检" in dialogue[0][1]
+        )
+
+    def mark_ephemeral_probe_slot(self, session_key: str) -> None:
+        if session_key:
+            self._ephemeral_probe_slots.add(session_key)
+            self._session_titles[session_key] = "一键模型连通体检"
+
+    def is_ephemeral_probe_slot(self, session_key: str) -> bool:
+        return session_key in self._ephemeral_probe_slots
+
+    def is_compaction_messages(self, messages: Sequence[ChatMessage]) -> bool:
+        _, dialogue = self._normalize_messages(messages)
+        return is_compaction_dialogue(dialogue)
+
+    def is_ephemeral_compaction_slot(self, session_key: str) -> bool:
+        return session_key in self._pending_compactions
+
+    def delete_archived_by_vertex_session_id(self, vertex_session_id: str) -> None:
+        if vertex_session_id:
+            self._archive.delete_by_vertex_session_id(vertex_session_id)
+
+    def register_completed_compaction(
+        self,
+        session_key: str,
+        *,
+        session_url: Optional[str] = None,
+        origin_session_id: Optional[str] = None,
+        summary_text: str = "",
+        pre_compact_turn_count: int = 0,
+        tenant_id: str = "host",
+    ) -> PendingCompactionCleanup:
+        self._compaction_seq_counter += 1
+        vsid = extract_vertex_session_id(session_url or self._session_urls.get(session_key, ""))
+        if vsid:
+            self._archive.delete_by_vertex_session_id(vsid)
+        eff_tenant = (tenant_id or self._session_tenants.get(session_key) or "host").strip() or "host"
+        clean_origin = origin_session_id.strip() if isinstance(origin_session_id, str) and origin_session_id.strip() else None
+        if clean_origin and eff_tenant == "host":
+            orig_title = lookup_codex_thread_title(clean_origin, codex_home=self._codex_home)
+            if orig_title:
+                self._session_titles[session_key] = f"自动整理记忆 · {orig_title}"
+                if session_key in self._session_metrics:
+                    self._session_metrics[session_key]["session_title"] = self._session_titles[session_key]
+        rec = PendingCompactionCleanup(
+            slot_key=session_key,
+            compaction_seq=self._compaction_seq_counter,
+            turn_seq=self._slot_turn_seq.get(session_key, 0),
+            vertex_session_id=vsid,
+            origin_session_id=clean_origin,
+            summary_anchor=extract_summary_anchor(summary_text),
+            pre_compact_turn_count=max(0, int(pre_compact_turn_count)),
+            completed_at=time.time(),
+            delivered=False,
+            tenant_id=eff_tenant,
+        )
+        self._pending_compactions[session_key] = rec
+        return rec
+
+    def mark_compaction_delivered(
+        self,
+        session_key: str,
+        compaction_seq: int,
+        *,
+        compaction_token: Optional[str] = None,
+    ) -> None:
+        rec = self._pending_compactions.get(session_key)
+        if rec is None or rec.compaction_seq != compaction_seq:
+            return
+        rec.delivered = True
+        rec.completed_at = time.time()
+        if compaction_token and compaction_token.strip():
+            rec.compaction_token = compaction_token.strip()
+
+    def find_superseded_compactions(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        explicit_session_id: Optional[str] = None,
+        consumed_tokens: Sequence[str] = (),
+        tenant_id: str = "host",
+    ) -> List[PendingCompactionCleanup]:
+        """Return delivered compaction slots proven obsolete because the resumed session now holds the compacted state."""
+        if not self._pending_compactions:
+            return []
+        _, dialogue = self._normalize_messages(messages)
+        if is_compaction_dialogue(dialogue):
+            return []
+        eff_tenant = (tenant_id or "host").strip() or "host"
+        req_sid = explicit_session_id.strip() if isinstance(explicit_session_id, str) and explicit_session_id.strip() else None
+        token_set = {t.strip() for t in (consumed_tokens or ()) if isinstance(t, str) and t.strip()}
+        norm_blob = ""
+        matched: List[PendingCompactionCleanup] = []
+        for rec in list(self._pending_compactions.values()):
+            if not rec.delivered:
+                continue
+            if rec.force_superseded:
+                matched.append(rec)
+                continue
+            if (rec.tenant_id or "host") != eff_tenant:
+                continue
+            if rec.compaction_token and rec.compaction_token in token_set:
+                matched.append(rec)
+                continue
+            if rec.origin_session_id and req_sid and req_sid == rec.origin_session_id:
+                matched.append(rec)
+                continue
+            if rec.summary_anchor:
+                if not norm_blob:
+                    norm_blob = _WHITESPACE_RUN_RE.sub(
+                        " ",
+                        "\n".join(content for _, content in dialogue),
+                    )
+                if rec.summary_anchor in norm_blob:
+                    matched.append(rec)
+                    continue
+        return matched
+
+    def find_out_of_band_superseded_compactions(
+        self,
+        now_ts: Optional[float] = None,
+    ) -> List[PendingCompactionCleanup]:
+        """Detect delivered compaction slots whose originating session already advanced or finished locally."""
+        if not self._pending_compactions:
+            return []
+        now_val = time.time() if now_ts is None else float(now_ts)
+        matched: List[PendingCompactionCleanup] = []
+        for rec in list(self._pending_compactions.values()):
+            if not rec.delivered:
+                continue
+            if rec.force_superseded:
+                matched.append(rec)
+                continue
+            if rec.origin_session_id:
+                advanced_elsewhere = any(
+                    other_key != rec.slot_key
+                    and self._session_explicit_ids.get(other_key) == rec.origin_session_id
+                    and self.get_slot_last_updated_at(other_key) > rec.completed_at
+                    for other_key in self._session_turns
+                )
+                if advanced_elsewhere:
+                    matched.append(rec)
+                    continue
+                if (now_val - rec.completed_at) >= 15.0:
+                    c_act = lookup_codex_thread_activity(
+                        rec.origin_session_id,
+                        codex_home=self._codex_home,
+                        now_ts=now_val,
+                    )
+                    if c_act.get("known") and not c_act.get("active"):
+                        matched.append(rec)
+                        continue
+        return matched
+
+    def retire_reused_compaction_slot(self, session_key: str) -> Optional[PendingCompactionCleanup]:
+        rec = self._pending_compactions.pop(session_key, None)
+        if rec is not None and rec.vertex_session_id:
+            self._archive.delete_by_vertex_session_id(rec.vertex_session_id)
+        return rec
+
+    def claim_compaction_for_reset(self, session_key: str, compaction_seq: int) -> Optional[PendingCompactionCleanup]:
+        rec = self._pending_compactions.get(session_key)
+        if rec is None or rec.compaction_seq != compaction_seq:
+            return None
+        if self._slot_turn_seq.get(session_key, 0) != rec.turn_seq:
+            self._pending_compactions.pop(session_key, None)
+            return None
+        return self._pending_compactions.pop(session_key, None)
+
+    def get_slot_last_updated_at(self, session_key: str) -> float:
+        meta = self._session_metrics.get(session_key)
+        if isinstance(meta, dict) and meta.get("updated_at"):
+            try:
+                return float(meta["updated_at"])
+            except (TypeError, ValueError):
+                return 0.0
+        return 0.0
+
+    def get_slot_tenant_id(self, session_key: str) -> str:
+        return self._session_tenants.get(session_key) or "host"
 
     def flush_slot_to_archive(
         self,
@@ -681,10 +1017,18 @@ class ConversationContextBuilder:
         turns = self._session_turns.get(session_key)
         if not turns:
             return None
+        if (
+            session_key in self._ephemeral_probe_slots
+            or self._session_titles.get(session_key) == "一键模型连通体检"
+            or session_key in self._pending_compactions
+            or is_completed_compaction_turns(turns)
+        ):
+            return None
         eff_url = self._session_urls.get(session_key) or fallback_url or ""
         if not extract_vertex_session_id(eff_url):
             return None
         eff_sid = self._session_explicit_ids.get(session_key) or fallback_explicit_session_id
+        eff_tenant = self._session_tenants.get(session_key) or "host"
         return self._archive.upsert(
             session_url=eff_url,
             turns=turns,
@@ -694,6 +1038,7 @@ class ConversationContextBuilder:
             tools_fp=self._session_tools_fp.get(session_key, ""),
             system_fp=self._session_system_fp.get(session_key, ""),
             metrics=self._session_metrics.get(session_key),
+            tenant_id=eff_tenant,
         )
 
     def evict_slot_to_archive(
@@ -709,7 +1054,12 @@ class ConversationContextBuilder:
             fallback_url=fallback_url,
             fallback_explicit_session_id=fallback_explicit_session_id,
         )
+        evicted_vsid = extract_vertex_session_id(
+            self._session_urls.get(session_key) or fallback_url or ""
+        )
         self.invalidate_session(session_key)
+        if evicted_vsid:
+            self._evicted_slot_vsids[session_key] = evicted_vsid
 
     def restore_archived_to_slot(
         self,
@@ -721,7 +1071,9 @@ class ConversationContextBuilder:
     ) -> None:
         """Mount a verified historical Gemini session back onto a live worker slot."""
         self.clear_session(session_key)
+        self._evicted_slot_vsids.pop(session_key, None)
         self._session_turns[session_key] = list(record.turns)
+        self._session_tenants[session_key] = (record.tenant_id or "host").strip() or "host"
         if record.active_model:
             self._session_models[session_key] = record.active_model
         if record.tools_fp:
@@ -735,10 +1087,56 @@ class ConversationContextBuilder:
         eff_sid = explicit_session_id or record.explicit_session_id
         if eff_sid:
             self._session_explicit_ids[session_key] = eff_sid
-        if record.metrics:
-            restored_meta = dict(record.metrics)
-            restored_meta["slot_key"] = session_key
-            self._session_metrics[session_key] = restored_meta
+        restored_meta = dict(record.metrics) if record.metrics else {}
+        restored_meta["slot_key"] = session_key
+        if record.updated_at:
+            restored_meta["updated_at"] = max(int(restored_meta.get("updated_at") or 0), int(record.updated_at))
+        inline_cnt, inline_fp = _extract_compaction_summary_info(record.turns)
+        restored_cmp = max(int(restored_meta.get("compaction_count") or 0), inline_cnt)
+        restored_fp = str(restored_meta.get("compaction_fp") or inline_fp or "")
+        restored_meta["compaction_count"] = restored_cmp
+        if restored_fp:
+            restored_meta["compaction_fp"] = restored_fp
+        if restored_cmp > 0:
+            cmp_key = eff_sid if eff_sid else f"slot:{session_key}"
+            prev_c, prev_f = self._session_compactions.get(cmp_key, (0, ""))
+            if restored_cmp >= prev_c:
+                self._session_compactions[cmp_key] = (restored_cmp, restored_fp or prev_f)
+        self._session_metrics[session_key] = restored_meta
+
+    def reconcile_idle_slot_url(
+        self,
+        slot_key: str,
+        live_tab_url: str,
+        fallback_explicit_session_id: Optional[str] = None,
+    ) -> bool:
+        """Ensure an idle slot's tracked session matches its live browser URL; return True if stale binding evicted."""
+        live_vsid = extract_vertex_session_id(live_tab_url)
+        if self._session_turns.get(slot_key):
+            tracked_url = self._session_urls.get(slot_key, "")
+            tracked_vsid = extract_vertex_session_id(tracked_url)
+            if not tracked_vsid and live_vsid:
+                self._session_urls[slot_key] = live_tab_url.strip()
+                self.flush_slot_to_archive(
+                    slot_key,
+                    fallback_explicit_session_id=fallback_explicit_session_id,
+                )
+                return False
+            if tracked_vsid and live_vsid != tracked_vsid:
+                self.evict_slot_to_archive(
+                    slot_key,
+                    fallback_url=tracked_url,
+                    fallback_explicit_session_id=fallback_explicit_session_id,
+                )
+                return True
+            return False
+
+        if fallback_explicit_session_id and live_vsid:
+            rec = self._archive.get_by_explicit_session_id(fallback_explicit_session_id)
+            if rec is not None and rec.vertex_session_id and rec.vertex_session_id != live_vsid:
+                self._evicted_slot_vsids[slot_key] = rec.vertex_session_id
+                return True
+        return False
 
     def hydrate_live_slots_from_archive(
         self,
@@ -747,16 +1145,43 @@ class ConversationContextBuilder:
         """Rehydrate untouched live browser tabs (e.g. after server restart) whose `/r/session/<id>` is in L2."""
         hydrated_sids: Dict[str, Optional[str]] = {}
         for slot_key, tab_url in slot_urls.items():
-            if slot_key in self._session_turns or slot_key in self._session_force_reset:
+            if (
+                slot_key in self._session_turns
+                or slot_key in self._session_force_reset
+                or slot_key in self._ephemeral_probe_slots
+            ):
                 continue
             vsid = extract_vertex_session_id(tab_url)
             if not vsid:
                 continue
-            if self._hydration_misses.get(slot_key) == vsid:
+            if (
+                self._hydration_misses.get(slot_key) == vsid
+                or self._evicted_slot_vsids.get(slot_key) == vsid
+            ):
                 continue
             rec = self._archive.get_by_vertex_session_id(vsid)
             if rec is None:
                 self._hydration_misses[slot_key] = vsid
+                continue
+            if rec.session_title == "一键模型连通体检":
+                self._hydration_misses[slot_key] = vsid
+                continue
+            if is_completed_compaction_turns(rec.turns):
+                self._archive.delete(rec.archive_key)
+                self._hydration_misses[slot_key] = vsid
+                age_ok = (time.time() - float(rec.updated_at or 0.0)) >= 15.0
+                if age_ok and slot_key not in self._pending_compactions:
+                    self._compaction_seq_counter += 1
+                    self._pending_compactions[slot_key] = PendingCompactionCleanup(
+                        slot_key=slot_key,
+                        compaction_seq=self._compaction_seq_counter,
+                        turn_seq=self._slot_turn_seq.get(slot_key, 0),
+                        vertex_session_id=vsid,
+                        origin_session_id=rec.explicit_session_id,
+                        completed_at=float(rec.updated_at or time.time()),
+                        delivered=True,
+                        force_superseded=True,
+                    )
                 continue
             self.restore_archived_to_slot(slot_key, rec, session_url=tab_url)
             hydrated_sids[slot_key] = rec.explicit_session_id
@@ -772,6 +1197,7 @@ class ConversationContextBuilder:
         model: str = "gemini-enterprise-web",
         explicit_session_id: Optional[str] = None,
         exclude_vertex_session_ids: Sequence[str] = (),
+        tenant_id: str = "host",
     ) -> Optional[ArchivedSessionRecord]:
         """Locate an archived Gemini session in L2 that matches the incoming multi-turn continuation."""
         if model_requests_new_chat(model):
@@ -783,9 +1209,12 @@ class ConversationContextBuilder:
             return None
 
         excluded = {v for v in exclude_vertex_session_ids if v}
+        eff_tenant = (tenant_id or "host").strip() or "host"
         req_sid = explicit_session_id.strip() if isinstance(explicit_session_id, str) and explicit_session_id.strip() else None
 
         def _matches(rec: ArchivedSessionRecord) -> bool:
+            if (rec.tenant_id or "host") != eff_tenant:
+                return False
             if not rec.vertex_session_id or not rec.session_url or not rec.turns:
                 return False
             if rec.vertex_session_id in excluded:
@@ -800,7 +1229,7 @@ class ConversationContextBuilder:
             return self._history_matches(rec.turns, dialogue[: len(rec.turns)])
 
         if req_sid:
-            direct = self._archive.get_by_explicit_session_id(req_sid)
+            direct = self._archive.get_by_explicit_session_id(req_sid, tenant_id=eff_tenant)
             if direct is not None and _matches(direct):
                 return direct
 
@@ -831,6 +1260,14 @@ class ConversationContextBuilder:
 
     def is_slot_session_active(self, slot_key: str, slot_dict: Dict[str, Any]) -> bool:
         """Return True if a slot is busy in Bridge or mid-turn in its bound Codex session."""
+        slot_tenant = str(slot_dict.get("owner_tenant_id") or self._session_tenants.get(slot_key) or "host")
+        if slot_tenant != "host":
+            now_ts = time.time()
+            return bool(
+                slot_dict.get("busy")
+                or int(slot_dict.get("waiting_count") or 0) > 0
+                or float(slot_dict.get("pending_tool_call_until") or 0.0) > now_ts
+            )
         act = resolve_slot_activity(
             slot_dict,
             fallback_session_id=self._session_explicit_ids.get(slot_key),
@@ -851,19 +1288,43 @@ class ConversationContextBuilder:
             seen_keys.add(skey)
             meta = self._session_metrics.get(skey) or {}
             t_cnt = int(meta.get("turn_count") or 0)
+            slot_tenant = str(ws.get("owner_tenant_id") or self._session_tenants.get(skey) or meta.get("tenant_id") or "host")
             fallback_sid = self._session_explicit_ids.get(skey)
             ws_for_lookup = ws if ws.get("pinned_session_id") or not fallback_sid else {**ws, "pinned_session_id": fallback_sid}
             act = resolve_slot_activity(
                 ws,
                 fallback_session_id=fallback_sid,
-                codex_home=self._codex_home,
+                codex_home=self._codex_home if slot_tenant == "host" else None,
             )
+            if slot_tenant != "host" and act.get("activity_source") == "codex":
+                act = {
+                    "session_active": False,
+                    "activity_phase": "idle",
+                    "activity_label": "空闲待命",
+                    "activity_source": "slot",
+                    "tool_name": "",
+                }
             sess_title, title_src = resolve_slot_session_title(
                 ws_for_lookup,
                 prompt_title=self._session_titles.get(skey, "") or str(meta.get("session_title") or ""),
                 turn_count=t_cnt,
-                codex_home=self._codex_home,
+                codex_home=self._codex_home if slot_tenant == "host" else None,
             )
+            is_probe_slot = skey in self._ephemeral_probe_slots
+            is_compaction_slot = skey in self._pending_compactions
+            if (
+                skey in self._session_force_reset
+                and not ws.get("busy")
+                and int(ws.get("waiting_count") or 0) == 0
+                and t_cnt == 0
+                and not ws_for_lookup.get("pinned_session_id")
+            ):
+                sess_title, title_src = ("", "")
+            if is_probe_slot and title_src != "codex":
+                sess_title, title_src = ("一键模型连通体检", "task")
+            elif is_compaction_slot and title_src != "codex":
+                cmp_title = self._session_titles.get(skey, "") or "自动整理对话记忆"
+                sess_title, title_src = (cmp_title, "task")
             total_toks = int(meta.get("total_context_tokens") or 0)
             limit_toks = int(meta.get("context_limit_tokens") or CARBON_CONTEXT_WINDOW)
             eff_limit_toks = int(limit_toks * CARBON_EFFECTIVE_CONTEXT_PERCENT / 100)
@@ -873,11 +1334,18 @@ class ConversationContextBuilder:
             base_updated = int(meta.get("updated_at") or ws.get("last_used_at") or 0)
             if t_cnt > 0 or ws_for_lookup.get("pinned_session_id") or act["session_active"]:
                 eff_updated = max(base_updated, int(act.get("codex_updated_at") or 0))
+                pinned_sid_str = str(ws_for_lookup.get("pinned_session_id") or "")
+                tracked_cmp = int(meta.get("compaction_count") or 0)
+                if pinned_sid_str and pinned_sid_str in self._session_compactions:
+                    tracked_cmp = max(tracked_cmp, self._session_compactions[pinned_sid_str][0])
+                slot_compactions = max(tracked_cmp, int(act.get("compaction_count") or 0))
             else:
                 eff_updated = base_updated
+                slot_compactions = 0
             slots_out.append({
                 "slot_key": skey,
                 "tab_id": ws.get("tab_id"),
+                "tenant_id": slot_tenant,
                 "busy": bool(ws.get("busy")),
                 "waiting_count": int(ws.get("waiting_count") or 0),
                 "session_active": bool(act["session_active"]),
@@ -888,9 +1356,12 @@ class ConversationContextBuilder:
                 "pinned_session_id": ws_for_lookup.get("pinned_session_id"),
                 "session_title": sess_title,
                 "title_source": title_src,
+                "ephemeral_probe": is_probe_slot,
+                "ephemeral_compaction": is_compaction_slot,
                 "active_model": str(ws.get("active_model") or meta.get("active_model") or ""),
                 "turn_count": t_cnt,
                 "user_turns": int(meta.get("user_turns") or 0),
+                "compaction_count": slot_compactions,
                 "total_context_tokens": total_toks,
                 "context_limit_tokens": limit_toks,
                 "effective_limit_tokens": eff_limit_toks,
@@ -920,6 +1391,7 @@ class ConversationContextBuilder:
             m_copy.setdefault("compact_threshold_tokens", c_tok)
             m_copy.setdefault("remaining_to_compact_tokens", max(0, c_tok - t_tok))
             m_copy.setdefault("remaining_context_tokens", max(0, l_tok - t_tok))
+            m_copy.setdefault("compaction_count", 0)
             m_copy["compact_pct"] = round(min(100.0, (t_tok / max(c_tok, 1)) * 100.0), 1)
             slots_out.append(m_copy)
         working_count = sum(
@@ -929,7 +1401,11 @@ class ConversationContextBuilder:
         )
         active_slots = [
             s for s in slots_out
-            if bool(s.get("busy")) or bool(s.get("session_active")) or int(s.get("turn_count") or 0) > 0 or bool(s.get("session_title"))
+            if bool(s.get("busy")) or bool(s.get("session_active")) or (
+                not bool(s.get("ephemeral_probe"))
+                and not bool(s.get("ephemeral_compaction"))
+                and (int(s.get("turn_count") or 0) > 0 or bool(s.get("session_title")))
+            )
         ]
         active_slots.sort(
             key=lambda s: (
@@ -950,6 +1426,7 @@ class ConversationContextBuilder:
             "active_model": "",
             "turn_count": 0,
             "user_turns": 0,
+            "compaction_count": 0,
             "total_context_tokens": 0,
             "context_limit_tokens": CARBON_CONTEXT_WINDOW,
             "effective_limit_tokens": eff_limit_default,
@@ -1070,6 +1547,7 @@ class ConversationContextBuilder:
         candidate_slot_keys: Sequence[str],
         messages: Sequence[ChatMessage],
         model: str = "gemini-enterprise-web",
+        tenant_id: str = "host",
     ) -> List[str]:
         """Find worker slot keys whose active browser conversation matches `messages`'s prefix."""
         if not candidate_slot_keys or model_requests_new_chat(model):
@@ -1081,8 +1559,12 @@ class ConversationContextBuilder:
         if dialogue[-1][0] == "user" and dialogue[-1][1].startswith("[NEW_CHAT]"):
             return []
 
+        eff_tenant = (tenant_id or "host").strip() or "host"
         matched: List[Tuple[int, str]] = []
         for slot_key in candidate_slot_keys:
+            slot_tenant = self._session_tenants.get(slot_key) or "host"
+            if slot_tenant != eff_tenant:
+                continue
             tracked = self._session_turns.get(slot_key)
             if not tracked or len(tracked) >= len(dialogue):
                 continue
@@ -1112,7 +1594,13 @@ class ConversationContextBuilder:
         last_strategy: Optional[str] = None,
         session_url: Optional[str] = None,
         explicit_session_id: Optional[str] = None,
+        is_compaction: bool = False,
+        tenant_id: str = "host",
     ) -> None:
+        if not is_compaction:
+            self._pending_compactions.pop(session_key, None)
+        eff_tenant = (tenant_id or self._session_tenants.get(session_key) or "host").strip() or "host"
+        self._session_tenants[session_key] = eff_tenant
         updated = list(sent_history)
         if assistant_tool_calls:
             canon = format_assistant_history_entry(assistant_reply or "", assistant_tool_calls)
@@ -1120,6 +1608,7 @@ class ConversationContextBuilder:
             canon = (assistant_reply or "").strip()
         updated.append(("assistant", canon))
         self._session_turns[session_key] = updated
+        self._slot_turn_seq[session_key] = self._slot_turn_seq.get(session_key, 0) + 1
         self._session_recovery.pop(session_key, None)
         self._session_force_reset.discard(session_key)
         if active_model is not None:
@@ -1132,6 +1621,17 @@ class ConversationContextBuilder:
             self._session_urls[session_key] = session_url.strip()
         if explicit_session_id and explicit_session_id.strip():
             self._session_explicit_ids[session_key] = explicit_session_id.strip()
+        elif last_strategy != "smart_incremental_delta":
+            self._session_explicit_ids.pop(session_key, None)
+        if (
+            len(sent_history) == 1
+            and sent_history[0][0] == "user"
+            and "这是一次连通性体检" in sent_history[0][1]
+        ):
+            self._ephemeral_probe_slots.add(session_key)
+            self._session_titles[session_key] = "一键模型连通体检"
+        else:
+            self._ephemeral_probe_slots.discard(session_key)
 
         comp_tokens = estimate_tokens(canon)
         if logical_prompt_tokens is not None:
@@ -1142,14 +1642,39 @@ class ConversationContextBuilder:
         eff_model = active_model or self._session_models.get(session_key) or ""
         rem_compact = max(0, CARBON_AUTO_COMPACT_TOKENS - total_ctx)
         rem_context = max(0, CARBON_CONTEXT_WINDOW - total_ctx)
+        prev_meta = self._session_metrics.get(session_key) or {}
+        eff_sid_clean = self._session_explicit_ids.get(session_key, "")
+        cmp_track_key = eff_sid_clean or f"slot:{session_key}"
+        prev_cmp_cnt, prev_cmp_fp = self._session_compactions.get(
+            cmp_track_key,
+            (
+                int(prev_meta.get("compaction_count") or 0) if not eff_sid_clean else 0,
+                str(prev_meta.get("compaction_fp") or "") if not eff_sid_clean else "",
+            ),
+        )
+        inline_cmp_cnt, cmp_fp = _extract_compaction_summary_info(updated)
+        if inline_cmp_cnt > 0:
+            if cmp_fp != prev_cmp_fp:
+                compaction_count = max(inline_cmp_cnt, prev_cmp_cnt + 1)
+            else:
+                compaction_count = max(inline_cmp_cnt, prev_cmp_cnt)
+            self._session_compactions[cmp_track_key] = (compaction_count, cmp_fp)
+        elif last_strategy == "smart_single_turn" and len(updated) <= 2 and not eff_sid_clean:
+            compaction_count = 0
+            self._session_compactions.pop(cmp_track_key, None)
+        else:
+            compaction_count = prev_cmp_cnt
         self._session_metrics[session_key] = {
             "slot_key": session_key,
             "tab_id": None,
             "busy": False,
+            "tenant_id": eff_tenant,
             "session_title": self._session_titles.get(session_key, ""),
             "active_model": eff_model,
             "turn_count": len(updated),
             "user_turns": sum(1 for r, _ in updated if r == "user"),
+            "compaction_count": compaction_count,
+            "compaction_fp": cmp_fp or prev_cmp_fp,
             "total_context_tokens": total_ctx,
             "context_limit_tokens": CARBON_CONTEXT_WINDOW,
             "effective_limit_tokens": int(CARBON_CONTEXT_WINDOW * CARBON_EFFECTIVE_CONTEXT_PERCENT / 100),
@@ -1163,7 +1688,8 @@ class ConversationContextBuilder:
             "last_strategy": last_strategy or "smart_single_turn",
             "updated_at": int(time.time()),
         }
-        self.flush_slot_to_archive(session_key)
+        if not is_compaction:
+            self.flush_slot_to_archive(session_key)
 
     def build(
         self,
@@ -1177,7 +1703,14 @@ class ConversationContextBuilder:
         response_format: Optional[Dict[str, Any]] = None,
     ) -> PreparedPrompt:
         mode = (mode_override or self.default_mode or "smart").lower()
-        explicit_new_chat = model_requests_new_chat(model) or session_key in self._session_force_reset
+        had_pending_compaction = session_key in self._pending_compactions
+        if had_pending_compaction:
+            self.retire_reused_compaction_slot(session_key)
+        explicit_new_chat = (
+            model_requests_new_chat(model)
+            or session_key in self._session_force_reset
+            or had_pending_compaction
+        )
         target_model = resolve_target_web_model(model)
         pending_recovery = self._session_recovery.get(session_key)
 
@@ -1190,24 +1723,30 @@ class ConversationContextBuilder:
         )
 
         user_system_text, dialogue = self._normalize_messages(messages)
+        effective_system_text = "\n\n".join(
+            upgrade_desktop_agent_instructions(msg.text_content().strip())
+            for msg in messages
+            if (msg.role or "user").strip().lower() in {"system", "developer"} and msg.text_content().strip()
+        ).strip()
 
         tool_sys_text = build_tool_system_instructions(
             norm_tools,
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,
         )
-        if has_coding_tools(norm_tools) and tool_sys_text and CODING_WORKFLOW.strip() not in user_system_text:
+        if has_coding_tools(norm_tools) and tool_sys_text and CODING_WORKFLOW.strip() not in effective_system_text:
             tool_sys_text += "\n\n" + CODING_WORKFLOW
         fmt_sys_text = build_response_format_instructions(response_format)
 
-        combined_sys_sections = [s for s in (user_system_text, tool_sys_text, fmt_sys_text) if s]
+        combined_sys_sections = [s for s in (effective_system_text, tool_sys_text, fmt_sys_text) if s]
         combined_system_text = "\n\n".join(combined_sys_sections).strip()
 
         if not dialogue:
             fallback_prompt = combined_system_text or "Hello"
             reset_only_sys = explicit_new_chat or self.auto_reset_new_chat or (pending_recovery is not None)
             if reset_only_sys:
-                self.clear_session(session_key)
+                self.clear_session(session_key, keep_force_reset=True)
+                self._session_force_reset.add(session_key)
             return PreparedPrompt(
                 prompt=fallback_prompt,
                 reset_chat=reset_only_sys,
@@ -1225,7 +1764,8 @@ class ConversationContextBuilder:
             dialogue[-1] = ("user", stripped_user)
 
         if explicit_new_chat:
-            self.clear_session(session_key)
+            self.clear_session(session_key, keep_force_reset=True)
+            self._session_force_reset.add(session_key)
             pending_recovery = None
 
         tracked = self._session_turns.get(session_key)
@@ -1262,7 +1802,8 @@ class ConversationContextBuilder:
             )
             reset_last = explicit_new_chat or (self.auto_reset_new_chat and len(dialogue) == 1) or (pending_recovery is not None and not matches_last)
             if reset_last:
-                self.clear_session(session_key)
+                self.clear_session(session_key, keep_force_reset=True)
+                self._session_force_reset.add(session_key)
             elif recovery_notice and matches_last:
                 tail_prompt = f"{recovery_notice}\n\n{tail_prompt}"
             self._record_dialogue_title(session_key, dialogue)
@@ -1284,7 +1825,8 @@ class ConversationContextBuilder:
         if mode == "transcript":
             reset_trans = explicit_new_chat or self.auto_reset_new_chat or (pending_recovery is not None)
             if reset_trans:
-                self.clear_session(session_key)
+                self.clear_session(session_key, keep_force_reset=True)
+                self._session_force_reset.add(session_key)
             self._record_dialogue_title(session_key, dialogue)
             prompt = self._format_full_transcript(
                 system_text=combined_system_text,
@@ -1309,7 +1851,8 @@ class ConversationContextBuilder:
         if len(dialogue) == 1 and dialogue[0][0] == "user":
             reset_chat = explicit_new_chat or self.auto_reset_new_chat or (pending_recovery is not None)
             if reset_chat:
-                self.clear_session(session_key)
+                self.clear_session(session_key, keep_force_reset=True)
+                self._session_force_reset.add(session_key)
                 if target_model is not None:
                     self._session_models[session_key] = target_model
             self._record_dialogue_title(session_key, dialogue)
@@ -1379,7 +1922,8 @@ class ConversationContextBuilder:
         #    Start a clean web session (`reset_chat=True` when auto_reset_new_chat=True) and pack its history.
         reset_packed = explicit_new_chat or self.auto_reset_new_chat or (pending_recovery is not None)
         if reset_packed:
-            self.clear_session(session_key)
+            self.clear_session(session_key, keep_force_reset=True)
+            self._session_force_reset.add(session_key)
             if target_model is not None:
                 self._session_models[session_key] = target_model
         self._record_dialogue_title(session_key, dialogue)

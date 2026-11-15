@@ -495,6 +495,8 @@ class UsageLedger:
         context_limit: Optional[int] = None,
         duration_ms: int = 0,
         as_of_date: Optional[Union[date, datetime, str]] = None,
+        tenant_id: str = "host",
+        tenant_name: str = "本机直连",
     ) -> Dict[str, Any]:
         """Record one completed task into daily, session, model, and task ledgers."""
         p_tokens = max(0, int(prompt_tokens or 0))
@@ -573,6 +575,8 @@ class UsageLedger:
             "day": day_key,
             "slot_key": slot_key,
             "tab_id": tab_id,
+            "tenant_id": (tenant_id or "host").strip() or "host",
+            "tenant_name": (tenant_name or "本机直连").strip() or "本机直连",
             "task_type": norm_task,
             "task_label": TASK_LABELS.get(norm_task, norm_task),
             "requested_model": requested_model,

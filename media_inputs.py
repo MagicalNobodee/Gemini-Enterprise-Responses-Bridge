@@ -717,6 +717,7 @@ class FileStore:
         declared_mime: Optional[str] = None,
         purpose: str = "user_data",
         expected_category: Optional[str] = None,
+        tenant_id: str = "host",
     ) -> Dict[str, Any]:
         mime, category, norm_raw, safe_name = resolve_mime_and_name(
             raw,
@@ -725,7 +726,9 @@ class FileStore:
             expected_category=expected_category,
             normalize_for_web=(purpose != "assistants_output"),
         )
-        digest = hashlib.sha256(norm_raw).hexdigest()[:32]
+        eff_tenant = (tenant_id or "host").strip() or "host"
+        digest_src = norm_raw if eff_tenant == "host" else (eff_tenant.encode("utf-8") + b"\x00" + norm_raw)
+        digest = hashlib.sha256(digest_src).hexdigest()[:32]
         file_id = f"file_{digest}"
         blob_dir = self.files_dir / file_id
         blob_dir.mkdir(parents=True, exist_ok=True)
@@ -742,44 +745,58 @@ class FileStore:
             "status": "processed",
             "mime_type": mime,
             "category": category,
+            "tenant_id": eff_tenant,
             "path": str(blob_path),
         }
         self._meta_path(file_id).write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
         return meta
 
-    def get_meta(self, file_id: str) -> Dict[str, Any]:
+    def get_meta(self, file_id: str, tenant_id: Optional[str] = None) -> Dict[str, Any]:
         if not self._valid_id(file_id):
             raise FileNotFoundError(f"文件不存在：{file_id}")
         mp = self._meta_path(file_id)
         if not mp.is_file():
             raise FileNotFoundError(f"文件不存在：{file_id}")
         meta = json.loads(mp.read_text(encoding="utf-8"))
+        if tenant_id is not None and (meta.get("tenant_id") or "host") != tenant_id:
+            raise FileNotFoundError(f"文件不存在：{file_id}")
         if not Path(meta.get("path", "")).is_file():
             raise FileNotFoundError(f"文件数据已丢失：{file_id}")
         return meta
 
-    def read_bytes(self, file_id: str) -> Tuple[Dict[str, Any], bytes]:
-        meta = self.get_meta(file_id)
+    def read_bytes(self, file_id: str, tenant_id: Optional[str] = None) -> Tuple[Dict[str, Any], bytes]:
+        meta = self.get_meta(file_id, tenant_id=tenant_id)
         return meta, Path(meta["path"]).read_bytes()
 
-    def list_files(self, purpose: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list_files(self, purpose: Optional[str] = None, tenant_id: Optional[str] = None) -> List[Dict[str, Any]]:
         items: List[Dict[str, Any]] = []
         for mp in sorted(self.files_dir.glob("file_*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
             try:
                 meta = json.loads(mp.read_text(encoding="utf-8"))
+                if tenant_id is not None and (meta.get("tenant_id") or "host") != tenant_id:
+                    continue
                 if not Path(meta.get("path", "")).is_file():
                     continue
                 if purpose and meta.get("purpose") != purpose:
                     continue
-                items.append({k: v for k, v in meta.items() if k != "path"})
+                items.append({k: v for k, v in meta.items() if k not in {"path", "tenant_id"}})
             except Exception:
                 continue
         return items
 
-    def delete(self, file_id: str) -> bool:
+    def delete(self, file_id: str, tenant_id: Optional[str] = None) -> bool:
         if not self._valid_id(file_id):
             return False
         mp = self._meta_path(file_id)
+        if tenant_id is not None:
+            if not mp.is_file():
+                return False
+            try:
+                meta = json.loads(mp.read_text(encoding="utf-8"))
+            except Exception:
+                return False
+            if (meta.get("tenant_id") or "host") != tenant_id:
+                return False
         blob_dir = self.files_dir / file_id
         existed = mp.is_file() or blob_dir.is_dir()
         mp.unlink(missing_ok=True)
@@ -828,6 +845,9 @@ def parse_multipart_form(content_type: str, body: bytes) -> Tuple[Dict[str, str]
 
 def extract_part_marker(part: Dict[str, Any]) -> Optional[str]:
     """Compute the deterministic prompt placeholder marker for a multimodal content part."""
+    cached_marker = part.get("_bridge_part_marker")
+    if isinstance(cached_marker, str) and re.fullmatch(r"\[(Image|File|Audio|Video) attachment [^\]]+\]", cached_marker):
+        return cached_marker
     kind = str(part.get("type") or "").lower()
     if kind in {"image_url", "input_image", "image"}:
         original = part.get("_bridge_image_marker")
@@ -883,6 +903,7 @@ def _resolve_reference_or_bytes(
     expected_category: Optional[str],
     file_store: Optional[FileStore],
     image_output_dir: Optional[Path],
+    tenant_id: Optional[str] = None,
 ) -> Tuple[str, str, bytes, str, str]:
     """Return (mime, category, bytes, safe_filename, marker_token)."""
     err_code = {
@@ -915,7 +936,7 @@ def _resolve_reference_or_bytes(
         if file_store is None:
             raise InvalidAttachmentError("当前实例未启用本地文件存储。", error_code=err_code)
         try:
-            meta, raw = file_store.read_bytes(candidate_id)
+            meta, raw = file_store.read_bytes(candidate_id, tenant_id=tenant_id)
         except FileNotFoundError as exc:
             raise InvalidAttachmentError(f"找不到已上传文件：{candidate_id}", error_code=err_code) from exc
         mime, cat, norm_raw, safe_name = resolve_mime_and_name(
@@ -940,29 +961,71 @@ def _resolve_reference_or_bytes(
     return mime, cat, norm_raw, safe_name, val
 
 
-def historical_image_markers(messages: Sequence[ChatMessage]) -> set[str]:
+IMAGE_PART_KINDS = {"image_url", "input_image", "image"}
+MULTIMODAL_PART_KINDS = IMAGE_PART_KINDS | {
+    "file", "input_file", "document",
+    "input_audio", "audio_url", "audio",
+    "video_url", "input_video", "video",
+}
+
+
+def has_any_attachment_parts(messages: Sequence[ChatMessage]) -> bool:
+    for message in messages:
+        if not isinstance(message.content, list):
+            continue
+        for part in message.content:
+            if isinstance(part, dict) and str(part.get("type") or "").lower() in MULTIMODAL_PART_KINDS:
+                return True
+    return False
+
+
+def historical_image_markers(
+    messages: Sequence[ChatMessage],
+    *,
+    compaction: bool = False,
+    include_all_attachments: bool = False,
+) -> set[str]:
     """Only image inputs since the last assistant turn are pending visual evidence."""
-    last_assistant = max((i for i, message in enumerate(messages) if message.role == "assistant"), default=-1)
+    cutoff = (
+        len(messages) - 2
+        if compaction
+        else max((i for i, message in enumerate(messages) if message.role == "assistant"), default=-1)
+    )
+    target_kinds = MULTIMODAL_PART_KINDS if include_all_attachments else IMAGE_PART_KINDS
     historical, pending = set(), set()
     for i, message in enumerate(messages):
         if not isinstance(message.content, list):
             continue
         for part in message.content:
-            if isinstance(part, dict) and str(part.get("type") or "").lower() in {"image_url", "input_image", "image"}:
+            if isinstance(part, dict) and str(part.get("type") or "").lower() in target_kinds:
                 marker = extract_part_marker(part)
                 if marker:
-                    (historical if i <= last_assistant else pending).add(marker)
+                    (historical if i <= cutoff else pending).add(marker)
     # A newly supplied copy is an explicit request to inspect that image again.
     return historical - pending
 
 
 def reference_historical_images(prompt: str, markers: set[str]) -> str:
     """Change only the wire prompt; canonical history must stay stable for slot matching."""
+    if not markers:
+        return prompt
+
+    def _replace(match: re.Match[str]) -> str:
+        full = match.group(0)
+        if full not in markers:
+            return full
+        kind = match.group(1)
+        rest = match.group(2)
+        if kind == "Image":
+            return (
+                "[Historical image reference " + rest +
+                "; not attached this turn. Reopen with a declared client tool if pixels are needed.]"
+            )
+        return f"[Historical {kind.lower()} reference {rest}; not attached this turn.]"
+
     return re.sub(
-        r"\[Image attachment [a-f0-9]{20}\]",
-        lambda match: ("[Historical image reference " + match[0][18:-1] +
-                       "; not attached this turn. Reopen with a declared client tool if pixels are needed.]"
-                       if match[0] in markers else match[0]),
+        r"\[(Image|File|Audio|Video) attachment ([^\]]+)\]",
+        _replace,
         prompt,
     )
 
@@ -973,12 +1036,20 @@ def collect_attachments(
     callback_base_url: str = "",
     image_output_dir: Optional[Path] = None,
     pending_images_only: bool = False,
+    *,
+    pending_only: bool = False,
+    compaction: bool = False,
+    tenant_id: str = "host",
 ) -> List[Dict[str, Any]]:
     """Extract, validate, and prepare all multimodal attachments referenced in `messages`."""
     attachments: List[Dict[str, Any]] = []
     seen_markers: set[str] = set()
     total_bytes = 0
-    last_assistant = max((i for i, message in enumerate(messages) if message.role == "assistant"), default=-1)
+    cutoff = (
+        len(messages) - 2
+        if compaction
+        else max((i for i, message in enumerate(messages) if message.role == "assistant"), default=-1)
+    )
 
     for index, message in enumerate(messages):
         if not isinstance(message.content, list):
@@ -987,14 +1058,11 @@ def collect_attachments(
             if not isinstance(part, dict):
                 continue
             kind = str(part.get("type") or "").lower()
-            if pending_images_only and index <= last_assistant and kind in {"image_url", "input_image", "image"}:
+            if (pending_only or compaction) and index <= cutoff:
                 continue
-            if kind not in {
-                "image_url", "input_image", "image",
-                "file", "input_file", "document",
-                "input_audio", "audio_url", "audio",
-                "video_url", "input_video", "video",
-            }:
+            if pending_images_only and index <= cutoff and kind in IMAGE_PART_KINDS:
+                continue
+            if kind not in MULTIMODAL_PART_KINDS:
                 continue
 
             expected_cat: Optional[str] = None
@@ -1066,6 +1134,7 @@ def collect_attachments(
                 expected_category=expected_cat,
                 file_store=file_store,
                 image_output_dir=image_output_dir,
+                tenant_id=tenant_id,
             )
             if not marker:
                 marker = attachment_marker(cat, token, safe_name, mime)
@@ -1095,7 +1164,13 @@ def collect_attachments(
             if len(norm_raw) <= INLINE_DATA_URL_MAX_BYTES or file_store is None or not callback_base_url:
                 entry["data_url"] = f"data:{mime};base64," + base64.b64encode(norm_raw).decode("ascii")
             else:
-                saved = file_store.save(norm_raw, filename=safe_name, declared_mime=mime, purpose="bridge_staging")
+                saved = file_store.save(
+                    norm_raw,
+                    filename=safe_name,
+                    declared_mime=mime,
+                    purpose="bridge_staging",
+                    tenant_id=tenant_id,
+                )
                 entry["file_id"] = saved["id"]
                 entry["fetch_url"] = f"{callback_base_url.rstrip('/')}/api/bridge/attachments/{saved['id']}"
             attachments.append(entry)
@@ -1103,7 +1178,96 @@ def collect_attachments(
     return attachments
 
 
-def compact_messages_for_store(messages: Sequence[Dict[str, Any]], file_store: Optional[FileStore]) -> List[Dict[str, Any]]:
+def collect_rebuild_attachments(
+    messages: Sequence[ChatMessage],
+    pending_attachments: Sequence[Dict[str, Any]],
+    *,
+    file_store: Optional[FileStore] = None,
+    callback_base_url: str = "",
+    image_output_dir: Optional[Path] = None,
+    tenant_id: str = "host",
+) -> Tuple[List[Dict[str, Any]], set[str]]:
+    """Attach recent historical items within single-request limits when rebuilding a non-tool chat."""
+    last_assistant = max((i for i, message in enumerate(messages) if message.role == "assistant"), default=-1)
+    if last_assistant < 0:
+        return list(pending_attachments), set()
+
+    seen_markers: set[str] = {att["id"] for att in pending_attachments}
+    total_bytes = sum(int(att.get("size_bytes") or 0) for att in pending_attachments)
+    remaining_slots = max(0, MAX_ATTACHMENTS_PER_REQUEST - len(pending_attachments))
+    skipped_markers: set[str] = set()
+    kept_reversed: List[Dict[str, Any]] = []
+
+    historical_parts: List[Dict[str, Any]] = []
+    for index in range(last_assistant + 1):
+        content = messages[index].content
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and str(part.get("type") or "").lower() in MULTIMODAL_PART_KINDS:
+                historical_parts.append(part)
+
+    for part in reversed(historical_parts):
+        pre_marker = extract_part_marker(part) or ""
+        if pre_marker and pre_marker in seen_markers:
+            continue
+        if remaining_slots <= 0:
+            if pre_marker:
+                skipped_markers.add(pre_marker)
+            continue
+        try:
+            extracted = collect_attachments(
+                [ChatMessage(role="user", content=[part])],
+                file_store=file_store,
+                callback_base_url=callback_base_url,
+                image_output_dir=image_output_dir,
+                tenant_id=tenant_id,
+            )
+        except (InvalidAttachmentError, ValueError):
+            if pre_marker:
+                skipped_markers.add(pre_marker)
+            continue
+        if not extracted:
+            continue
+        att = dict(extracted[0])
+        marker = att["id"]
+        if marker in seen_markers:
+            continue
+        if total_bytes + int(att.get("size_bytes") or 0) > MAX_TOTAL_ATTACHMENT_BYTES:
+            skipped_markers.add(marker)
+            if pre_marker:
+                skipped_markers.add(pre_marker)
+            continue
+        seen_markers.add(marker)
+        if pre_marker:
+            seen_markers.add(pre_marker)
+        total_bytes += int(att.get("size_bytes") or 0)
+        remaining_slots -= 1
+        kept_reversed.append(att)
+
+    combined: List[Dict[str, Any]] = list(reversed(kept_reversed)) + [dict(a) for a in pending_attachments]
+    used_names: set[str] = set()
+    seq = 1
+    for item in combined:
+        cur_name = str(item.get("name") or "attachment.bin")
+        if re.fullmatch(r"bridge-\d+\.[a-z0-9]+", cur_name) or cur_name in used_names:
+            ext = cur_name.rsplit(".", 1)[-1] if "." in cur_name else "bin"
+            while f"bridge-{seq}.{ext}" in used_names:
+                seq += 1
+            cur_name = f"bridge-{seq}.{ext}"
+            seq += 1
+        used_names.add(cur_name)
+        item["name"] = cur_name
+
+    skipped_markers -= seen_markers
+    return combined, skipped_markers
+
+
+def compact_messages_for_store(
+    messages: Sequence[Dict[str, Any]],
+    file_store: Optional[FileStore],
+    tenant_id: str = "host",
+) -> List[Dict[str, Any]]:
     """Replace large inline base64 payloads with local `file_id` references before caching in ResponseStore."""
     if file_store is None:
         return list(messages)
@@ -1124,23 +1288,33 @@ def compact_messages_for_store(messages: Sequence[Dict[str, Any]], file_store: O
                 new_parts.append(part)
                 continue
             try:
-                extracted = collect_attachments([ChatMessage(role="user", content=[part])], file_store=file_store)
+                extracted = collect_attachments(
+                    [ChatMessage(role="user", content=[part])],
+                    file_store=file_store,
+                    tenant_id=tenant_id,
+                )
                 if extracted:
                     att = extracted[0]
                     if att.get("file_id"):
                         fid = att["file_id"]
                     else:
                         _, raw = decode_base64_payload(att["data_url"])
-                        fid = file_store.save(raw, filename=att["name"], declared_mime=att["mime_type"], purpose="response_cache")["id"]
+                        fid = file_store.save(
+                            raw,
+                            filename=att["name"],
+                            declared_mime=att["mime_type"],
+                            purpose="response_cache",
+                            tenant_id=tenant_id,
+                        )["id"]
                     cat = att["category"]
                     if cat == "image":
                         new_parts.append({"type": "image_url", "image_url": {"url": fid}, "_bridge_image_marker": att["id"]})
                     elif cat == "audio":
-                        new_parts.append({"type": "input_audio", "file_id": fid, "filename": att["name"]})
+                        new_parts.append({"type": "input_audio", "file_id": fid, "filename": att["name"], "_bridge_part_marker": att["id"]})
                     elif cat == "video":
-                        new_parts.append({"type": "video_url", "file_id": fid, "filename": att["name"]})
+                        new_parts.append({"type": "video_url", "file_id": fid, "filename": att["name"], "_bridge_part_marker": att["id"]})
                     else:
-                        new_parts.append({"type": "file", "file": {"file_id": fid, "filename": att["name"], "mime_type": att["mime_type"]}})
+                        new_parts.append({"type": "file", "file": {"file_id": fid, "filename": att["name"], "mime_type": att["mime_type"]}, "_bridge_part_marker": att["id"]})
                     changed = True
                     continue
             except Exception:

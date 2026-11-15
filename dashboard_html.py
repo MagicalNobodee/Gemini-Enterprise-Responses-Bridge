@@ -1261,6 +1261,120 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .log-item { padding: 3px 0; border-bottom: 1px solid #eef2f9; }
     .log-item:last-child { border-bottom: none; }
 
+    /* Public Distribution & Multi-Client Routing */
+    .sec-icon.teal { background: #f0fdfa; color: #0d9488; }
+    .btn.danger-soft {
+      background: var(--err-soft);
+      border-color: var(--err-border);
+      color: var(--err);
+    }
+    .btn.danger-soft:hover:not(:disabled) {
+      background: #ffe4e6;
+    }
+    .dist-card {
+      margin-top: 16px;
+      padding: 15px 16px;
+      border-radius: var(--radius-lg);
+      background: var(--surface-soft);
+      border: 1px solid var(--border);
+    }
+    .dist-card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+    .dist-card-title {
+      font-size: 0.88rem;
+      font-weight: 700;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .dist-form-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      align-items: end;
+    }
+    .dist-create-grid {
+      display: grid;
+      grid-template-columns: 1.5fr 0.8fr 0.9fr 0.9fr 1fr 1.2fr auto;
+      gap: 10px;
+      align-items: end;
+    }
+    @media (max-width: 980px) {
+      .dist-form-grid,
+      .dist-create-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+    @media (max-width: 560px) {
+      .dist-form-grid,
+      .dist-create-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+    .dist-field {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      min-width: 0;
+    }
+    .dist-field label {
+      font-size: 0.74rem;
+      font-weight: 600;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .dist-field input.clean-input,
+    .dist-field select.clean-select {
+      width: 100%;
+    }
+    .dist-share-box {
+      margin-top: 14px;
+      padding: 14px 16px;
+      border-radius: 13px;
+      background: linear-gradient(180deg, #f0fdfa 0%, #f8fafc 100%);
+      border: 1px solid #99f6e4;
+    }
+    .dist-share-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
+      font-size: 0.85rem;
+      font-weight: 700;
+      color: #0f766e;
+    }
+    .dist-share-pre {
+      margin: 0;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: #ffffff;
+      border: 1px solid #ccfbf1;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.79rem;
+      color: var(--text);
+      white-space: pre-wrap;
+      word-break: break-all;
+      line-height: 1.5;
+    }
+    .dist-row-actions {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
     /* Modal */
     .modal-backdrop {
       position: fixed;
@@ -1415,6 +1529,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <div class="seat-detail-head">
               <div class="seat-detail-title-group">
                 <span class="seat-detail-badge" id="detailSeatBadge">1 号席位</span>
+                <span class="chip warn" id="detailTenantChip" hidden>外部共享</span>
                 <span class="seat-detail-title" id="detailSeatTitle">暂无活跃会话</span>
                 <span class="chip" id="detailSourceChip">待命页</span>
                 <span class="chip" id="detailStatusChip">空闲待命</span>
@@ -1445,12 +1560,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                 <div class="s" id="detailReqs">本页累计完成 0 次请求</div>
               </div>
               <div class="detail-kpi">
-                <div class="k">浏览器工作页</div>
-                <div class="v" id="detailTabInfo">标签页 -</div>
-                <div class="s" id="detailTabSub">等待状态同步</div>
+                <div class="k">上下文压缩</div>
+                <div class="v" id="detailCompactions">0 次（未压缩）</div>
+                <div class="s" id="detailCompactionSub">满 300.0K 自动浓缩换新页</div>
               </div>
               <div class="detail-kpi">
-                <div class="k">绑定会话与活跃时间</div>
+                <div class="k">绑定会话与工作页</div>
                 <div class="v" id="detailSessionId">未绑定固定会话</div>
                 <div class="s" id="detailUpdatedAt">最近活跃 -</div>
               </div>
@@ -1716,6 +1831,125 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       </div>
     </section>
 
+    <!-- Section 3.5: Public Distribution & Multi-Client Routing -->
+    <section class="fold-section" data-sec="dist" id="secDist">
+      <div class="fold-head" data-fold-toggle="dist">
+        <div class="fold-title-wrap">
+          <span class="sec-icon teal">⇄</span>
+          <div>
+            <h2 class="fold-title">公网分发与多客分流</h2>
+            <div class="fold-subtitle">对方无需安装任何插件，填入地址与专属密钥即可使用 · 自动隔离会话并为本机预留专属席位</div>
+          </div>
+        </div>
+        <div class="fold-right">
+          <span class="chip" id="distSummaryChip">本机预留 2 席 · 0 把密钥</span>
+          <span class="chevron" aria-hidden="true">▾</span>
+        </div>
+      </div>
+      <div class="fold-body">
+        <div class="dist-card">
+          <div class="dist-card-head">
+            <div class="dist-card-title">
+              <span>主机保护与公网分流策略</span>
+              <span class="chip ok" id="distAccessBadge">外部共享已开启</span>
+              <span class="muted" style="font-weight:500;font-size:0.79rem;" id="distPoolSplitText">本机免密直连不受任何限制</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;">
+              <span class="muted" style="font-size:0.77rem;" id="distPolicyMsg"></span>
+              <button type="button" class="btn sm primary" id="distSavePolicyBtn">保存分流设置</button>
+            </div>
+          </div>
+          <div class="dist-form-grid">
+            <div class="dist-field">
+              <label for="distEnabledSelect">外部接入总开关</label>
+              <select id="distEnabledSelect" class="clean-select">
+                <option value="1">允许接入（凭下方专属密钥）</option>
+                <option value="0">暂停外部接入（仅本机可用）</option>
+              </select>
+            </div>
+            <div class="dist-field">
+              <label for="distReservedInput">为本机保底预留席位数</label>
+              <input id="distReservedInput" class="clean-input" type="number" min="0" max="20" value="2" />
+            </div>
+            <div class="dist-field">
+              <label for="distQueueTimeoutInput">外部满载排队超时（秒）</label>
+              <input id="distQueueTimeoutInput" class="clean-input" type="number" min="5" max="600" value="90" />
+            </div>
+            <div class="dist-field">
+              <label for="distPublicUrlInput">公网访问域名（选填，用于生成接入包）</label>
+              <input id="distPublicUrlInput" class="clean-input" type="text" spellcheck="false" placeholder="如 https://ai.example.com" />
+            </div>
+          </div>
+        </div>
+
+        <div class="dist-card" style="margin-top:12px;">
+          <div class="dist-card-head">
+            <div class="dist-card-title">
+              <span>新建客户端专属密钥</span>
+              <span class="muted" style="font-weight:500;font-size:0.78rem;">每人一把独立密钥，对话记忆、上传文件与并发排队互不串扰</span>
+            </div>
+          </div>
+          <div class="dist-create-grid">
+            <div class="dist-field">
+              <label for="distClientName">使用者名称</label>
+              <input id="distClientName" class="clean-input" type="text" maxlength="64" placeholder="如：朋友小张 / 副机笔记本" />
+            </div>
+            <div class="dist-field">
+              <label for="distClientConcurrency">单客最大并发</label>
+              <input id="distClientConcurrency" class="clean-input" type="number" min="1" max="20" value="2" />
+            </div>
+            <div class="dist-field">
+              <label for="distClientRpm">每分钟限次</label>
+              <input id="distClientRpm" class="clean-input" type="number" min="1" max="600" value="30" />
+            </div>
+            <div class="dist-field">
+              <label for="distClientDailyReq">每日次数上限</label>
+              <input id="distClientDailyReq" class="clean-input" type="number" min="0" value="0" title="填 0 表示不限制每日次数" />
+            </div>
+            <div class="dist-field">
+              <label for="distClientDailyTok">每日 Token 上限</label>
+              <input id="distClientDailyTok" class="clean-input" type="number" min="0" value="0" title="填 0 表示不限制每日 Token" />
+            </div>
+            <div class="dist-field">
+              <label for="distClientNote">备注（选填）</label>
+              <input id="distClientNote" class="clean-input" type="text" maxlength="120" placeholder="例如：仅日常编程使用" />
+            </div>
+            <button type="button" class="btn primary" id="distCreateClientBtn">+ 生成专属密钥</button>
+          </div>
+        </div>
+
+        <div class="dist-share-box" id="distShareBox" hidden>
+          <div class="dist-share-head">
+            <span id="distShareTitle">专属接入配置包（可直接发给对方）</span>
+            <div class="dist-row-actions">
+              <button type="button" class="btn sm primary" id="distCopyBundleBtn">复制完整接入包</button>
+              <button type="button" class="btn sm soft" id="distCopyKeyOnlyBtn">仅复制密钥</button>
+              <button type="button" class="btn sm" id="distCloseShareBtn">收起</button>
+            </div>
+          </div>
+          <pre class="dist-share-pre" id="distSharePre"></pre>
+        </div>
+
+        <div class="table-scroll" style="margin-top:14px;">
+          <table class="clean-table" id="distClientsTable">
+            <thead>
+              <tr>
+                <th>客户端名称</th>
+                <th>专属密钥</th>
+                <th>实时并发</th>
+                <th>限流与今日配额</th>
+                <th>累计调用 · 最近活跃</th>
+                <th>管理操作</th>
+              </tr>
+            </thead>
+            <tbody id="distClientsBody">
+              <tr><td colspan="6" class="muted">暂未创建外部密钥 · 本机直连免密，如需分享给他人请在上方生成专属密钥</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
     <!-- Section 4: Diagnostics & Logs (Collapsed by default) -->
     <section class="fold-section collapsed" data-sec="diag" id="secDiag">
       <div class="fold-head" data-fold-toggle="diag">
@@ -1802,6 +2036,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       let idleSeatsExpanded = false;
       let enrichedBySlotKey = {};
       let refreshResetTimer = null;
+      let lastDistSnapshot = null;
+      let lastDefaultModel = 'gemini-4-carbon';
+      let distPolicyDirty = false;
+      let currentShareKey = '';
+      let currentShareBundle = '';
 
       const PERIOD_LABELS = {
         today: '今日',
@@ -2068,6 +2307,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           : ((usedTok / Math.max(1, limTok)) * 100);
 
         document.getElementById('detailSeatBadge').textContent = item.seatNum + ' 号席位';
+        const tenantChip = document.getElementById('detailTenantChip');
+        if (item.isExternalTenant) {
+          tenantChip.hidden = false;
+          tenantChip.textContent = item.tenantLabel || '外部客户端';
+        } else {
+          tenantChip.hidden = true;
+        }
         const titleEl = document.getElementById('detailSeatTitle');
         titleEl.textContent = item.topic || '暂无活跃会话 · 空闲待命页';
         titleEl.title = item.topic || '空闲待命页';
@@ -2117,29 +2363,46 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
         const uTurns = Number(cs.user_turns || 0);
         const tSteps = Number(cs.turn_count || 0);
+        const cmpCnt = Number(cs.compaction_count || 0);
+        const completedReqs = Number(s.completed_requests || 0);
         document.getElementById('detailTurns').textContent =
           uTurns + ' 轮提问 · ' + tSteps + ' 步交互';
         document.getElementById('detailReqs').textContent =
-          '本页累计完成 ' + Number(s.completed_requests || 0) + ' 次请求';
+          cmpCnt > 0
+            ? ('当前新网页步数 · 本页完成 ' + completedReqs + ' 次')
+            : ('本页累计完成 ' + completedReqs + ' 次请求');
 
-        const tabInfoEl = document.getElementById('detailTabInfo');
-        tabInfoEl.textContent = s.tab_id ? ('标签页 #' + s.tab_id) : '自动分配工作页';
+        const cmpEl = document.getElementById('detailCompactions');
+        const cmpSubEl = document.getElementById('detailCompactionSub');
+        if (cmpCnt > 0) {
+          cmpEl.textContent = '已压缩 ' + cmpCnt + ' 次';
+          cmpSubEl.textContent = '正在第 ' + (cmpCnt + 1) + ' 段新网页续聊';
+        } else {
+          cmpEl.textContent = '0 次（未压缩）';
+          cmpSubEl.textContent = '满 ' + fmtTok(cmpTok) + ' 自动浓缩换新页';
+        }
+
         const cleanWebTitle = String(s.tab_title || '').replace(/\s*-\s*Gemini Enterprise\s*$/i, '').trim();
-        tabInfoEl.title = cleanWebTitle ? ('网页标题：' + cleanWebTitle) : '';
-        document.getElementById('detailTabSub').textContent =
-          (s.captured_rpc ? '流式通道已就绪' : '页面组件监听') + (s.tab_ready === false ? ' · 页面加载中' : ' · 登录正常');
+        const webSessMatch = String(s.tab_url || '').match(/\/r\/session\/([^/?#]+)/i);
+        const webSessShort = webSessMatch && webSessMatch[1] ? webSessMatch[1].slice(-6) : '';
 
         const sidEl = document.getElementById('detailSessionId');
-        if (s.pinned_session_id) {
-          const sid = String(s.pinned_session_id);
+        const effSid = s.pinned_session_id || cs.pinned_session_id;
+        if (effSid) {
+          const sid = String(effSid);
           sidEl.textContent = sid.length > 16 ? ('会话 ' + sid.slice(0, 8) + '…' + sid.slice(-4)) : ('会话 ' + sid);
-          sidEl.title = '绑定会话 ID: ' + sid;
+          sidEl.title = '绑定会话 ID: ' + sid + (webSessShort ? ('\n当前网页对话尾号: #' + webSessShort) : '');
         } else {
           sidEl.textContent = '未绑定固定会话';
-          sidEl.title = '';
+          sidEl.title = webSessShort ? ('当前网页对话尾号: #' + webSessShort) : '';
         }
-        document.getElementById('detailUpdatedAt').textContent =
-          item.lastTs > 0 ? ('最近活跃 ' + new Date(item.lastTs * 1000).toLocaleTimeString()) : '尚未产生调用';
+        const tabShort = s.tab_id ? ('标签页 #' + String(s.tab_id).slice(-4)) : '自动工作页';
+        const activeTimeStr = item.lastTs > 0 ? (new Date(item.lastTs * 1000).toLocaleTimeString() + ' 活跃') : '随时待命';
+        const updEl = document.getElementById('detailUpdatedAt');
+        updEl.textContent = tabShort + ' · ' + activeTimeStr;
+        updEl.title = (s.tab_id ? ('浏览器标签页 ID: #' + s.tab_id) : '自动分配工作页')
+          + (cleanWebTitle ? ('\n网页标题: ' + cleanWebTitle) : '')
+          + (s.tab_ready === false ? '\n状态: 页面加载中' : '');
       }
 
       function buildSeatCard(item) {
@@ -2196,7 +2459,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         const modelSpan = document.createElement('span');
         modelSpan.textContent = friendlyModel(s.active_model || cs.active_model);
         const turnSpan = document.createElement('span');
-        turnSpan.textContent = turns > 0 ? ('第 ' + turns + ' 轮') : (item.isWorking ? '进行中' : '待命');
+        const turnBase = turns > 0 ? ('第 ' + turns + ' 轮') : (item.isWorking ? '进行中' : '待命');
+        turnSpan.textContent = item.isExternalTenant ? (item.shortTenantLabel + ' · ' + turnBase) : turnBase;
+        if (item.isExternalTenant) {
+          turnSpan.style.color = '#d97706';
+          turnSpan.style.fontWeight = '650';
+        }
         meta.appendChild(modelSpan);
         meta.appendChild(turnSpan);
 
@@ -2287,8 +2555,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           const topic = String(cs.session_title || '').trim();
           const turns = Number(cs.user_turns || cs.turn_count || 0);
           const usedTok = Number(cs.total_context_tokens || 0);
-          const hasActiveConv = Boolean(topic) || turns > 0 || usedTok > 0 || Boolean(s.pinned_session_id);
+          const isEphemeralProbe = Boolean(cs.ephemeral_probe) && !isWorking;
+          const hasActiveConv = !isEphemeralProbe && (Boolean(topic) || turns > 0 || usedTok > 0 || Boolean(s.pinned_session_id));
           const lastTs = Math.max(Number(cs.updated_at || 0), Number(s.last_used_at || 0));
+          const tenantId = String(s.owner_tenant_id || cs.tenant_id || 'host');
+          const isExternalTenant = Boolean(tenantId && tenantId !== 'host');
+          const tenantLabel = String(cs.tenant_name || (isExternalTenant ? '外部客户端' : '本机直连'));
+          const shortTenantLabel = tenantLabel.startsWith('客户端 · ') ? ('共享·' + tenantLabel.slice(6)) : tenantLabel;
           const enriched = {
             slot: s,
             cs: cs,
@@ -2302,7 +2575,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             titleSource: String(cs.title_source || ''),
             turns: turns,
             hasActiveConv: hasActiveConv,
-            lastTs: lastTs
+            lastTs: lastTs,
+            tenantId: tenantId,
+            isExternalTenant: isExternalTenant,
+            tenantLabel: tenantLabel,
+            shortTenantLabel: shortTenantLabel
           };
           if (s.slot_key) enrichedBySlotKey[s.slot_key] = enriched;
           return enriched;
@@ -2721,7 +2998,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             const tMeta = TASK_META[r.task_type] || { label: r.task_label || '常规调用' };
             const rt = resolveTokenParts(r);
             tr.appendChild(makeCell(tStr));
-            tr.appendChild(makeCell(tMeta.label));
+            if (r.tenant_id && r.tenant_id !== 'host') {
+              const taskWrap = document.createElement('span');
+              taskWrap.style.display = 'inline-flex';
+              taskWrap.style.alignItems = 'center';
+              taskWrap.style.gap = '6px';
+              taskWrap.appendChild(document.createTextNode(tMeta.label));
+              const tBadge = document.createElement('span');
+              tBadge.className = 'chip warn';
+              const rawTName = String(r.tenant_name || '外部');
+              tBadge.textContent = rawTName.startsWith('客户端 · ') ? rawTName.slice(6) : rawTName;
+              taskWrap.appendChild(tBadge);
+              tr.appendChild(makeCell(taskWrap));
+            } else {
+              tr.appendChild(makeCell(tMeta.label));
+            }
             tr.appendChild(makeCell(friendlyModel(r.display_name || r.model) + ' · ' + friendlySeatLabel(r.slot_key, r.tab_id)));
             tr.appendChild(makeCell(friendlyStrategyBadge(r.strategy)));
             tr.appendChild(makeCell(
@@ -2816,6 +3107,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
           if (data.usage) {
             renderLedger(data.usage, data.context_monitor);
+          }
+          lastDefaultModel = data.default_model || 'gemini-4-carbon';
+          if (data.distribution) {
+            renderDistribution(data.distribution, lastDefaultModel);
           }
 
           // Diagnostics drawer
@@ -2937,6 +3232,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           }
 
           const reqHeaders = Object.assign({ 'Content-Type': 'application/json' }, headers);
+          if (isQuickProbe) reqHeaders['X-Bridge-Probe'] = '1';
           const earlyPollTimer = setTimeout(refreshStatus, 280);
           const res = await fetch('/v1/chat/completions', {
             method: 'POST',
@@ -3042,6 +3338,390 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         const val = ev.target.value;
         selectedPeriod = val ? ('day:' + val) : 'all';
         if (lastUsageSnapshot) renderLedger(lastUsageSnapshot, lastCtxSnapshot);
+      });
+
+      // Public Distribution & Multi-Client Controls
+      function buildAdminHeaders() {
+        const authVal = document.getElementById('apiKeyInput').value.trim();
+        const h = { 'Content-Type': 'application/json' };
+        if (authVal) h['Authorization'] = 'Bearer ' + authVal;
+        return h;
+      }
+
+      function resolveShareApiBase(policyObj) {
+        let raw = String((policyObj && policyObj.public_base_url) || window.location.origin || '').trim();
+        while (raw.endsWith('/')) raw = raw.slice(0, -1);
+        if (!raw.endsWith('/v1')) raw = raw + '/v1';
+        return raw;
+      }
+
+      function buildClientBundleText(clientObj, policyObj, defModel) {
+        const apiBase = resolveShareApiBase(policyObj);
+        const recModel = defModel || 'gemini-4-carbon';
+        const keyStr = clientObj.api_key || clientObj.key_preview || '';
+        const lines = [
+          '【' + (clientObj.name || '共享客户端') + ' · AI 接口接入信息】',
+          '接口地址 (Base URL): ' + apiBase,
+          '专属密钥 (API Key): ' + keyStr,
+          '推荐主力模型: ' + recModel,
+          '其他可选模型: gemini-4-argon, gemini-3.1-pro, gemini-3.8-flash',
+          '使用方法: 打开 Cursor / Codex / Cherry Studio / ChatBox 等任意支持 OpenAI 接口的软件，填入以上接口地址和专属密钥即可直接使用（无需安装任何插件）。'
+        ];
+        return lines.join('\n');
+      }
+
+      function showShareBundle(clientObj) {
+        const policyObj = (lastDistSnapshot && lastDistSnapshot.policy) || {};
+        currentShareKey = String(clientObj.api_key || '');
+        currentShareBundle = buildClientBundleText(clientObj, policyObj, lastDefaultModel);
+        document.getElementById('distShareTitle').textContent = '「' + (clientObj.name || '客户端') + '」专属接入包（可直接复制发给对方）';
+        document.getElementById('distSharePre').textContent = currentShareBundle;
+        document.getElementById('distShareBox').hidden = false;
+      }
+
+      async function copyTextWithFeedback(btn, text, okLabel) {
+        const orig = btn.textContent;
+        try {
+          await navigator.clipboard.writeText(text);
+          btn.textContent = okLabel || '已复制 ✓';
+        } catch (_) {
+          btn.textContent = '请手动复制';
+        }
+        setTimeout(function () { btn.textContent = orig; }, 1400);
+      }
+
+      function renderDistribution(dist, defModel) {
+        if (!dist) return;
+        lastDistSnapshot = dist;
+        const policy = dist.policy || {};
+        const rt = dist.runtime || {};
+        const clientsList = Array.isArray(dist.clients) ? dist.clients : [];
+        const enabled = policy.external_access_enabled !== false;
+        const reserved = Number(policy.host_reserved_slots !== undefined ? policy.host_reserved_slots : 2);
+        const poolCap = Number(rt.pool_capacity || 0);
+        const extCap = Number(rt.external_parallel_cap || 0);
+        const extInf = Number(rt.external_in_flight || 0);
+        const extQueued = Number(rt.external_queued || 0);
+        const hostInf = Number(rt.host_in_flight || 0);
+        const activeKeys = Number(rt.active_client_keys || 0);
+        const totalKeys = Number(rt.total_client_keys || clientsList.length);
+
+        const sumChip = document.getElementById('distSummaryChip');
+        if (!enabled) {
+          sumChip.className = 'chip warn';
+          sumChip.textContent = '外部接入已暂停 · ' + totalKeys + ' 把密钥';
+        } else if (extInf > 0 || extQueued > 0) {
+          sumChip.className = 'chip busy';
+          sumChip.textContent = '外部 ' + extInf + ' 工作中' + (extQueued > 0 ? (' / ' + extQueued + ' 排队') : '') + ' · ' + activeKeys + ' 把密钥启用';
+        } else {
+          sumChip.className = activeKeys > 0 ? 'chip ok' : 'chip';
+          sumChip.textContent = '本机保底 ' + reserved + ' 席 · ' + activeKeys + ' 把密钥启用';
+        }
+
+        const badge = document.getElementById('distAccessBadge');
+        badge.className = enabled ? 'chip ok' : 'chip warn';
+        badge.textContent = enabled ? '外部共享已开启' : '外部共享已暂停';
+
+        const splitEl = document.getElementById('distPoolSplitText');
+        if (poolCap > 0) {
+          splitEl.textContent = '当前在线 ' + poolCap + ' 席 = 本机保底 ' + Math.min(poolCap, reserved) + ' 席 + 外部最多并发 ' + extCap + ' 席（本机 ' + hostInf + ' / 外部 ' + extInf + ' 工作中' + (extQueued > 0 ? ('，排队 ' + extQueued) : '') + '）';
+        } else {
+          splitEl.textContent = '本机直连免密且优先使用席位；外部客户端按并发上限与公平队列自动调度';
+        }
+
+        const policyInputs = [
+          document.getElementById('distEnabledSelect'),
+          document.getElementById('distReservedInput'),
+          document.getElementById('distQueueTimeoutInput'),
+          document.getElementById('distPublicUrlInput')
+        ];
+        const anyPolicyFocused = policyInputs.some(function (el) { return el && document.activeElement === el; });
+        if (!distPolicyDirty && !anyPolicyFocused) {
+          document.getElementById('distEnabledSelect').value = enabled ? '1' : '0';
+          document.getElementById('distReservedInput').value = String(reserved);
+          document.getElementById('distQueueTimeoutInput').value = String(Math.round(Number(policy.external_queue_timeout_seconds || 90)));
+          document.getElementById('distPublicUrlInput').value = String(policy.public_base_url || '');
+        }
+
+        const tbody = document.getElementById('distClientsBody');
+        if (clientsList.length === 0) {
+          renderEmptyRow(tbody, 6, '暂未创建外部密钥 · 本机直连无需密钥，如需分享给他人请在上方生成专属密钥');
+          return;
+        }
+        tbody.replaceChildren();
+        clientsList.forEach(function (c) {
+          const tr = document.createElement('tr');
+
+          // Col 1: Name + Status + Note
+          const nameBox = document.createElement('div');
+          const nameRow = document.createElement('div');
+          nameRow.style.display = 'flex';
+          nameRow.style.alignItems = 'center';
+          nameRow.style.gap = '6px';
+          const strong = document.createElement('strong');
+          strong.textContent = c.name || c.client_id;
+          const st = document.createElement('span');
+          st.className = c.enabled ? 'chip ok' : 'chip warn';
+          st.textContent = c.enabled ? '启用中' : '已暂停';
+          nameRow.appendChild(strong);
+          nameRow.appendChild(st);
+          nameBox.appendChild(nameRow);
+          if (c.note) {
+            const noteSub = document.createElement('div');
+            noteSub.className = 'muted';
+            noteSub.style.fontSize = '0.73rem';
+            noteSub.textContent = c.note;
+            nameBox.appendChild(noteSub);
+          }
+          tr.appendChild(makeCell(nameBox));
+
+          // Col 2: Secret Key preview + Copy buttons
+          const keyBox = document.createElement('div');
+          keyBox.className = 'dist-row-actions';
+          const codeSpan = document.createElement('span');
+          codeSpan.className = 'mono';
+          codeSpan.style.fontSize = '0.77rem';
+          codeSpan.textContent = c.key_preview || 'sk-geb-****';
+          keyBox.appendChild(codeSpan);
+          if (c.api_key) {
+            const cpBundleBtn = document.createElement('button');
+            cpBundleBtn.type = 'button';
+            cpBundleBtn.className = 'btn sm soft';
+            cpBundleBtn.textContent = '复制接入包';
+            cpBundleBtn.addEventListener('click', function () {
+              showShareBundle(c);
+              copyTextWithFeedback(cpBundleBtn, buildClientBundleText(c, policy, defModel), '接入包已复制 ✓');
+            });
+            const cpKeyBtn = document.createElement('button');
+            cpKeyBtn.type = 'button';
+            cpKeyBtn.className = 'btn sm';
+            cpKeyBtn.textContent = '复制密钥';
+            cpKeyBtn.addEventListener('click', function () {
+              copyTextWithFeedback(cpKeyBtn, c.api_key, '已复制 ✓');
+            });
+            keyBox.appendChild(cpBundleBtn);
+            keyBox.appendChild(cpKeyBtn);
+          }
+          tr.appendChild(makeCell(keyBox));
+
+          // Col 3: Real-time concurrency
+          const inf = Number(c.in_flight || 0);
+          const qd = Number(c.queued || 0);
+          const maxC = Number(c.max_concurrency || 1);
+          const concChip = document.createElement('span');
+          concChip.className = inf > 0 ? 'chip busy' : 'chip';
+          concChip.textContent = inf + ' / ' + maxC + ' 并发' + (qd > 0 ? ('（排队 ' + qd + '）') : '');
+          tr.appendChild(makeCell(concChip));
+
+          // Col 4: Rate limits & daily quota
+          const reqLim = Number(c.daily_request_limit || 0);
+          const tokLim = Number(c.daily_token_limit || 0);
+          const todayReqs = Number(c.today_requests || 0);
+          const todayToks = Number(c.today_tokens || 0);
+          const quotaParts = [
+            (c.rpm_limit || 30) + ' 次/分',
+            '今日 ' + todayReqs + (reqLim > 0 ? ('/' + reqLim) : '') + ' 次'
+          ];
+          if (tokLim > 0 || todayToks > 0) {
+            quotaParts.push(fmtLedgerTok(todayToks) + (tokLim > 0 ? ('/' + fmtLedgerTok(tokLim)) : '') + ' Tok');
+          }
+          tr.appendChild(makeCell(quotaParts.join(' · ')));
+
+          // Col 5: Cumulative usage & last active
+          const totReqs = Number(c.total_requests || 0);
+          const totToks = Number(c.total_tokens || 0);
+          const lastStr = c.last_used_at ? new Date(c.last_used_at * 1000).toLocaleTimeString() : '尚未使用';
+          const statText = totReqs + ' 次 (' + fmtLedgerTok(totToks) + ') · ' + lastStr + (c.last_ip ? (' · ' + c.last_ip) : '');
+          tr.appendChild(makeCell(statText));
+
+          // Col 6: Actions (Toggle, Rotate, Revoke)
+          const actBox = document.createElement('div');
+          actBox.className = 'dist-row-actions';
+
+          const toggleBtn = document.createElement('button');
+          toggleBtn.type = 'button';
+          toggleBtn.className = 'btn sm';
+          toggleBtn.textContent = c.enabled ? '暂停' : '启用';
+          toggleBtn.addEventListener('click', async function () {
+            toggleBtn.disabled = true;
+            try {
+              const res = await fetch('/api/distribution/clients/' + encodeURIComponent(c.client_id), {
+                method: 'PATCH',
+                headers: buildAdminHeaders(),
+                body: JSON.stringify({ enabled: !c.enabled })
+              });
+              const d = await res.json().catch(function () { return {}; });
+              if (res.ok && d.distribution) renderDistribution(d.distribution, lastDefaultModel);
+            } finally {
+              toggleBtn.disabled = false;
+            }
+          });
+
+          const rotBtn = document.createElement('button');
+          rotBtn.type = 'button';
+          rotBtn.className = 'btn sm';
+          rotBtn.textContent = '换新密钥';
+          let rotConfirm = false;
+          rotBtn.addEventListener('click', async function () {
+            if (!rotConfirm) {
+              rotConfirm = true;
+              rotBtn.textContent = '确认换新?';
+              setTimeout(function () {
+                if (rotConfirm) {
+                  rotConfirm = false;
+                  rotBtn.textContent = '换新密钥';
+                }
+              }, 3000);
+              return;
+            }
+            rotConfirm = false;
+            rotBtn.disabled = true;
+            try {
+              const res = await fetch('/api/distribution/clients/' + encodeURIComponent(c.client_id) + '/rotate-key', {
+                method: 'POST',
+                headers: buildAdminHeaders()
+              });
+              const d = await res.json().catch(function () { return {}; });
+              if (res.ok && d.distribution) {
+                renderDistribution(d.distribution, lastDefaultModel);
+                if (d.client) showShareBundle(d.client);
+              }
+            } finally {
+              rotBtn.disabled = false;
+            }
+          });
+
+          const delBtn = document.createElement('button');
+          delBtn.type = 'button';
+          delBtn.className = 'btn sm danger-soft';
+          delBtn.textContent = '吊销';
+          let delConfirm = false;
+          delBtn.addEventListener('click', async function () {
+            if (!delConfirm) {
+              delConfirm = true;
+              delBtn.textContent = '确认吊销?';
+              setTimeout(function () {
+                if (delConfirm) {
+                  delConfirm = false;
+                  delBtn.textContent = '吊销';
+                }
+              }, 3000);
+              return;
+            }
+            delConfirm = false;
+            delBtn.disabled = true;
+            try {
+              const res = await fetch('/api/distribution/clients/' + encodeURIComponent(c.client_id), {
+                method: 'DELETE',
+                headers: buildAdminHeaders()
+              });
+              const d = await res.json().catch(function () { return {}; });
+              if (res.ok && d.distribution) {
+                renderDistribution(d.distribution, lastDefaultModel);
+                document.getElementById('distShareBox').hidden = true;
+                refreshStatus();
+              }
+            } finally {
+              delBtn.disabled = false;
+            }
+          });
+
+          actBox.appendChild(toggleBtn);
+          actBox.appendChild(rotBtn);
+          actBox.appendChild(delBtn);
+          tr.appendChild(makeCell(actBox));
+
+          tbody.appendChild(tr);
+        });
+      }
+
+      ['distEnabledSelect', 'distReservedInput', 'distQueueTimeoutInput', 'distPublicUrlInput'].forEach(function (id) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.addEventListener('input', function () { distPolicyDirty = true; });
+        el.addEventListener('change', function () { distPolicyDirty = true; });
+      });
+
+      document.getElementById('distSavePolicyBtn').addEventListener('click', async function () {
+        const btn = document.getElementById('distSavePolicyBtn');
+        const msg = document.getElementById('distPolicyMsg');
+        btn.disabled = true;
+        try {
+          const payload = {
+            external_access_enabled: document.getElementById('distEnabledSelect').value === '1',
+            host_reserved_slots: Math.max(0, Number(document.getElementById('distReservedInput').value || 0)),
+            external_queue_timeout_seconds: Math.max(5, Number(document.getElementById('distQueueTimeoutInput').value || 90)),
+            public_base_url: document.getElementById('distPublicUrlInput').value.trim()
+          };
+          const res = await fetch('/api/distribution/policy', {
+            method: 'PATCH',
+            headers: buildAdminHeaders(),
+            body: JSON.stringify(payload)
+          });
+          const d = await res.json().catch(function () { return {}; });
+          if (!res.ok || !d.ok) {
+            msg.textContent = (d && d.detail) ? d.detail : '保存失败';
+            return;
+          }
+          distPolicyDirty = false;
+          if (d.distribution) renderDistribution(d.distribution, lastDefaultModel);
+          msg.textContent = '已保存生效 ✓';
+          setTimeout(function () { msg.textContent = ''; }, 2000);
+        } catch (_) {
+          msg.textContent = '网络异常';
+        } finally {
+          btn.disabled = false;
+        }
+      });
+
+      document.getElementById('distCreateClientBtn').addEventListener('click', async function () {
+        const btn = document.getElementById('distCreateClientBtn');
+        const nameEl = document.getElementById('distClientName');
+        const nameVal = nameEl.value.trim();
+        if (!nameVal) {
+          nameEl.focus();
+          const orig = btn.textContent;
+          btn.textContent = '请先填写名称';
+          setTimeout(function () { btn.textContent = orig; }, 1400);
+          return;
+        }
+        btn.disabled = true;
+        try {
+          const payload = {
+            name: nameVal,
+            max_concurrency: Math.max(1, Number(document.getElementById('distClientConcurrency').value || 2)),
+            rpm_limit: Math.max(1, Number(document.getElementById('distClientRpm').value || 30)),
+            daily_request_limit: Math.max(0, Number(document.getElementById('distClientDailyReq').value || 0)),
+            daily_token_limit: Math.max(0, Number(document.getElementById('distClientDailyTok').value || 0)),
+            note: document.getElementById('distClientNote').value.trim()
+          };
+          const res = await fetch('/api/distribution/clients', {
+            method: 'POST',
+            headers: buildAdminHeaders(),
+            body: JSON.stringify(payload)
+          });
+          const d = await res.json().catch(function () { return {}; });
+          if (res.ok && d.ok) {
+            nameEl.value = '';
+            document.getElementById('distClientNote').value = '';
+            if (d.distribution) renderDistribution(d.distribution, lastDefaultModel);
+            if (d.client) showShareBundle(d.client);
+          }
+        } finally {
+          btn.disabled = false;
+        }
+      });
+
+      document.getElementById('distCopyBundleBtn').addEventListener('click', function () {
+        if (!currentShareBundle) return;
+        copyTextWithFeedback(document.getElementById('distCopyBundleBtn'), currentShareBundle, '已复制接入包 ✓');
+      });
+      document.getElementById('distCopyKeyOnlyBtn').addEventListener('click', function () {
+        if (!currentShareKey) return;
+        copyTextWithFeedback(document.getElementById('distCopyKeyOnlyBtn'), currentShareKey, '已复制密钥 ✓');
+      });
+      document.getElementById('distCloseShareBtn').addEventListener('click', function () {
+        document.getElementById('distShareBox').hidden = true;
       });
 
       // Guide Modal & One-Click Copy

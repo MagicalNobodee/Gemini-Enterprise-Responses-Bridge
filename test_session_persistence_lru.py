@@ -541,3 +541,480 @@ def test_server_restart_hydrates_live_tabs_from_sqlite_archive(tmp_path: Path):
     assert post_restart_cmds[0]["reset_chat"] is False
     assert "RESTART_SEED_HISTORY" not in post_restart_cmds[0]["prompt"]
     assert "RESTART_DELTA_FOLLOWUP" in post_restart_cmds[0]["prompt"]
+
+
+def test_post_reboot_probe_prefers_standby_and_never_rehydrates_evicted_project(tmp_path: Path):
+    url_p1 = "https://vertexaisearch.cloud.google.com/u/0/app/cid1/r/session/vsid-proj-newer"
+    url_p2 = "https://vertexaisearch.cloud.google.com/u/0/app/cid1/r/session/vsid-proj-older"
+    url_orphan = "https://vertexaisearch.cloud.google.com/u/0/app/cid1/r/session/vsid-orphan-untracked"
+    url_probe = "https://vertexaisearch.cloud.google.com/u/0/app/cid1/r/session/vsid-probe-run"
+
+    now_ts = time.time()
+    app_seed = create_app(_make_settings(tmp_path, max_parallel_tabs=3))
+    archive = app_seed.state.context_builder._archive
+    archive.upsert(
+        session_url=url_p1,
+        turns=[("user", "构建前端控制台"), ("assistant", "完成")],
+        explicit_session_id="codex-proj-1",
+        session_title="构建前端控制台",
+        active_model="4-carbon",
+        updated_at=now_ts - 600.0,
+    )
+    archive.upsert(
+        session_url=url_p2,
+        turns=[("user", "优化网络同步模块"), ("assistant", "完成")],
+        explicit_session_id="codex-proj-2",
+        session_title="优化网络同步模块",
+        active_model="4-carbon",
+        updated_at=now_ts - 7200.0,
+    )
+    app_seed.state.context_builder.close()
+
+    app_rb = create_app(_make_settings(tmp_path, max_parallel_tabs=3, auto_spawn_tabs=False))
+    probe_cmds = []
+    with TestClient(app_rb) as client, client.websocket_connect("/ws/browser?client_id=ext-rb") as ws:
+        ws.receive_json()
+        ws.send_json({
+            "type": "tab_status",
+            "capabilities": ["multi_tab", "reset_tab", "open_session"],
+            "max_parallel_tabs": 3,
+            "tabs": [
+                {"tab_id": 401, "tab_url": url_p1, "ready": True},
+                {"tab_id": 402, "tab_url": url_p2, "ready": True},
+                {"tab_id": 403, "tab_url": url_orphan, "ready": True},
+            ],
+            "ready": True,
+        })
+        ws.receive_json()
+
+        for idx in (1, 2):
+            def w_probe():
+                cmd = _recv_next_meaningful(ws)
+                probe_cmds.append(cmd)
+                ws.send_json({
+                    "type": "request_complete",
+                    "request_id": cmd["request_id"],
+                    "tab_id": cmd["tab_id"],
+                    "tab_url": url_probe,
+                    "reply": f"连接正常-{idx}",
+                })
+            tp = threading.Thread(target=w_probe, daemon=True)
+            tp.start()
+            res = client.post(
+                "/v1/chat/completions",
+                headers={"X-Bridge-Probe": "1"},
+                json={"model": "gemini-4-carbon", "stream": False, "messages": [{"role": "user", "content": "你好，这是一次连通性体检"}]},
+            )
+            tp.join(timeout=3)
+            assert res.status_code == 200
+
+        assert [c["tab_id"] for c in probe_cmds] == [403, 403]
+        mon = {s["tab_id"]: s for s in client.get("/api/status").json()["context_monitor"]["slots"]}
+        assert mon[401]["pinned_session_id"] == "codex-proj-1"
+        assert mon[402]["pinned_session_id"] == "codex-proj-2"
+        assert mon[403]["pinned_session_id"] is None and mon[403]["ephemeral_probe"] is True
+        assert app_rb.state.context_builder._archive.get_by_vertex_session_id("vsid-probe-run") is None
+
+    app_full = create_app(_make_settings(tmp_path, max_parallel_tabs=2, auto_spawn_tabs=False))
+    mid_snap, evict_cmds = {}, []
+    with TestClient(app_full) as client2, client2.websocket_connect("/ws/browser?client_id=ext-full") as ws2:
+        ws2.receive_json()
+        ws2.send_json({
+            "type": "tab_status",
+            "capabilities": ["multi_tab", "reset_tab", "open_session"],
+            "max_parallel_tabs": 2,
+            "tabs": [
+                {"tab_id": 401, "tab_url": url_p1, "ready": True},
+                {"tab_id": 402, "tab_url": url_p2, "ready": True},
+            ],
+            "ready": True,
+        })
+        ws2.receive_json()
+
+        def w_evict():
+            cmd = _recv_next_meaningful(ws2)
+            evict_cmds.append(cmd)
+            mid_snap["data"] = client2.get("/api/status").json()
+            ws2.send_json({
+                "type": "request_complete",
+                "request_id": cmd["request_id"],
+                "tab_id": cmd["tab_id"],
+                "tab_url": url_probe,
+                "reply": "连接正常",
+            })
+        te = threading.Thread(target=w_evict, daemon=True)
+        te.start()
+        r_ev = client2.post(
+            "/v1/chat/completions",
+            headers={"X-Bridge-Probe": "1"},
+            json={"model": "gemini-4-carbon", "stream": True, "messages": [{"role": "user", "content": "你好，这是一次连通性体检"}]},
+        )
+        te.join(timeout=3)
+        assert r_ev.status_code == 200 and evict_cmds[0]["tab_id"] == 402
+        m402 = next(s for s in mid_snap["data"]["context_monitor"]["slots"] if s["tab_id"] == 402)
+        assert m402["pinned_session_id"] is None and m402["session_title"] == "一键模型连通体检"
+        f402 = next(s for s in client2.get("/api/status").json()["context_monitor"]["slots"] if s["tab_id"] == 402)
+        assert f402["pinned_session_id"] is None and f402["ephemeral_probe"] is True
+        saved_p2 = app_full.state.context_builder._archive.get_by_explicit_session_id("codex-proj-2")
+        assert saved_p2 is not None and saved_p2.vertex_session_id == "vsid-proj-older"
+
+
+def test_compaction_slot_auto_resets_only_after_resumed_session_starts_working(tmp_path: Path):
+    app = create_app(_make_settings(tmp_path, max_parallel_tabs=2, auto_spawn_tabs=False))
+    base_url = "https://vertexaisearch.cloud.google.com/u/0/app/cid-main"
+    url_501 = f"{base_url}/r/session/vsid-main-501"
+    url_502 = f"{base_url}/r/session/vsid-compact-502"
+    url_501_resumed = f"{base_url}/r/session/vsid-main-501-next"
+
+    def recv_cmd(ws):
+        msg = _recv_next_meaningful(ws)
+        while msg.get("type") in {"working_tabs", "sync_busy_tabs"}:
+            msg = _recv_next_meaningful(ws)
+        return msg
+
+    codex_compact_prompt = (
+        "You are performing a context checkpoint compaction. Create a handoff summary "
+        "for another LLM that will resume the task."
+    )
+    compact_summary = (
+        "## Goal\nImplement LAN multiplayer co-op sync for Sanctum of Ash.\n"
+        "## Next Step\nWire room host heartbeat and snapshot interpolation."
+    )
+    tools_spec = [{"type": "function", "function": {"name": "exec_command", "parameters": {"type": "object"}}}]
+
+    with TestClient(app) as client, client.websocket_connect("/ws/browser?client_id=ext-cmp") as ws:
+        ws.receive_json()
+        ws.send_json({
+            "type": "tab_status",
+            "capabilities": ["multi_tab", "reset_tab", "open_session"],
+            "max_parallel_tabs": 2,
+            "tabs": [
+                {"tab_id": 501, "tab_url": base_url, "ready": True},
+                {"tab_id": 502, "tab_url": base_url, "ready": True},
+            ],
+            "ready": True,
+        })
+        ws.receive_json()
+
+        # Step 1: Main coding session starts on Tab 501
+        def w_turn1():
+            cmd = recv_cmd(ws)
+            assert cmd["type"] == "execute_prompt" and cmd["tab_id"] == 501
+            ws.send_json({
+                "type": "request_complete",
+                "request_id": cmd["request_id"],
+                "tab_id": 501,
+                "tab_url": url_501,
+                "reply": "已初始化局域网联机模块架构。",
+            })
+
+        t1 = threading.Thread(target=w_turn1, daemon=True)
+        t1.start()
+        r1 = client.post(
+            "/v1/chat/completions",
+            headers={"X-Session-Id": "codex-lan-coop"},
+            json={
+                "model": "gemini-4-carbon",
+                "stream": False,
+                "tools": tools_spec,
+                "messages": [{"role": "user", "content": "实现局域网多人合作联机同步"}],
+            },
+        )
+        t1.join(timeout=3)
+        assert r1.status_code == 200
+
+        # Step 2: Inline Codex compaction runs on auxiliary Tab 502
+        mid_compact_status = {}
+
+        def w_compact():
+            cmd = recv_cmd(ws)
+            assert cmd["type"] == "execute_prompt" and cmd["tab_id"] == 502
+            mid_compact_status["data"] = client.get("/api/status").json()
+            ws.send_json({
+                "type": "stream_chunk",
+                "request_id": cmd["request_id"],
+                "tab_id": 502,
+                "delta": compact_summary,
+            })
+            ws.send_json({
+                "type": "request_complete",
+                "request_id": cmd["request_id"],
+                "tab_id": 502,
+                "tab_url": url_502,
+                "reply": compact_summary,
+            })
+
+        tc = threading.Thread(target=w_compact, daemon=True)
+        tc.start()
+        rc = client.post(
+            "/v1/chat/completions",
+            headers={"X-Session-Id": "codex-lan-coop"},
+            json={
+                "model": "gemini-4-carbon",
+                "stream": True,
+                "messages": [
+                    {"role": "user", "content": "实现局域网多人合作联机同步"},
+                    {"role": "assistant", "content": "已初始化局域网联机模块架构。"},
+                    {"role": "user", "content": codex_compact_prompt},
+                ],
+            },
+        )
+        tc.join(timeout=3)
+        assert rc.status_code == 200
+        mid_502 = next(s for s in mid_compact_status["data"]["context_monitor"]["slots"] if s["tab_id"] == 502)
+        assert mid_502["session_title"].startswith("自动整理记忆")
+        assert app.state.context_builder._archive.get_by_vertex_session_id("vsid-compact-502") is None
+        # Before resumed session starts working, Tab 502 is still tracked as pending handoff
+        assert app.state.context_builder.is_ephemeral_compaction_slot(mid_502["slot_key"]) is True
+
+        # Step 3: If the resumed session fails BEFORE submitting to Gemini, Tab 502 must NOT be prematurely reset
+        def w_fail_before_submit():
+            cmd = recv_cmd(ws)
+            assert cmd["type"] == "execute_prompt" and cmd["tab_id"] == 501
+            ws.send_json({
+                "type": "request_error",
+                "request_id": cmd["request_id"],
+                "tab_id": 501,
+                "submitted": False,
+                "error": "Transient network glitch before submit",
+            })
+
+        tf = threading.Thread(target=w_fail_before_submit, daemon=True)
+        tf.start()
+        rf = client.post(
+            "/v1/chat/completions",
+            headers={"X-Session-Id": "codex-lan-coop"},
+            json={
+                "model": "gemini-4-carbon",
+                "stream": True,
+                "tools": tools_spec,
+                "messages": [
+                    {"role": "user", "content": "实现局域网多人合作联机同步"},
+                    {"role": "user", "content": "Another language model started to solve this problem and produced a summary of its thinking process.\n" + compact_summary},
+                    {"role": "user", "content": "继续实现房间心跳与快照插值"},
+                ],
+            },
+        )
+        _ = rf.text
+        tf.join(timeout=3)
+        assert app.state.context_builder.is_ephemeral_compaction_slot(mid_502["slot_key"]) is True
+
+        # Step 4: Resumed session successfully starts working on Tab 501 -> Tab 502 auto-resets!
+        reset_events = []
+
+        def w_resume_ok():
+            cmd = recv_cmd(ws)
+            assert cmd["type"] == "execute_prompt" and cmd["tab_id"] == 501
+            ws.send_json({
+                "type": "request_progress",
+                "request_id": cmd["request_id"],
+                "tab_id": 501,
+                "submitted": True,
+                "generating": True,
+                "dom_len": 18,
+                "net_len": 18,
+            })
+            ws.send_json({
+                "type": "stream_chunk",
+                "request_id": cmd["request_id"],
+                "tab_id": 501,
+                "delta": "开始编写房间心跳逻辑...",
+            })
+            # Auto-reset for Tab 502 arrives as soon as Tab 501 starts working!
+            rst = recv_cmd(ws)
+            assert rst["type"] == "reset_tab" and rst["tab_id"] == 502
+            reset_events.append(rst)
+            ws.send_json({
+                "type": "reset_tab_result",
+                "reset_id": rst["reset_id"],
+                "tab_id": 502,
+                "ok": True,
+            })
+            ws.send_json({
+                "type": "request_complete",
+                "request_id": cmd["request_id"],
+                "tab_id": 501,
+                "tab_url": url_501_resumed,
+                "reply": "开始编写房间心跳逻辑...已完成。",
+            })
+
+        tr = threading.Thread(target=w_resume_ok, daemon=True)
+        tr.start()
+        rr = client.post(
+            "/v1/chat/completions",
+            headers={"X-Session-Id": "codex-lan-coop"},
+            json={
+                "model": "gemini-4-carbon",
+                "stream": True,
+                "tools": tools_spec,
+                "messages": [
+                    {"role": "user", "content": "实现局域网多人合作联机同步"},
+                    {"role": "user", "content": "Another language model started to solve this problem and produced a summary of its thinking process.\n" + compact_summary},
+                    {"role": "user", "content": "继续实现房间心跳与快照插值"},
+                ],
+            },
+        )
+        assert "开始编写房间心跳逻辑" in rr.text
+        tr.join(timeout=3)
+        assert len(reset_events) == 1 and reset_events[0]["tab_id"] == 502
+
+        final_snap = client.get("/api/status").json()
+        slots_by_tab = {s["tab_id"]: s for s in final_snap["context_monitor"]["slots"]}
+        hub_by_tab = {s["tab_id"]: s for s in final_snap["hub"]["worker_slots"]}
+        assert slots_by_tab[501]["pinned_session_id"] == "codex-lan-coop"
+        assert slots_by_tab[501]["turn_count"] >= 2
+        assert slots_by_tab[502]["turn_count"] == 0
+        assert slots_by_tab[502]["session_title"] == ""
+        assert slots_by_tab[502]["ephemeral_compaction"] is False
+        assert hub_by_tab[502]["pinned_session_id"] is None
+        assert "/r/session/" not in hub_by_tab[502]["tab_url"]
+
+
+def test_responses_compact_token_handoff_and_legacy_archive_cleanup(tmp_path: Path):
+    app = create_app(_make_settings(tmp_path, max_parallel_tabs=2, auto_spawn_tabs=False))
+    base_url = "https://vertexaisearch.cloud.google.com/u/0/app/cid-resp"
+    url_601 = f"{base_url}/r/session/vsid-resp-601"
+    url_602 = f"{base_url}/r/session/vsid-compact-602"
+    url_legacy_cmp = f"{base_url}/r/session/vsid-legacy-cmp-699"
+
+    def recv_cmd(ws):
+        msg = _recv_next_meaningful(ws)
+        while msg.get("type") in {"working_tabs", "sync_busy_tabs"}:
+            msg = _recv_next_meaningful(ws)
+        return msg
+
+    reset_tabs = []
+    with TestClient(app) as client, client.websocket_connect("/ws/browser?client_id=ext-rcmp") as ws:
+        ws.receive_json()
+        ws.send_json({
+            "type": "tab_status",
+            "capabilities": ["multi_tab", "reset_tab", "open_session"],
+            "max_parallel_tabs": 2,
+            "tabs": [
+                {"tab_id": 601, "tab_url": base_url, "ready": True},
+                {"tab_id": 602, "tab_url": base_url, "ready": True},
+            ],
+            "ready": True,
+        })
+        ws.receive_json()
+
+        # 1) Occupy Tab 601 with an active session so /v1/responses/compact picks Tab 602
+        def w_seed():
+            cmd = recv_cmd(ws)
+            assert cmd["tab_id"] == 601
+            ws.send_json({
+                "type": "request_complete",
+                "request_id": cmd["request_id"],
+                "tab_id": 601,
+                "tab_url": url_601,
+                "reply": "初始会话已在601就绪",
+            })
+
+        ts = threading.Thread(target=w_seed, daemon=True)
+        ts.start()
+        assert client.post(
+            "/v1/responses",
+            headers={"X-Session-Id": "resp-sess-1"},
+            json={"input": "启动项目构建", "stream": False},
+        ).status_code == 200
+        ts.join(timeout=3)
+
+        # 2) Run /v1/responses/compact -> executes on Tab 602
+        def w_rcmp():
+            cmd = recv_cmd(ws)
+            assert cmd["tab_id"] == 602
+            ws.send_json({
+                "type": "request_complete",
+                "request_id": cmd["request_id"],
+                "tab_id": 602,
+                "tab_url": url_602,
+                "reply": "Checkpoint summary: build scripts verified and artifacts staged.",
+            })
+
+        trc = threading.Thread(target=w_rcmp, daemon=True)
+        trc.start()
+        cmp_res = client.post("/v1/responses/compact", json={"input": "构建脚本校验记录"}).json()
+        trc.join(timeout=3)
+        assert cmp_res["object"] == "response.compaction"
+
+        # 3) Resume via /v1/responses on Tab 601 with compact['output'] -> auto-resets Tab 602!
+        def w_rnext():
+            cmd = recv_cmd(ws)
+            assert cmd["tab_id"] == 601
+            ws.send_json({
+                "type": "request_complete",
+                "request_id": cmd["request_id"],
+                "tab_id": 601,
+                "tab_url": url_601,
+                "reply": "已接管压缩记录并继续部署",
+            })
+            rst = recv_cmd(ws)
+            assert rst["type"] == "reset_tab" and rst["tab_id"] == 602
+            reset_tabs.append(rst["tab_id"])
+            ws.send_json({
+                "type": "reset_tab_result",
+                "reset_id": rst["reset_id"],
+                "tab_id": 602,
+                "ok": True,
+            })
+
+        trn = threading.Thread(target=w_rnext, daemon=True)
+        trn.start()
+        rn = client.post(
+            "/v1/responses",
+            headers={"X-Session-Id": "resp-sess-1"},
+            json={"input": cmp_res["output"] + [{"role": "user", "content": "继续部署"}], "stream": False},
+        )
+        trn.join(timeout=3)
+        assert rn.status_code == 200
+        time.sleep(0.05)
+        assert reset_tabs == [602]
+        s602 = next(s for s in client.get("/api/status").json()["context_monitor"]["slots"] if s["tab_id"] == 602)
+        assert s602["turn_count"] == 0 and s602["session_title"] == ""
+
+    # 4) Legacy archived compaction entry in SQLite is purged & auto-reset upon hydration + /api/status
+    app2 = create_app(_make_settings(tmp_path, max_parallel_tabs=2, auto_spawn_tabs=False))
+    app2.state.context_builder._archive.upsert(
+        session_url=url_legacy_cmp,
+        turns=[
+            ("user", "历史对话内容"),
+            ("user", "You are performing a context checkpoint compaction. Create a handoff summary for another LLM."),
+            ("assistant", "Legacy summary text"),
+        ],
+        session_title="遗留压缩快照",
+        active_model="gemini-4-carbon",
+        metrics={"turn_count": 3, "total_context_tokens": 1200, "updated_at": int(time.time()) - 120},
+        updated_at=time.time() - 120.0,
+    )
+    legacy_resets = []
+    with TestClient(app2) as client_leg, client_leg.websocket_connect("/ws/browser?client_id=ext-leg") as ws_leg:
+        ws_leg.receive_json()
+        ws_leg.send_json({
+            "type": "tab_status",
+            "capabilities": ["multi_tab", "reset_tab", "open_session"],
+            "max_parallel_tabs": 1,
+            "tabs": [{"tab_id": 699, "tab_url": url_legacy_cmp, "ready": True}],
+            "ready": True,
+        })
+        ws_leg.receive_json()
+
+        def w_leg_rst():
+            rst = recv_cmd(ws_leg)
+            assert rst["type"] == "reset_tab" and rst["tab_id"] == 699
+            legacy_resets.append(rst["tab_id"])
+            ws_leg.send_json({
+                "type": "reset_tab_result",
+                "reset_id": rst["reset_id"],
+                "tab_id": 699,
+                "ok": True,
+            })
+
+        tl = threading.Thread(target=w_leg_rst, daemon=True)
+        tl.start()
+        assert client_leg.get("/api/status").status_code == 200
+        tl.join(timeout=3)
+        time.sleep(0.05)
+        assert legacy_resets == [699]
+        assert app2.state.context_builder._archive.get_by_vertex_session_id("vsid-legacy-cmp-699") is None
+        s699 = client_leg.get("/api/status").json()["context_monitor"]["slots"][0]
+        assert s699["turn_count"] == 0 and s699["session_title"] == ""
