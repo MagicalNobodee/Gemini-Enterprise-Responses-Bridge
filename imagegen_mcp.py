@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from pathlib import Path
 import sys
 import urllib.error
@@ -11,8 +12,12 @@ import urllib.request
 import uuid
 
 from media_inputs import SUPPORTED_MIME_SPECS, decode_base64_payload, resolve_mime_and_name
+from platform_compat import reconfigure_stdio_utf8
 
-BASE_URL = "http://127.0.0.1:8000"
+BASE_URL = (
+    os.getenv("BRIDGE_BASE_URL", "").strip().rstrip("/")
+    or f"http://127.0.0.1:{os.getenv('BRIDGE_PORT', '8000').strip() or '8000'}"
+)
 
 TOOLS = [
     {
@@ -247,6 +252,7 @@ def handle(request: dict) -> dict:
 
 
 def main() -> None:
+    reconfigure_stdio_utf8(force_utf8=True)
     for line in sys.stdin:
         try:
             request = json.loads(line)

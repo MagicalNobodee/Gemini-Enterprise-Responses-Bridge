@@ -144,7 +144,11 @@ _TRUNCATION = re.compile(
     r"IMPORTANT: The file content has been truncated|output (?:has been |was )?truncated",
     re.IGNORECASE,
 )
-_READ_COMMAND = re.compile(r"^(?:cat|sed|head|tail|rg|wc)\b|^git\s+(?:diff|show|log|status)\b")
+_READ_COMMAND = re.compile(
+    r"^(?:(?:[^\s\\/]+[\\/])?(?:cat|sed|head|tail|rg|wc|type|dir|findstr|get-content|gc|get-childitem|gci|select-string|sls)(?:\.(?:exe|cmd|bat))?)\b"
+    r"|^git(?:\.exe)?\s+(?:diff|show|log|status)\b",
+    re.IGNORECASE,
+)
 
 
 def has_coding_tools(tools) -> bool:
@@ -203,10 +207,14 @@ def deduplicate_tool_text(text: str, call_id: str, seen: dict) -> str:
     """Reference exact repeated large text; keep the first complete result in history."""
     if len(text) < 4096 or not call_id:
         return text
-    header, delimiter, body = text.partition("\nOutput:\n")
+    m_delim = re.search(r"\r?\nOutput:\r?\n", text)
+    if m_delim:
+        header, delimiter, body = text[: m_delim.start()], m_delim.group(0), text[m_delim.end() :]
+    else:
+        header, delimiter, body = text, "", ""
     # Codex wraps stdout in volatile chunk/timing metadata. Preserve each new header.
     content = body if delimiter and header.startswith("Chunk ID:") else text
-    status = re.search(r"Process exited with code [^\n]+", header)
+    status = re.search(r"Process exited with code [^\r\n]+", header)
     digest = hashlib.sha256(((status.group() if status else "") + "\n" + content).encode()).hexdigest()
     previous_id = seen.get(digest)
     if previous_id and previous_id != call_id:

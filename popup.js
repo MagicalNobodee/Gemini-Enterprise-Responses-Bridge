@@ -25,6 +25,7 @@ const elCurTabTitle = document.getElementById("curTabTitle");
 const elCurTabBadge = document.getElementById("curTabBadge");
 const elCurTabDesc = document.getElementById("curTabDesc");
 const elToggleManualBtn = document.getElementById("toggleManualBtn");
+const elOpenManualTabBtn = document.getElementById("openManualTabBtn");
 const elAutoSpawn = document.getElementById("autoSpawnSelect");
 const elAutoSpawnCheck = document.getElementById("autoSpawnCheck");
 const elMaxTabs = document.getElementById("maxTabsSelect");
@@ -38,6 +39,89 @@ const elSendSel = document.getElementById("sendSelector");
 const elReplySel = document.getElementById("replySelector");
 const elDiagOut = document.getElementById("diagOutput");
 const elSaveToast = document.getElementById("saveToast");
+
+const POPUP_DEFAULT_VERTEX_HOME_URL =
+  "https://vertexaisearch.cloud.google.com/home/cid/f8a26a7c-0f51-4098-bf58-52506661472b?hl=en_US";
+
+function hasPopupVertexWorkspacePath(rawOrPath) {
+  return /\/(?:cid|app)\/[^/?#]+/i.test(String(rawOrPath || ""));
+}
+
+function normalizePopupVertexHomeUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== "string") return "";
+  try {
+    const u = new URL(rawUrl.trim());
+    if (!u.hostname.toLowerCase().endsWith("vertexaisearch.cloud.google.com")) {
+      return "";
+    }
+    const nextPath = (u.pathname || "")
+      .replace(/\/r\/session\/[^/?#]+.*$/i, "")
+      .replace(/\/session\/[^/?#]+.*$/i, "")
+      .replace(/\/c\/[^/?#]+.*$/i, "")
+      .replace(/\/+$/, "");
+    if (!nextPath) {
+      return "";
+    }
+    u.pathname = nextPath;
+    u.hash = "";
+    return u.toString();
+  } catch (_) {
+    return "";
+  }
+}
+
+async function resolvePopupVertexHomeUrl() {
+  let tabs = [];
+  try {
+    tabs = (await chrome.tabs.query({ url: "https://vertexaisearch.cloud.google.com/*" })) || [];
+  } catch (_) {}
+  const ordered = tabs.filter((t) => t && t.active).concat(tabs.filter((t) => t && !t.active));
+  for (const t of ordered) {
+    const clean = normalizePopupVertexHomeUrl(t.url || "");
+    if (clean && hasPopupVertexWorkspacePath(clean)) {
+      try {
+        await chrome.storage.local.set({ lastVertexHomeUrl: clean });
+      } catch (_) {}
+      return clean;
+    }
+  }
+  let storedClean = "";
+  try {
+    const data = await chrome.storage.local.get("lastVertexHomeUrl");
+    storedClean = normalizePopupVertexHomeUrl(data && data.lastVertexHomeUrl ? data.lastVertexHomeUrl : "");
+    if (storedClean && hasPopupVertexWorkspacePath(storedClean)) {
+      return storedClean;
+    }
+  } catch (_) {}
+  for (const t of ordered) {
+    const clean = normalizePopupVertexHomeUrl(t.url || "");
+    if (clean) return clean;
+  }
+  return storedClean || POPUP_DEFAULT_VERTEX_HOME_URL;
+}
+
+async function openCleanGeminiTab({ manual = true, active = true } = {}) {
+  const targetUrl = await resolvePopupVertexHomeUrl();
+  if (active) {
+    const res = await chrome.runtime.sendMessage({
+      type: "GEB_POPUP_OPEN_CLEAN_TAB",
+      manual,
+      url: targetUrl
+    });
+    if (res && res.handled) {
+      return res;
+    }
+  }
+  const created = await chrome.tabs.create({ url: targetUrl, active });
+  if (manual && created && created.id) {
+    await chrome.runtime.sendMessage({
+      type: "GEB_TOGGLE_TAB_MANUAL",
+      tabId: created.id,
+      manual: true
+    });
+  }
+  return { ok: true, tabId: created ? created.id : null, url: targetUrl };
+}
 
 let initialFormHydrated = false;
 let toastTimer = null;
@@ -110,8 +194,15 @@ function renderCurrentTabControl(focusedTab, settings, maxCap) {
   if (!elCurTabPanel || !elCurTabBadge || !elCurTabDesc || !elToggleManualBtn) {
     return;
   }
-  if (focusedTab && focusedTab.isVertex && focusedTab.id) {
+  const isUsableFocused = Boolean(
+    focusedTab &&
+    focusedTab.isVertex &&
+    focusedTab.id &&
+    (!focusedTab.url || normalizePopupVertexHomeUrl(focusedTab.url))
+  );
+  if (isUsableFocused) {
     const st = focusedTab.state || {};
+    if (elOpenManualTabBtn) elOpenManualTabBtn.hidden = false;
     if (elCurTabTitle) {
       elCurTabTitle.textContent = st.seatIndex
         ? `当前标签页（席位 #${st.seatIndex}）`
@@ -151,6 +242,7 @@ function renderCurrentTabControl(focusedTab, settings, maxCap) {
       elToggleManualBtn.className = "btn manual-toggle-btn to-manual";
     }
   } else {
+    if (elOpenManualTabBtn) elOpenManualTabBtn.hidden = true;
     if (elCurTabTitle) elCurTabTitle.textContent = "当前浏览标签页";
     elCurTabPanel.className = "cur-tab-panel";
     elCurTabBadge.textContent = "非 Gemini 页";
@@ -390,7 +482,7 @@ if (elToggleManualBtn) {
       elToggleManualBtn.disabled = true;
       try {
         if (act === "open_manual") {
-          await chrome.runtime.sendMessage({ type: "GEB_POPUP_OPEN_MANUAL_TAB" });
+          await openCleanGeminiTab({ manual: true, active: true });
           window.close();
           return;
         }
@@ -402,6 +494,20 @@ if (elToggleManualBtn) {
         }
       } finally {
         elToggleManualBtn.disabled = false;
+      }
+    })();
+  });
+}
+
+if (elOpenManualTabBtn) {
+  elOpenManualTabBtn.addEventListener("click", () => {
+    void (async () => {
+      elOpenManualTabBtn.disabled = true;
+      try {
+        await openCleanGeminiTab({ manual: true, active: true });
+        window.close();
+      } finally {
+        elOpenManualTabBtn.disabled = false;
       }
     })();
   });
@@ -470,7 +576,10 @@ if (spawnBtn) {
 
 if (elOpenVertexBtn) {
   elOpenVertexBtn.addEventListener("click", () => {
-    void chrome.tabs.create({ url: "https://vertexaisearch.cloud.google.com/" });
+    void (async () => {
+      await openCleanGeminiTab({ manual: false, active: true });
+      window.close();
+    })();
   });
 }
 
@@ -497,7 +606,21 @@ document.getElementById("clearLogsBtn").addEventListener("click", () => {
   })();
 });
 
-void loadState(true);
+const popupParams =
+  typeof window !== "undefined" && typeof URLSearchParams === "function"
+    ? new URLSearchParams(window.location?.search || "")
+    : null;
+if (popupParams && popupParams.get("geb_open_manual") === "1") {
+  void (async () => {
+    await openCleanGeminiTab({
+      manual: true,
+      active: popupParams.get("bg") !== "1"
+    });
+    window.close();
+  })();
+} else {
+  void loadState(true);
+}
 setInterval(() => {
   void loadState(false);
 }, 2500);

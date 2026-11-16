@@ -20,6 +20,7 @@ from agent_policy import (CARBON_AUTO_COMPACT_TOKENS, CARBON_CONTEXT_WINDOW, CAR
                           has_coding_tools, reading_diagnostics, reading_reminder, deduplicate_tool_text,
                           upgrade_desktop_agent_instructions)
 from codex_activity import lookup_codex_thread_activity, resolve_slot_activity
+from platform_compat import configure_sqlite_connection, sqlite_file_uri
 from tool_calling import (
     build_response_format_instructions,
     build_tool_delta_reminder,
@@ -261,16 +262,26 @@ def lookup_codex_thread_title(
     try:
         db_path = root / "state_5.sqlite"
         if db_path.is_file():
-            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.05)
+            con = sqlite3.connect(sqlite_file_uri(db_path, "ro"), uri=True, timeout=0.05)
             try:
-                row = con.execute(
-                    "SELECT name, title FROM threads WHERE id = ? LIMIT 1",
-                    (sid,),
-                ).fetchone()
+                try:
+                    row = con.execute(
+                        "SELECT name, title, agent_nickname, thread_source FROM threads WHERE id = ? LIMIT 1",
+                        (sid,),
+                    ).fetchone()
+                except sqlite3.OperationalError:
+                    row = con.execute(
+                        "SELECT name, title, '', '' FROM threads WHERE id = ? LIMIT 1",
+                        (sid,),
+                    ).fetchone()
                 if row:
                     short_name = str(row[0] or "").strip()
                     raw_first = str(row[1] or "").strip()
+                    nickname = str(row[2] or "").strip()
+                    thread_source = str(row[3] or "").strip()
                     resolved = short_name or clean_prompt_to_title(raw_first)
+                    if thread_source == "subagent" and nickname:
+                        resolved = f"子代理 {nickname} · {resolved}" if resolved else f"子代理 {nickname}"
             finally:
                 con.close()
     except Exception:
@@ -423,6 +434,7 @@ class SessionArchiveStore:
             p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             db_target = str(p)
         self._db = sqlite3.connect(db_target, check_same_thread=False)
+        configure_sqlite_connection(self._db, is_memory=(db_target == ":memory:"))
         if db_target != ":memory:":
             try:
                 Path(db_target).chmod(0o600)
@@ -665,6 +677,14 @@ class SessionArchiveStore:
         with self._lock, self._db:
             self._db.execute("DELETE FROM session_archive WHERE vertex_session_id = ?", (vertex_session_id,))
 
+    def delete_by_tenant_id(self, tenant_id: str) -> int:
+        eff_tid = (tenant_id or "").strip()
+        if not eff_tid:
+            return 0
+        with self._lock, self._db:
+            cur = self._db.execute("DELETE FROM session_archive WHERE tenant_id = ?", (eff_tid,))
+            return int(cur.rowcount or 0)
+
     def close(self) -> None:
         with self._lock:
             self._db.close()
@@ -842,6 +862,14 @@ class ConversationContextBuilder:
 
     def is_ephemeral_compaction_slot(self, session_key: str) -> bool:
         return session_key in self._pending_compactions
+
+    def has_pending_recovery(self, session_key: str) -> bool:
+        return session_key in self._session_recovery
+
+    def has_compaction_summary(self, messages: Sequence[ChatMessage]) -> bool:
+        _, dialogue = self._normalize_messages(messages)
+        inline_cnt, _ = _extract_compaction_summary_info(dialogue)
+        return inline_cnt > 0
 
     def delete_archived_by_vertex_session_id(self, vertex_session_id: str) -> None:
         if vertex_session_id:
@@ -1253,6 +1281,127 @@ class ConversationContextBuilder:
         if session_key and cleaned:
             self._session_titles[session_key] = cleaned
 
+    def get_session_title(self, session_key: str) -> str:
+        return str(self._session_titles.get(session_key) or (self._session_metrics.get(session_key) or {}).get("session_title") or "")
+
+    def purge_tenant_sessions(self, tenant_id: str, *, include_archive: bool = False) -> Dict[str, int]:
+        eff_tid = (tenant_id or "").strip()
+        if not eff_tid:
+            return {"cleared_slots": 0, "deleted_archives": 0}
+        cleared = 0
+        for skey, stid in list(self._session_tenants.items()):
+            if stid == eff_tid:
+                if include_archive:
+                    self.invalidate_session(skey)
+                else:
+                    self.evict_slot_to_archive(skey)
+                cleared += 1
+        deleted_arch = self._archive.delete_by_tenant_id(eff_tid) if include_archive else 0
+        return {"cleared_slots": cleared, "deleted_archives": deleted_arch}
+
+    def list_sessions_overview(
+        self,
+        worker_slots: Optional[Sequence[Dict[str, Any]]] = None,
+        *,
+        tenant_label_fn: Optional[Any] = None,
+        limit: int = 120,
+    ) -> List[Dict[str, Any]]:
+        ctx_snap = self.get_context_snapshot(worker_slots or [])
+        items: List[Dict[str, Any]] = []
+        live_vsids: set[str] = set()
+        live_sids: set[str] = set()
+
+        def _clean_sid(raw_sid: Optional[str], tid: str) -> str:
+            s = str(raw_sid or "").strip()
+            if not s:
+                return ""
+            prefix = f"{tid}::"
+            return s[len(prefix):] if s.startswith(prefix) else s
+
+        for slot in ctx_snap.get("slots") or []:
+            if not isinstance(slot, dict):
+                continue
+            if bool(slot.get("ephemeral_probe")) or bool(slot.get("ephemeral_compaction")):
+                continue
+            skey = str(slot.get("slot_key") or "")
+            t_cnt = int(slot.get("turn_count") or 0)
+            raw_sid = str(slot.get("pinned_session_id") or self._session_explicit_ids.get(skey) or "")
+            busy = bool(slot.get("busy")) or bool(slot.get("session_active")) or int(slot.get("waiting_count") or 0) > 0
+            if t_cnt <= 0 and not raw_sid and not busy and not slot.get("session_title"):
+                continue
+            tid = str(slot.get("tenant_id") or "host")
+            tname = tenant_label_fn(tid) if callable(tenant_label_fn) else ("本机直连" if tid == "host" else tid)
+            s_url = self._session_urls.get(skey, "")
+            vsid = extract_vertex_session_id(s_url)
+            if vsid:
+                live_vsids.add(vsid)
+            if raw_sid:
+                live_sids.add(raw_sid)
+            items.append({
+                "session_ref": f"slot:{skey}",
+                "source": "live",
+                "state": "working" if busy else "mounted",
+                "slot_key": skey,
+                "tab_id": slot.get("tab_id"),
+                "archive_key": "",
+                "tenant_id": tid,
+                "tenant_name": tname,
+                "session_id": _clean_sid(raw_sid, tid),
+                "session_title": str(slot.get("session_title") or "未命名活跃对话"),
+                "active_model": str(slot.get("active_model") or ""),
+                "turn_count": t_cnt,
+                "user_turns": int(slot.get("user_turns") or 0),
+                "compaction_count": int(slot.get("compaction_count") or 0),
+                "total_context_tokens": int(slot.get("total_context_tokens") or 0),
+                "compact_pct": float(slot.get("compact_pct") or 0.0),
+                "busy": busy,
+                "activity_label": str(slot.get("activity_label") or ("工作中" if busy else "在线挂载")),
+                "updated_at": int(slot.get("updated_at") or 0),
+            })
+
+        for rec in self._archive.list_recent(limit=max(20, int(limit))):
+            if rec.session_title == "一键模型连通体检" or is_completed_compaction_turns(rec.turns):
+                continue
+            if rec.vertex_session_id and rec.vertex_session_id in live_vsids:
+                continue
+            if rec.explicit_session_id and rec.explicit_session_id in live_sids:
+                continue
+            tid = str(rec.tenant_id or "host")
+            tname = tenant_label_fn(tid) if callable(tenant_label_fn) else ("本机直连" if tid == "host" else tid)
+            meta = rec.metrics or {}
+            t_tok = int(meta.get("total_context_tokens") or 0)
+            c_tok = int(meta.get("compact_threshold_tokens") or CARBON_AUTO_COMPACT_TOKENS)
+            items.append({
+                "session_ref": f"archive:{rec.archive_key}",
+                "source": "archived",
+                "state": "archived",
+                "slot_key": "",
+                "tab_id": None,
+                "archive_key": rec.archive_key,
+                "tenant_id": tid,
+                "tenant_name": tname,
+                "session_id": _clean_sid(rec.explicit_session_id, tid),
+                "session_title": str(rec.session_title or (extract_dialogue_title(rec.turns) or "历史归档会话")),
+                "active_model": str(rec.active_model or meta.get("active_model") or ""),
+                "turn_count": len(rec.turns),
+                "user_turns": sum(1 for r, _ in rec.turns if r == "user"),
+                "compaction_count": int(meta.get("compaction_count") or 0),
+                "total_context_tokens": t_tok,
+                "compact_pct": round(min(100.0, (t_tok / max(c_tok, 1)) * 100.0), 1),
+                "busy": False,
+                "activity_label": "已归档 · 续聊自动唤醒",
+                "updated_at": int(rec.updated_at or 0),
+            })
+
+        items.sort(
+            key=lambda x: (
+                2 if x["state"] == "working" else (1 if x["state"] == "mounted" else 0),
+                int(x.get("updated_at") or 0),
+            ),
+            reverse=True,
+        )
+        return items[:max(1, int(limit))]
+
     def _record_dialogue_title(self, session_key: str, dialogue: Sequence[Tuple[str, str]]) -> None:
         extracted = extract_dialogue_title(dialogue)
         if extracted:
@@ -1483,10 +1632,10 @@ class ConversationContextBuilder:
                 common_prefix_len += 1
             min_len = min(len(c_prev), len(c_cur))
             if min_len > 0 and common_prefix_len >= int(min_len * 0.65):
-                prev_paras = {p.strip() for p in prev_sys_fp.split("\n\n") if p.strip()}
+                prev_paras = {p.strip() for p in re.split(r"\r?\n\r?\n", prev_sys_fp) if p.strip()}
                 new_paras = [
                     p.strip()
-                    for p in cur_sys_text.split("\n\n")
+                    for p in re.split(r"\r?\n\r?\n", cur_sys_text)
                     if p.strip() and p.strip() not in prev_paras
                 ]
                 delta_sys = "\n\n".join(new_paras).strip()

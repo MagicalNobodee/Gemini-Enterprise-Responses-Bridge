@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import shutil
 import subprocess
 import time
 from typing import Any, AsyncIterator, Dict, List, Optional, Sequence
@@ -12,6 +11,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Sequence
 import httpx
 
 from config import BridgeSettings
+from platform_compat import find_executable, subprocess_hidden_kwargs
 from schemas import ChatMessage
 from tool_calling import (
     build_response_format_instructions,
@@ -19,6 +19,14 @@ from tool_calling import (
     build_tool_system_instructions,
     format_assistant_history_entry,
     format_tool_result_entry,
+)
+
+
+_WINDOWS_GCLOUD_PATHS = (
+    r"%LOCALAPPDATA%\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd",
+    r"%ProgramFiles(x86)%\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd",
+    r"%ProgramFiles%\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd",
+    r"%USERPROFILE%\scoop\shims\gcloud.cmd",
 )
 
 
@@ -42,7 +50,11 @@ class GCloudVertexProvider:
         if self._cached_token and now < self._token_expires_at:
             return self._cached_token
 
-        gcloud_bin = shutil.which(self.settings.gcloud_binary) or shutil.which("gcloud.cmd")
+        gcloud_bin = find_executable(
+            self.settings.gcloud_binary,
+            posix_candidates=("/opt/homebrew/bin/gcloud", "/usr/local/bin/gcloud", "/usr/bin/gcloud"),
+            windows_candidates=_WINDOWS_GCLOUD_PATHS,
+        )
         if not gcloud_bin:
             raise GCloudUpstreamError(
                 "未找到 gcloud CLI，请先安装 Google Cloud SDK 并执行 `gcloud auth application-default login`。"
@@ -71,6 +83,7 @@ class GCloudVertexProvider:
                     errors="replace",
                     timeout=15,
                     check=False,
+                    **subprocess_hidden_kwargs(),
                 )
                 if proc.returncode == 0 and proc.stdout.strip():
                     return proc.stdout.strip().splitlines()[-1].strip()

@@ -9,6 +9,8 @@ import zlib
 from pathlib import Path
 from typing import Tuple
 
+from platform_compat import reconfigure_stdio_utf8
+
 
 def _make_png_chunk(chunk_type: bytes, data: bytes) -> bytes:
     crc = zlib.crc32(chunk_type + data) & 0xFFFFFFFF
@@ -121,5 +123,6 @@ def export_extension_bundle(root_dir: Path | None = None) -> Path:
 
 
 if __name__ == "__main__":
+    reconfigure_stdio_utf8()
     target = export_extension_bundle()
     print(f"Exported Chrome/Edge MV3 extension bundle to: {target}")

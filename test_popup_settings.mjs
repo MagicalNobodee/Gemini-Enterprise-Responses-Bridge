@@ -24,6 +24,8 @@ const openTabs = [
   { id: 13, url: 'https://vertexaisearch.cloud.google.com/u/1/home', title: 'Tab 3', status: 'complete' }
 ];
 const sentTabMsgs = [];
+const createdTabs = [];
+let onMessageListener = null;
 const eventStub = () => ({ addListener() {}, removeListener() {} });
 const bgChrome = {
   storage: {
@@ -43,10 +45,21 @@ const bgChrome = {
   },
   action: { setBadgeText: async () => {}, setBadgeBackgroundColor: async () => {} },
   alarms: { create: async () => {}, onAlarm: eventStub() },
-  runtime: { onInstalled: eventStub(), onStartup: eventStub(), onMessage: eventStub(), onConnect: eventStub() },
+  runtime: {
+    onInstalled: eventStub(),
+    onStartup: eventStub(),
+    onMessage: { addListener: (fn) => { onMessageListener = fn; }, removeListener() {} },
+    onConnect: eventStub()
+  },
   tabs: {
     query: async () => openTabs,
     get: async (id) => openTabs.find((t) => t.id === id),
+    create: async (opts) => {
+      const created = { id: 200 + createdTabs.length, url: opts.url, active: Boolean(opts.active), status: 'complete' };
+      createdTabs.push(created);
+      openTabs.push(created);
+      return created;
+    },
     update: async () => {},
     sendMessage: async (tabId, msg) => { sentTabMsgs.push({ tabId, msg }); return { ok: true }; },
     onUpdated: eventStub(),
@@ -95,6 +108,50 @@ assert.deepEqual(cls.managedTabs.map((t) => t.id), [11, 13]);
 // 4) Restore tab #99 back to Bridge -> manualSessionKeys cleared
 await bgCtx.setTabManualState(99, false);
 assert.ok(!store.manualSessionKeys.includes('session:sess-own'));
+
+// 5) Opening a manual tab when existing tab is ALREADY a clean /home/cid/... URL (no /r/session/) or alongside a 404 root tab
+const sendBgMsg = (msg) =>
+  new Promise((resolve) => {
+    onMessageListener(msg, {}, resolve);
+  });
+openTabs.length = 0;
+delete store.lastVertexHomeUrl;
+openTabs.push(
+  { id: 50, url: 'https://vertexaisearch.cloud.google.com/', title: 'Error 404 (Not Found)!!1', status: 'complete' },
+  { id: 51, url: 'https://vertexaisearch.cloud.google.com/u/1/home/cid/f8a26a7c-0f51-4098-bf58-52506661472b?hl=en_US', title: 'Gemini Enterprise', status: 'complete' }
+);
+cls = await bgCtx.classifyAllVertexTabs();
+assert.deepEqual(cls.allTabs.map((t) => t.id), [51], 'Bare 404 root URL must not be admitted');
+const manualOpenRes = await sendBgMsg({ type: 'GEB_POPUP_OPEN_MANUAL_TAB' });
+assert.equal(manualOpenRes.ok, true);
+assert.equal(
+  manualOpenRes.url,
+  'https://vertexaisearch.cloud.google.com/u/1/home/cid/f8a26a7c-0f51-4098-bf58-52506661472b?hl=en_US'
+);
+cls = await bgCtx.classifyAllVertexTabs();
+assert.equal(cls.perTabState.get(manualOpenRes.tabId).mode, 'manual');
+assert.equal(
+  store.lastVertexHomeUrl,
+  'https://vertexaisearch.cloud.google.com/u/1/home/cid/f8a26a7c-0f51-4098-bf58-52506661472b?hl=en_US'
+);
+
+// 6) Even when all Gemini tabs are closed, remembered workspace URL prevents 404
+openTabs.length = 0;
+const closedManualRes = await sendBgMsg({ type: 'GEB_POPUP_OPEN_MANUAL_TAB' });
+assert.equal(
+  closedManualRes.url,
+  'https://vertexaisearch.cloud.google.com/u/1/home/cid/f8a26a7c-0f51-4098-bf58-52506661472b?hl=en_US'
+);
+
+// 7) Fresh install with zero history falls back to clean workspace cid entry instead of bare 404 root
+openTabs.length = 0;
+delete store.lastVertexHomeUrl;
+const freshRes = await sendBgMsg({ type: 'GEB_POPUP_OPEN_VERTEX_TAB' });
+assert.equal(
+  freshRes.url,
+  'https://vertexaisearch.cloud.google.com/home/cid/f8a26a7c-0f51-4098-bf58-52506661472b?hl=en_US'
+);
+
 bgCtx.clearReconnectTimer();
 bgCtx.clearHeartbeatInterval();
 console.log('PASS: default pool cap, manual tab/session exclusion, overflow promotion, and state broadcast');

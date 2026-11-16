@@ -39,6 +39,10 @@
 - **多模态附件与产物持久化 (`media_inputs.py` / `media_outputs.py`)**：支持常见图片（PNG/JPEG/WebP/GIF/HEIC/SVG/AVIF 等）、PDF/文档与音视频输入上传，自动捕获并落盘网页生成的原图、视频与导出文件；内置零第三方依赖的 stdio MCP 工具 `imagegen_mcp.py`（`generate_image`）。
 - **可视化控制台与等价成本记账 (`dashboard_html.py` / `usage_ledger.py`)**：访问 `http://127.0.0.1:8000/` 即可查看实时工作池水位、单席位重置、一键模型连通性测试，以及按日/模型/任务类型统计上下文缓存节省额与 USD/CNY 官方 API 等价费用的本地记账台。
 
+### 7. 公网安全分发、多租户隔离与全栈跨平台兼容 (`distribution.py` / `tunnel_manager.py` / `platform_compat.py`)
+- **多客户端专属密钥与租户隔离**：支持签发 `sk-geb-...` 外部客户端密钥，隔离会话历史、文件空间与用量账本，支持主机保底席位预留、并发/频率/日预算配额管控、到期时间及模型/网段白名单。
+- **内置免费公网隧道与跨平台运行**：控制台内置 Cloudflare 免费加密隧道一键启停与外部连通自检（公网/反代流量自动拦截免密访问并锁定管理面仅本机可用）；完整兼容 macOS、Linux 与 Windows 10/11（含 `start.ps1`、`start.bat`、`stop.bat` 后台静默守护及开机自启）。
+
 ---
 
 ## 系统架构
@@ -70,8 +74,17 @@ cp -n env.example .env
 **Windows（PowerShell 一键初始化并启动）：**
 
 ```powershell
+# 前台启动（首次自动创建独立环境并安装依赖）：双击 start.bat 或运行
 .\start.ps1
-# 或直接双击 start.bat
+
+# 后台静默启动 / 安全停止 / 查看状态（自动检查在途请求，避免中断活跃任务）
+.\start.ps1 -Background
+.\start.ps1 -Stop
+.\start.ps1 -Status
+
+# 设置或移除 Windows 登录自动后台启动
+.\start.ps1 -InstallStartup -Background
+.\start.ps1 -UninstallStartup
 ```
 
 服务启动时会自动在项目下导出完整的 `extension/`（含 `16/48/128` 图标）与 `userscript/` 目录，并监听 `http://127.0.0.1:8000`。
@@ -97,6 +110,9 @@ cp -n env.example .env
 
 # 确认无误后备份并写入配置
 ./.venv/bin/python configure_codex_context.py --apply --backup-dir ./codex-config-backup
+
+# Windows 一键生成/同步当前系统的 ~/.codex/gemini-bridge.config.toml 专用配置
+.\start.ps1 -EnsureCodexProfile
 ```
 
 #### 接入通用 OpenAI 兼容客户端（Cursor / Cline / ChatBox / SDK）
@@ -140,6 +156,7 @@ for event in response:
 | `GET /api/usage` | 按今日 / 本会话 / 累计 / 模型 / 任务分类查询本地 Token 与等价费用账本 |
 | `POST /api/slots/reset` | 重置指定空闲工作席位为全新网页对话 |
 | `POST /api/extension/reload` | 在空闲状态下通知已连接的浏览器扩展执行热重载 |
+| `GET / POST /api/distribution/*`、`/*/tunnel/*` | 仅本机直连可用的多客户端密钥签发、配额管理、会话总控与公网隧道启停接口 |
 | `POST /v1/responses` | OpenAI Responses 协议主入口（支持流式 SSE、工具循环、多模态与 `previous_response_id`） |
 | `POST /v1/responses/input_tokens` | Responses 输入 Token 预算估算 |
 | `POST /v1/responses/compact` | Responses 长对话上下文检查点浓缩 |
@@ -184,6 +201,9 @@ for event in response:
 ├── media_inputs.py / media_outputs.py# 多模态附件校验、FileStore 存储与网页生成产物持久化
 ├── image_inputs.py / image_outputs.py# 图像输入预处理与生成图片提取辅助
 ├── imagegen_mcp.py                   # 面向 Codex 的零依赖 stdio MCP 图像生成/编辑工具
+├── distribution.py                   # 多客户端密钥鉴权、租户隔离、席位配额与调用流水管控
+├── tunnel_manager.py                 # Cloudflare 公网加密隧道生命周期管理与安全自检
+├── platform_compat.py                # macOS / Linux / Windows 跨平台编码、路径与进程兼容层
 ├── usage_ledger.py                   # 本地 Token、缓存节省额与官方 API 等价费用记账模块
 ├── dashboard_html.py                 # http://127.0.0.1:8000/ 可视化控制台与记账前端
 ├── configure_codex_context.py        # 本地 Codex 模型目录（codex-models.json）与配置同步脚本
@@ -193,6 +213,7 @@ for event in response:
 ├── content-bridge.js                 # ISOLATED 世界安全中继与网页右下角闭合 Shadow DOM 状态胶囊
 ├── page-driver.js                    # MAIN 世界驱动（原生流解析、主响应流锁、深层 Shadow DOM 操控）
 ├── popup.html / popup.css / popup.js # 扩展可视化状态弹窗与当前标签页免接管快捷控制
+├── start.ps1 / start.bat / stop.bat  # Windows 10/11 一键初始化、后台静默启停与开机自启脚本
 ├── extension/                        # 自动导出的 Chrome / Edge 未打包扩展目录
 ├── userscript/                       # 自动导出的 Tampermonkey 备选脚本目录
 └── test_*.py / test_*.mjs            # Python (Pytest) 与 Node.js 全链路回归测试套件

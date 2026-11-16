@@ -1,6 +1,7 @@
 """Regression checks for file fidelity, continuation, and Carbon-only configuration."""
 import copy
 import json
+import os
 import tomllib
 
 from agent_policy import (
@@ -180,7 +181,11 @@ def test_ccswitch_sync_preserves_other_presets_and_credentials(tmp_path):
         rows = {key: json.loads(raw) for key, raw in conn.execute('SELECT id,settings_config FROM providers')}
     assert rows['other'] == other and rows['local']['auth'] == local['auth']
     assert tomllib.loads(rows['local']['config'])['model_auto_compact_token_limit'] == CARBON_AUTO_COMPACT_TOKENS
-    assert (backup / 'cc-switch.db').stat().st_mode & 0o777 == 0o600
+    backup_mode = (backup / 'cc-switch.db').stat().st_mode & 0o777
+    if os.name == 'nt':
+        assert (backup_mode & 0o600) == 0o600
+    else:
+        assert backup_mode == 0o600
     assert update_ccswitch(database, False, None) == []
 
 

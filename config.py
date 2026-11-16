@@ -2,25 +2,38 @@
 
 from __future__ import annotations
 
+import io
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
 
 
+def _read_dotenv_text(dotenv_path: Path) -> str:
+    """Decode .env resiliently across UTF-8, UTF-8 with BOM (Notepad/PS5.1), and GBK/GB18030."""
+    raw_bytes = dotenv_path.read_bytes()
+    for enc in ("utf-8-sig", "gb18030"):
+        try:
+            return raw_bytes.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw_bytes.decode("utf-8", errors="replace").lstrip("\ufeff")
+
+
 def _load_dotenv_file(dotenv_path: Path) -> None:
     """Load key=value pairs from .env without failing if python-dotenv is absent."""
     if not dotenv_path.is_file():
         return
+    text = _read_dotenv_text(dotenv_path)
     try:
         from dotenv import load_dotenv  # type: ignore
 
-        load_dotenv(dotenv_path=dotenv_path, override=False)
+        load_dotenv(stream=io.StringIO(text), override=False)
         return
     except ImportError:
         pass
 
-    for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+    for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -83,6 +96,7 @@ class BridgeSettings:
     session_archive_path: str = ""
     usage_ledger_path: str = ""
     distribution_path: str = ""
+    tunnel_state_path: str = ""
     host_reserved_slots: int = 2
     usd_to_cny_rate: float = 6.8
     price_overrides_json: str = ""
@@ -131,6 +145,7 @@ class BridgeSettings:
             include_citations=_env_bool("BRIDGE_INCLUDE_CITATIONS", True),
             cors_allow_origins=origins,
             auto_export_extension=_env_bool("BRIDGE_AUTO_EXPORT_EXTENSION", True),
+            generated_dir=os.getenv("BRIDGE_GENERATED_DIR", "").strip(),
             response_store_dir=os.getenv(
                 "BRIDGE_RESPONSE_STORE_DIR", str(root / ".cache" / "response_store")
             ).strip(),
@@ -145,6 +160,9 @@ class BridgeSettings:
             ).strip(),
             distribution_path=os.getenv(
                 "BRIDGE_DISTRIBUTION_PATH", str(root / ".cache" / "distribution.json")
+            ).strip(),
+            tunnel_state_path=os.getenv(
+                "BRIDGE_TUNNEL_STATE_PATH", ""
             ).strip(),
             host_reserved_slots=max(0, _env_int("BRIDGE_HOST_RESERVED_SLOTS", 2)),
             usd_to_cny_rate=_env_float("BRIDGE_USD_TO_CNY_RATE", 6.8),

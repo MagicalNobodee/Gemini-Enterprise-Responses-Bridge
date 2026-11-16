@@ -1374,6 +1374,171 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       gap: 6px;
       flex-wrap: wrap;
     }
+    .console-nav {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+      padding: 10px 14px;
+      background: #ffffff;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      box-shadow: var(--shadow-xs);
+    }
+    .console-nav-links {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .nav-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--surface-soft);
+      color: var(--text-sub);
+      font-size: 0.79rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.16s ease;
+    }
+    .nav-pill:hover {
+      border-color: #93c5fd;
+      background: #eff6ff;
+      color: var(--primary);
+    }
+    .tunnel-banner {
+      margin-top: 12px;
+      padding: 16px 18px;
+      border-radius: var(--radius-lg);
+      background: linear-gradient(135deg, #f0f9ff 0%, #f0fdfa 100%);
+      border: 1px solid #bae6fd;
+    }
+    .tunnel-url-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 10px;
+      padding: 10px 14px;
+      border-radius: 12px;
+      background: #ffffff;
+      border: 1px solid #cbd5e1;
+    }
+    .tunnel-url-val {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.88rem;
+      font-weight: 700;
+      color: #0f172a;
+      word-break: break-all;
+    }
+    .tunnel-probe-box {
+      margin-top: 10px;
+      padding: 9px 12px;
+      border-radius: 10px;
+      font-size: 0.79rem;
+      background: rgba(255, 255, 255, 0.82);
+      border: 1px solid #e2e8f0;
+      color: var(--text-sub);
+    }
+    .tunnel-probe-box.ok { border-color: #a7f3d0; background: #ecfdf5; color: #065f46; }
+    .tunnel-probe-box.warn { border-color: #fde68a; background: #fffbeb; color: #92400e; }
+    .quota-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      min-width: 175px;
+    }
+    .quota-line {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      font-size: 0.74rem;
+    }
+    .quota-line-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      color: var(--text-sub);
+    }
+    .quota-bar-track {
+      height: 5px;
+      border-radius: 999px;
+      background: #e2e8f0;
+      overflow: hidden;
+    }
+    .quota-bar-fill {
+      height: 100%;
+      border-radius: 999px;
+      background: #2563eb;
+      transition: width 0.25s ease;
+    }
+    .quota-bar-fill.warn { background: #f59e0b; }
+    .quota-bar-fill.err { background: #ef4444; }
+    .audit-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin: 12px 0 10px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: var(--surface-soft);
+      border: 1px solid var(--border);
+    }
+    .audit-filters {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      flex: 1;
+    }
+    .preview-wrap {
+      max-width: 360px;
+      white-space: normal;
+      line-height: 1.42;
+      font-size: 0.77rem;
+    }
+    .preview-q {
+      color: var(--text);
+      font-weight: 600;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      word-break: break-word;
+    }
+    .preview-a {
+      color: var(--muted);
+      margin-top: 2px;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      word-break: break-word;
+    }
+    .modal-card.wide {
+      max-width: 680px;
+      max-height: 90vh;
+      overflow-y: auto;
+    }
+    .edit-grid-2 {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 11px;
+      margin-bottom: 12px;
+    }
+    @media (max-width: 600px) {
+      .edit-grid-2 { grid-template-columns: 1fr; }
+    }
+    .sec-icon.amber { background: #fffbeb; color: #d97706; }
 
     /* Modal */
     .modal-backdrop {
@@ -1441,7 +1606,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
         <div>
           <h1>Gemini Enterprise</h1>
-          <div class="brand-sub">本地网关控制台 · 默认 Carbon</div>
+          <div class="brand-sub">总台控制面板 · 公网网关 / 多密钥配额 / 会话与任务审计 · 默认 Carbon</div>
         </div>
       </div>
       <div class="topbar-actions">
@@ -1501,6 +1666,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
     </section>
+
+    <!-- Master Console Quick Navigation Bar -->
+    <nav class="console-nav" aria-label="总台功能快捷导航">
+      <div class="console-nav-links">
+        <button type="button" class="nav-pill" data-jump-sec="secDist">🌐 公网通道与 API 密钥总控</button>
+        <button type="button" class="nav-pill" data-jump-sec="secAudit">🗂 会话管理与任务调用记录</button>
+        <button type="button" class="nav-pill" data-jump-sec="secLedger">¥ 各密钥用量与费用账本</button>
+        <button type="button" class="nav-pill" data-jump-sec="secSeats">✦ 并行席位池</button>
+        <button type="button" class="nav-pill" data-jump-sec="secProbe">⚡ 连通体检</button>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+        <span class="chip" id="navTunnelChip">公网通道未开启</span>
+        <span class="chip" id="navLiveTasksChip">当前无在途任务</span>
+      </div>
+    </nav>
 
     <!-- Section 1: Parallel Seats & Memory Capacity -->
     <section class="fold-section" data-sec="seats" id="secSeats">
@@ -1679,6 +1859,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <button type="button" class="period-tab active" data-period="all">全部累计</button>
           </div>
           <div class="date-picker-wrap">
+            <span>统计对象:</span>
+            <select id="ledgerTenantSelect" class="clean-select" style="padding:4px 10px;font-size:0.78rem;min-width:165px;" aria-label="按 API 密钥筛选统计">
+              <option value="all">全部汇总（本机 + 所有外部密钥）</option>
+              <option value="host">本机直连</option>
+            </select>
             <span>按日历查某天:</span>
             <input type="date" id="datePickerInput" class="date-input" aria-label="按日期查看统计" />
             <select id="dayFilterSelect" hidden></select>
@@ -1768,6 +1953,34 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           </div>
         </div>
 
+        <div class="dist-card" style="margin-top:14px;">
+          <div class="dist-card-head" style="margin-bottom:8px;">
+            <div class="dist-card-title">
+              <span>各 API 密钥用量对比排行</span>
+              <span class="muted" style="font-weight:500;font-size:0.78rem;">点击右侧按钮可单独查看某把密钥的趋势图、模型明细与调用流水</span>
+            </div>
+            <button type="button" class="btn sm" id="ledgerResetTenantFilterBtn" hidden>返回全部汇总</button>
+          </div>
+          <div class="table-scroll">
+            <table class="clean-table" id="ledgerTenantTable">
+              <thead>
+                <tr>
+                  <th>调用方 / API 密钥</th>
+                  <th class="num">成功调用</th>
+                  <th class="num">拦截/报错</th>
+                  <th class="num">累计 Token</th>
+                  <th>输入 / 输出 / 缓存</th>
+                  <th class="num">等效花费</th>
+                  <th>快捷筛选</th>
+                </tr>
+              </thead>
+              <tbody id="ledgerTenantBody">
+                <tr><td colspan="7" class="muted">暂无分密钥用量记录</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
         <details class="sub-panel">
           <summary>查看分模型统计、按日汇总与最近调用流水</summary>
           <div class="sub-table-title">按模型汇总</div>
@@ -1837,8 +2050,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="fold-title-wrap">
           <span class="sec-icon teal">⇄</span>
           <div>
-            <h2 class="fold-title">公网分发与多客分流</h2>
-            <div class="fold-subtitle">对方无需安装任何插件，填入地址与专属密钥即可使用 · 自动隔离会话并为本机预留专属席位</div>
+            <h2 class="fold-title">公网通道与 API 密钥总控中心</h2>
+            <div class="fold-subtitle">零成本开启公网穿透 · 独立管控每把密钥的并发、次数、预算、有效期、模型与 IP 权限</div>
           </div>
         </div>
         <div class="fold-right">
@@ -1847,6 +2060,46 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
       <div class="fold-body">
+        <div class="tunnel-banner" id="tunnelBanner">
+          <div class="dist-card-head" style="margin-bottom:6px;">
+            <div class="dist-card-title">
+              <span>🌐 免费公网穿透通道（Cloudflare 加密隧道）</span>
+              <span class="chip" id="tunnelStatusChip">检测中</span>
+              <span class="muted" style="font-weight:500;font-size:0.78rem;" id="tunnelSubHint">免注册免域名，一键生成外部 HTTPS 接口地址</span>
+            </div>
+            <div class="dist-row-actions">
+              <button type="button" class="btn sm primary" id="tunnelStartQuickBtn">🌐 一键开启免费公网</button>
+              <button type="button" class="btn sm soft" id="tunnelRestartQuickBtn" hidden>重新生成公网地址</button>
+              <button type="button" class="btn sm soft" id="tunnelProbeBtn">🛡 公网安全自检</button>
+              <button type="button" class="btn sm danger-soft" id="tunnelStopBtn" hidden>关闭公网通道</button>
+            </div>
+          </div>
+          <div class="tunnel-url-row">
+            <div style="min-width:0;">
+              <div class="muted" style="font-size:0.74rem;">外部软件填写的公网接口地址 (Base URL)</div>
+              <div class="tunnel-url-val" id="tunnelUrlVal">尚未开启公网通道（点击右上角「一键开启免费公网」自动生成）</div>
+            </div>
+            <div class="dist-row-actions">
+              <button type="button" class="btn sm soft" id="tunnelCopyUrlBtn" disabled>复制公网接口地址</button>
+            </div>
+          </div>
+          <div class="tunnel-probe-box" id="tunnelProbeBox" hidden></div>
+          <details style="margin-top:10px;font-size:0.79rem;color:var(--muted);" id="tunnelNamedDrawer">
+            <summary style="cursor:pointer;font-weight:600;">进阶可选：已有免费域名？切换为固定域名 Cloudflare Tunnel Token</summary>
+            <div class="dist-form-grid" style="margin-top:10px;grid-template-columns: 1.4fr 1.2fr auto;">
+              <div class="dist-field">
+                <label for="tunnelNamedTokenInput">Cloudflare Tunnel Token</label>
+                <input id="tunnelNamedTokenInput" class="clean-input" type="password" autocomplete="off" placeholder="粘贴 Cloudflare Zero Trust 后台生成的 eyJ... 令牌" />
+              </div>
+              <div class="dist-field">
+                <label for="tunnelNamedUrlInput">绑定的固定公网域名</label>
+                <input id="tunnelNamedUrlInput" class="clean-input" type="text" spellcheck="false" placeholder="如 https://api.yourdomain.com" />
+              </div>
+              <button type="button" class="btn sm primary" id="tunnelStartNamedBtn">启用固定域名隧道</button>
+            </div>
+          </details>
+        </div>
+
         <div class="dist-card">
           <div class="dist-card-head">
             <div class="dist-card-title">
@@ -1916,6 +2169,31 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             </div>
             <button type="button" class="btn primary" id="distCreateClientBtn">+ 生成专属密钥</button>
           </div>
+          <details style="margin-top:10px;font-size:0.79rem;color:var(--muted);">
+            <summary style="cursor:pointer;font-weight:600;">展开更多限制项：每日金额预算 / 总 Token 封顶 / 到期时间 / 允许模型 / IP 白名单</summary>
+            <div class="dist-form-grid" style="margin-top:10px;grid-template-columns: repeat(5, minmax(0, 1fr));">
+              <div class="dist-field">
+                <label for="distClientDailyCost">每日预算上限 ($ 美元)</label>
+                <input id="distClientDailyCost" class="clean-input" type="number" min="0" step="0.1" value="0" title="填 0 表示不限制每日等效美元预算" />
+              </div>
+              <div class="dist-field">
+                <label for="distClientTotalTok">累计总 Token 封顶</label>
+                <input id="distClientTotalTok" class="clean-input" type="number" min="0" value="0" title="填 0 表示不设终身总封顶" />
+              </div>
+              <div class="dist-field">
+                <label for="distClientExpiresDate">到期日期（选填）</label>
+                <input id="distClientExpiresDate" class="clean-input" type="date" />
+              </div>
+              <div class="dist-field">
+                <label for="distClientAllowedModels">允许模型（逗号分隔，留空不限）</label>
+                <input id="distClientAllowedModels" class="clean-input" type="text" placeholder="如 gemini-4-carbon, gemini-4-argon" />
+              </div>
+              <div class="dist-field">
+                <label for="distClientAllowedIps">IP 白名单（逗号分隔，留空不限）</label>
+                <input id="distClientAllowedIps" class="clean-input" type="text" placeholder="如 203.0.113.5, 10.0.0.0/8" />
+              </div>
+            </div>
+          </details>
         </div>
 
         <div class="dist-share-box" id="distShareBox" hidden>
@@ -1946,6 +2224,130 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
               <tr><td colspan="6" class="muted">暂未创建外部密钥 · 本机直连免密，如需分享给他人请在上方生成专属密钥</td></tr>
             </tbody>
           </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- Section 3.8: Live Tasks, Sessions & Task Audit Center -->
+    <section class="fold-section" data-sec="audit" id="secAudit">
+      <div class="fold-head" data-fold-toggle="audit">
+        <div class="fold-title-wrap">
+          <span class="sec-icon amber">🗂</span>
+          <div>
+            <h2 class="fold-title">会话管理与任务调用记录</h2>
+            <div class="fold-subtitle">实时查看正在执行的任务 · 管理各密钥的活跃/归档对话 · 检索每一次调用内容与限流拦截原因</div>
+          </div>
+        </div>
+        <div class="fold-right">
+          <span class="chip" id="auditSummaryChip">0 在途 · 0 会话 · 0 条记录</span>
+          <span class="chevron" aria-hidden="true">▾</span>
+        </div>
+      </div>
+      <div class="fold-body">
+        <div class="dist-card">
+          <div class="dist-card-head" style="margin-bottom:8px;">
+            <div class="dist-card-title">
+              <span>⚡ 实时在途与排队任务</span>
+              <span class="chip" id="liveTasksCountChip">当前空闲</span>
+            </div>
+          </div>
+          <div class="table-scroll">
+            <table class="clean-table" id="liveTasksTable">
+              <thead>
+                <tr>
+                  <th>状态</th>
+                  <th>调用方 / 来源 IP</th>
+                  <th>用途 · 模型</th>
+                  <th>所在席位</th>
+                  <th>任务提问摘要</th>
+                  <th class="num">已运行</th>
+                </tr>
+              </thead>
+              <tbody id="liveTasksBody">
+                <tr><td colspan="6" class="muted">当前没有正在执行或排队的请求</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="dist-card" style="margin-top:12px;">
+          <div class="dist-card-head" style="margin-bottom:8px;">
+            <div class="dist-card-title">
+              <span>💬 活跃与归档会话列表</span>
+              <span class="muted" style="font-weight:500;font-size:0.78rem;">不同密钥的会话记忆完全隔离，可随时清理单条会话或清空某个客户端的历史会话</span>
+            </div>
+          </div>
+          <div class="audit-toolbar">
+            <div class="audit-filters">
+              <select id="sessionTenantFilter" class="clean-select" style="padding:5px 10px;font-size:0.79rem;">
+                <option value="all">全部调用方会话</option>
+                <option value="host">本机直连</option>
+              </select>
+              <input id="sessionSearchInput" class="clean-input" type="text" placeholder="搜索会话标题、会话 ID 或模型..." style="max-width:260px;padding:5px 10px;font-size:0.79rem;" />
+            </div>
+            <div class="dist-row-actions">
+              <button type="button" class="btn sm danger-soft" id="sessionPurgeTenantBtn" hidden>清空所选客户端全部会话</button>
+            </div>
+          </div>
+          <div class="table-scroll">
+            <table class="clean-table" id="sessionsTable">
+              <thead>
+                <tr>
+                  <th>状态</th>
+                  <th>所属调用方</th>
+                  <th>会话标题 / 标识</th>
+                  <th>模型 · 轮数</th>
+                  <th>记忆容量占用</th>
+                  <th>最近活跃</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="sessionsTableBody">
+                <tr><td colspan="7" class="muted">暂无活跃或历史归档会话</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="dist-card" style="margin-top:12px;">
+          <div class="dist-card-head" style="margin-bottom:8px;">
+            <div class="dist-card-title">
+              <span>📜 任务调用记录与拦截审计流水</span>
+              <span class="chip" id="auditCountChip">最近 0 条</span>
+            </div>
+          </div>
+          <div class="audit-toolbar">
+            <div class="audit-filters">
+              <select id="auditTenantFilter" class="clean-select" style="padding:5px 10px;font-size:0.79rem;">
+                <option value="all">全部调用方（本机 + 外部密钥）</option>
+                <option value="host">本机直连</option>
+              </select>
+              <select id="auditStatusFilter" class="clean-select" style="padding:5px 10px;font-size:0.79rem;">
+                <option value="all">全部状态（成功 + 限流 + 拦截 + 异常）</option>
+                <option value="ok">仅看成功调用</option>
+                <option value="blocked">仅看限流与权限拦截 (401/403/429)</option>
+                <option value="error">仅看执行报错</option>
+              </select>
+              <input id="auditSearchInput" class="clean-input" type="text" placeholder="搜索提问内容、回复摘要、错误原因、IP 或模型..." style="flex:1;min-width:220px;padding:5px 10px;font-size:0.79rem;" />
+            </div>
+          </div>
+          <div class="table-scroll">
+            <table class="clean-table" id="auditLogTable">
+              <thead>
+                <tr>
+                  <th>时间 · 状态</th>
+                  <th>调用方 · 来源 IP</th>
+                  <th>用途 · 模型 · 席位</th>
+                  <th>提问内容与回复 / 拦截详情</th>
+                  <th>Token · 花费</th>
+                  <th class="num">耗时</th>
+                </tr>
+              </thead>
+              <tbody id="auditLogBody">
+                <tr><td colspan="6" class="muted">暂无任务调用审计记录</td></tr>
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
     </section>
@@ -2016,12 +2418,77 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       </div>
     </div>
   </div>
+
+  <!-- Edit Client Quota & Restrictions Modal -->
+  <div class="modal-backdrop" id="clientEditModal" hidden>
+    <div class="modal-card wide" role="dialog" aria-modal="true" aria-labelledby="clientEditModalTitle">
+      <div class="modal-head">
+        <h3 id="clientEditModalTitle">编辑客户端密钥配额与访问限制</h3>
+        <button type="button" class="btn sm" id="closeClientEditBtn">关闭</button>
+      </div>
+      <input type="hidden" id="editClientId" />
+      <div class="edit-grid-2">
+        <div class="dist-field">
+          <label for="editClientName">客户端 / 使用者名称</label>
+          <input id="editClientName" class="clean-input" type="text" maxlength="64" />
+        </div>
+        <div class="dist-field">
+          <label for="editClientNote">备注说明</label>
+          <input id="editClientNote" class="clean-input" type="text" maxlength="120" />
+        </div>
+        <div class="dist-field">
+          <label for="editClientConcurrency">单客最大同时并发数</label>
+          <input id="editClientConcurrency" class="clean-input" type="number" min="1" max="20" />
+        </div>
+        <div class="dist-field">
+          <label for="editClientRpm">每分钟请求次数上限 (RPM)</label>
+          <input id="editClientRpm" class="clean-input" type="number" min="1" max="600" />
+        </div>
+        <div class="dist-field">
+          <label for="editClientDailyReq">每日调用次数上限（0 为不限）</label>
+          <input id="editClientDailyReq" class="clean-input" type="number" min="0" />
+        </div>
+        <div class="dist-field">
+          <label for="editClientDailyTok">每日 Token 上限（0 为不限）</label>
+          <input id="editClientDailyTok" class="clean-input" type="number" min="0" />
+        </div>
+        <div class="dist-field">
+          <label for="editClientDailyCost">每日参考预算上限 $ USD（0 为不限）</label>
+          <input id="editClientDailyCost" class="clean-input" type="number" min="0" step="0.1" />
+        </div>
+        <div class="dist-field">
+          <label for="editClientTotalTok">累计总 Token 封顶（0 为不限）</label>
+          <input id="editClientTotalTok" class="clean-input" type="number" min="0" />
+        </div>
+        <div class="dist-field">
+          <label for="editClientExpiresDate">密钥到期日（清空表示永不过期）</label>
+          <input id="editClientExpiresDate" class="clean-input" type="date" />
+        </div>
+        <div class="dist-field">
+          <label for="editClientAllowedModels">允许调用的模型（逗号分隔，留空允许全部）</label>
+          <input id="editClientAllowedModels" class="clean-input" type="text" placeholder="如 gemini-4-carbon, gemini-4-argon" />
+        </div>
+      </div>
+      <div class="dist-field" style="margin-bottom:14px;">
+        <label for="editClientAllowedIps">允许访问的来源 IP 或网段白名单（逗号分隔，留空允许任意网络访问）</label>
+        <input id="editClientAllowedIps" class="clean-input" type="text" placeholder="如 203.0.113.8, 198.51.100.0/24" />
+      </div>
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+        <span class="muted" style="font-size:0.8rem;" id="editClientMsg">保存后立即对该密钥的新请求生效</span>
+        <div class="dist-row-actions">
+          <button type="button" class="btn sm" id="editResetTodayQuotaBtn">清零今日已用额度</button>
+          <button type="button" class="btn primary" id="saveClientEditBtn">保存修改</button>
+        </div>
+      </div>
+    </div>
+  </div>
   <script>
     (function () {
       const baseOrigin = window.location.origin;
       document.getElementById('baseUrlVal').textContent = baseOrigin + '/v1';
 
       let selectedPeriod = 'all';
+      let selectedTenant = 'all';
       let selectedCurrency = 'CNY';
       try {
         const savedCur = localStorage.getItem('geb_currency');
@@ -2037,10 +2504,79 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       let enrichedBySlotKey = {};
       let refreshResetTimer = null;
       let lastDistSnapshot = null;
+      let lastTunnelSnapshot = null;
+      let lastSessionsOverview = [];
       let lastDefaultModel = 'gemini-4-carbon';
       let distPolicyDirty = false;
       let currentShareKey = '';
       let currentShareBundle = '';
+      let editingClientId = '';
+
+      function friendlyTenantLabel(tid, fallbackName) {
+        if (!tid || tid === 'host') return '本机直连';
+        if (tid === 'external_unauth') return '未授权外部探测';
+        if (lastDistSnapshot && Array.isArray(lastDistSnapshot.clients)) {
+          for (let i = 0; i < lastDistSnapshot.clients.length; i++) {
+            const c = lastDistSnapshot.clients[i];
+            if (c && (c.tenant_id === tid || ('client:' + c.client_id) === tid)) {
+              return '密钥 · ' + (c.name || c.client_id);
+            }
+          }
+        }
+        const raw = String(fallbackName || tid);
+        return raw.startsWith('客户端 · ') ? ('密钥 · ' + raw.slice(6)) : raw;
+      }
+
+      function syncTenantSelectOptions(selectEl, allLabel) {
+        if (!selectEl) return;
+        const prevVal = selectEl.value || 'all';
+        const seen = { all: true, host: true };
+        const items = [
+          { value: 'all', label: allLabel || '全部汇总' },
+          { value: 'host', label: '本机直连（免密）' }
+        ];
+        if (lastDistSnapshot && Array.isArray(lastDistSnapshot.clients)) {
+          lastDistSnapshot.clients.forEach(function (c) {
+            const tid = c.tenant_id || ('client:' + c.client_id);
+            if (!seen[tid]) {
+              seen[tid] = true;
+              items.push({ value: tid, label: 'API · ' + (c.name || c.client_id) + (c.enabled ? '' : ' (已暂停)') });
+            }
+          });
+        }
+        const byTen = (lastUsageSnapshot && lastUsageSnapshot.by_tenant) || {};
+        Object.keys(byTen).forEach(function (tid) {
+          if (!seen[tid]) {
+            seen[tid] = true;
+            items.push({ value: tid, label: friendlyTenantLabel(tid, byTen[tid] && byTen[tid].tenant_name) });
+          }
+        });
+        selectEl.replaceChildren();
+        items.forEach(function (it) {
+          const opt = document.createElement('option');
+          opt.value = it.value;
+          opt.textContent = it.label;
+          selectEl.appendChild(opt);
+        });
+        selectEl.value = seen[prevVal] ? prevVal : 'all';
+      }
+
+      function jumpToSection(secId) {
+        const el = document.getElementById(secId);
+        if (!el) return;
+        el.classList.remove('collapsed');
+        const key = el.getAttribute('data-sec');
+        if (key) {
+          try { localStorage.setItem('geb_fold_' + key, '0'); } catch (_) {}
+        }
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+
+      document.querySelectorAll('[data-jump-sec]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          jumpToSection(btn.getAttribute('data-jump-sec'));
+        });
+      });
 
       const PERIOD_LABELS = {
         today: '今日',
@@ -2669,28 +3205,49 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       function resolveSelectedGroup(usage) {
         const periods = (usage && usage.periods) || {};
         const daily = (usage && usage.daily) || {};
+        let baseRes = null;
         if (selectedPeriod.startsWith('day:')) {
           const dk = selectedPeriod.slice(4);
           if (daily[dk]) {
-            return { group: daily[dk], label: dk, filterDay: dk, mode: 'day' };
+            baseRes = { group: daily[dk], label: dk, filterDay: dk, mode: 'day' };
           }
         }
-        if (periods[selectedPeriod]) {
+        if (!baseRes && periods[selectedPeriod]) {
           let lbl = PERIOD_LABELS[selectedPeriod] || selectedPeriod;
           if (selectedPeriod === 'today' && usage.today_date) lbl = '今日 (' + usage.today_date.slice(5) + ')';
           if (selectedPeriod === 'yesterday' && usage.yesterday_date) lbl = '昨日 (' + usage.yesterday_date.slice(5) + ')';
-          return {
+          baseRes = {
             group: periods[selectedPeriod],
             label: lbl,
             filterDay: selectedPeriod === 'today' ? usage.today_date : (selectedPeriod === 'yesterday' ? usage.yesterday_date : null),
             mode: selectedPeriod
           };
         }
+        if (!baseRes) {
+          baseRes = {
+            group: periods.all || { summary: usage.all_time || {}, by_model: usage.by_model || {}, by_task: usage.by_task || {}, by_tenant: usage.by_tenant || {} },
+            label: '全部累计',
+            filterDay: null,
+            mode: 'all'
+          };
+        }
+        const baseByTenant = (baseRes.group && baseRes.group.by_tenant) || {};
+        if (selectedTenant && selectedTenant !== 'all') {
+          const tGroup = baseByTenant[selectedTenant] || { summary: {}, by_model: {}, by_task: {}, errors: 0 };
+          return {
+            group: tGroup,
+            baseByTenant: baseByTenant,
+            label: baseRes.label + ' · ' + friendlyTenantLabel(selectedTenant, tGroup.tenant_name),
+            filterDay: baseRes.filterDay,
+            mode: baseRes.mode
+          };
+        }
         return {
-          group: { summary: usage.all_time || {}, by_model: usage.by_model || {}, by_task: usage.by_task || {} },
-          label: '全部累计',
-          filterDay: null,
-          mode: 'all'
+          group: baseRes.group,
+          baseByTenant: baseByTenant,
+          label: baseRes.label,
+          filterDay: baseRes.filterDay,
+          mode: baseRes.mode
         };
       }
 
@@ -2723,8 +3280,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         }
 
         let maxTotal = 0.0001;
+        function pickDaySummary(dk) {
+          const dObj = dailyMap[dk] || {};
+          if (selectedTenant && selectedTenant !== 'all') {
+            const tObj = (dObj.by_tenant && dObj.by_tenant[selectedTenant]) || {};
+            return tObj.summary || {};
+          }
+          return dObj.summary || {};
+        }
         days.forEach(function (dk) {
-          const s = (dailyMap[dk] && dailyMap[dk].summary) || {};
+          const s = pickDaySummary(dk);
           const tot = selectedCurrency === 'USD'
             ? Number(s.cached_equivalent_cost_usd || 0)
             : Number(s.cached_equivalent_cost_cny || 0);
@@ -2732,7 +3297,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         });
 
         days.forEach(function (dk) {
-          const s = (dailyMap[dk] && dailyMap[dk].summary) || {};
+          const s = pickDaySummary(dk);
           const actual = selectedCurrency === 'USD'
             ? Number(s.cached_equivalent_cost_usd || 0)
             : Number(s.cached_equivalent_cost_cny || 0);
@@ -2848,6 +3413,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         lastUsageSnapshot = usage;
         lastCtxSnapshot = ctxMon;
         syncPeriodControls(usage);
+        const tenantSel = document.getElementById('ledgerTenantSelect');
+        syncTenantSelectOptions(tenantSel, '全部汇总（本机 + 所有外部密钥）');
+        if (tenantSel) tenantSel.value = selectedTenant;
+        const resetTenBtn = document.getElementById('ledgerResetTenantFilterBtn');
+        if (resetTenBtn) resetTenBtn.hidden = (selectedTenant === 'all');
 
         const resolved = resolveSelectedGroup(usage);
         const curSummary = (resolved.group && resolved.group.summary) || {};
@@ -2915,6 +3485,60 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         renderDailyBars(usage, resolved.filterDay);
         renderTaskBreakdown(byTask, reqCount);
 
+        // Per-Tenant / Per-API Key Leaderboard
+        const tenantBody = document.getElementById('ledgerTenantBody');
+        const baseByTenant = resolved.baseByTenant || {};
+        const tenantIds = Object.keys(baseByTenant);
+        if (lastDistSnapshot && Array.isArray(lastDistSnapshot.clients)) {
+          lastDistSnapshot.clients.forEach(function (c) {
+            const tid = c.tenant_id || ('client:' + c.client_id);
+            if (tenantIds.indexOf(tid) === -1) tenantIds.push(tid);
+          });
+        }
+        if (tenantIds.length === 0) {
+          renderEmptyRow(tenantBody, 7, '当前时间范围暂无分密钥调用记录');
+        } else {
+          tenantBody.replaceChildren();
+          tenantIds.forEach(function (tid) {
+            const tRaw = baseByTenant[tid] || { summary: {}, errors: 0, tenant_name: '' };
+            const ts = tRaw.summary || {};
+            const tt = resolveTokenParts(ts);
+            const errCnt = Number(tRaw.errors !== undefined ? tRaw.errors : (ts.errors || 0));
+            const tr = document.createElement('tr');
+            if (selectedTenant === tid) tr.style.background = '#eff6ff';
+            const nameWrap = document.createElement('div');
+            nameWrap.style.display = 'flex';
+            nameWrap.style.alignItems = 'center';
+            nameWrap.style.gap = '6px';
+            const bTag = document.createElement('span');
+            bTag.className = tid === 'host' ? 'chip ok' : (tid === 'external_unauth' ? 'chip err' : 'chip purple');
+            bTag.textContent = tid === 'host' ? '本机' : (tid === 'external_unauth' ? '陌生来源' : '外部 API');
+            const tStrong = document.createElement('strong');
+            tStrong.textContent = friendlyTenantLabel(tid, tRaw.tenant_name);
+            nameWrap.appendChild(bTag);
+            nameWrap.appendChild(tStrong);
+            tr.appendChild(makeCell(nameWrap));
+            tr.appendChild(makeCell((ts.requests || 0) + ' 次', 'num'));
+            const errChip = document.createElement('span');
+            errChip.className = errCnt > 0 ? 'chip warn' : 'muted';
+            errChip.textContent = errCnt > 0 ? (errCnt + ' 次拦截/异常') : '0';
+            tr.appendChild(makeCell(errChip, 'num'));
+            tr.appendChild(makeCell(fmtLedgerTok(tt.total), 'num'));
+            tr.appendChild(makeCell(fmtLedgerTok(tt.input) + ' / ' + fmtLedgerTok(tt.output) + ' / ' + fmtLedgerTok(tt.cached)));
+            tr.appendChild(makeCell(fmtMoney(ts.cached_equivalent_cost_usd, ts.cached_equivalent_cost_cny), 'num'));
+            const fBtn = document.createElement('button');
+            fBtn.type = 'button';
+            fBtn.className = selectedTenant === tid ? 'btn sm primary' : 'btn sm soft';
+            fBtn.textContent = selectedTenant === tid ? '正在查看 ✓' : '单独查看账本';
+            fBtn.addEventListener('click', function () {
+              selectedTenant = (selectedTenant === tid) ? 'all' : tid;
+              renderLedger(lastUsageSnapshot, lastCtxSnapshot);
+            });
+            tr.appendChild(makeCell(fBtn));
+            tenantBody.appendChild(tr);
+          });
+        }
+
         // Model Table
         const modelBody = document.getElementById('ledgerModelBody');
         const modelKeys = Object.keys(byModel);
@@ -2950,7 +3574,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         } else {
           dailyBody.replaceChildren();
           sortedDays.forEach(function (dk) {
-            const ds = (dailyMap[dk] && dailyMap[dk].summary) || {};
+            const dGroup = dailyMap[dk] || {};
+            const ds = (selectedTenant && selectedTenant !== 'all')
+              ? (((dGroup.by_tenant && dGroup.by_tenant[selectedTenant]) && dGroup.by_tenant[selectedTenant].summary) || {})
+              : (dGroup.summary || {});
             const dt = resolveTokenParts(ds);
             const tr = document.createElement('tr');
             if (resolved.filterDay === dk) tr.style.background = '#eff6ff';
@@ -2975,6 +3602,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         const startedAt = Number(usage.started_at || 0);
         const todayStr = usage.today_date || '';
         const filteredRecents = allRecents.filter(function (r) {
+          if (selectedTenant && selectedTenant !== 'all') {
+            if ((r.tenant_id || 'host') !== selectedTenant) return false;
+          }
           if (resolved.filterDay) return r.day === resolved.filterDay;
           if (resolved.mode === 'session') return Number(r.ts || 0) >= startedAt;
           if (resolved.mode === '7d' && todayStr && r.day) {
@@ -3052,7 +3682,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           // Step 1: Local Service
           setStepState(
             'stepServiceCard', 'stepServiceIcon', 'stepServiceDesc', 'stepServiceTag',
-            'ok', '✓', '8000 · ' + defModelName, '在线'
+            'ok', '✓', window.location.host + ' · ' + defModelName, '在线'
           );
 
           // Step 2 & 3: Extension & Google Tabs
@@ -3112,6 +3742,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           if (data.distribution) {
             renderDistribution(data.distribution, lastDefaultModel);
           }
+          if (data.tunnel) {
+            renderTunnel(data.tunnel, data.distribution);
+          }
+          lastSessionsOverview = Array.isArray(data.sessions_overview) ? data.sessions_overview : [];
+          renderAuditCenter(data.distribution, data.usage, lastSessionsOverview);
 
           // Diagnostics drawer
           document.getElementById('modeVal').textContent = '浏览器桥接 · 智能增量记忆';
@@ -3144,7 +3779,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           document.getElementById('connText').textContent = '本地服务未响应';
           setStepState(
             'stepServiceCard', 'stepServiceIcon', 'stepServiceDesc', 'stepServiceTag',
-            'err', '✕', '8000 未响应', '离线'
+            'err', '✕', window.location.host + ' 未响应', '离线'
           );
         }
         if (manual) {
@@ -3340,6 +3975,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         if (lastUsageSnapshot) renderLedger(lastUsageSnapshot, lastCtxSnapshot);
       });
 
+      document.getElementById('ledgerTenantSelect').addEventListener('change', function (ev) {
+        selectedTenant = ev.target.value || 'all';
+        if (lastUsageSnapshot) renderLedger(lastUsageSnapshot, lastCtxSnapshot);
+      });
+
+      document.getElementById('ledgerResetTenantFilterBtn').addEventListener('click', function () {
+        selectedTenant = 'all';
+        if (lastUsageSnapshot) renderLedger(lastUsageSnapshot, lastCtxSnapshot);
+      });
+
       // Public Distribution & Multi-Client Controls
       function buildAdminHeaders() {
         const authVal = document.getElementById('apiKeyInput').value.trim();
@@ -3349,10 +3994,134 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       }
 
       function resolveShareApiBase(policyObj) {
-        let raw = String((policyObj && policyObj.public_base_url) || window.location.origin || '').trim();
+        const tunUrl = (lastTunnelSnapshot && lastTunnelSnapshot.running && lastTunnelSnapshot.active_url) ? lastTunnelSnapshot.active_url : '';
+        let raw = String((policyObj && policyObj.public_base_url) || tunUrl || window.location.origin || '').trim();
         while (raw.endsWith('/')) raw = raw.slice(0, -1);
         if (!raw.endsWith('/v1')) raw = raw + '/v1';
         return raw;
+      }
+
+      function dateInputToExpiresTs(val) {
+        const s = String(val || '').trim();
+        if (!s) return 0;
+        const ms = Date.parse(s + 'T23:59:59+08:00');
+        return isNaN(ms) ? 0 : Math.floor(ms / 1000);
+      }
+
+      function expiresTsToDateInput(ts) {
+        const n = Number(ts || 0);
+        if (n <= 0) return '';
+        const dt = new Date((n + 8 * 3600) * 1000);
+        return isNaN(dt.getTime()) ? '' : dt.toISOString().slice(0, 10);
+      }
+
+      function makeQuotaBarLine(title, usedVal, limitVal, fmtFn) {
+        const wrap = document.createElement('div');
+        wrap.className = 'quota-line';
+        const top = document.createElement('div');
+        top.className = 'quota-line-top';
+        const lSpan = document.createElement('span');
+        lSpan.textContent = title;
+        const rSpan = document.createElement('span');
+        const fmt = fmtFn || function (x) { return String(x); };
+        rSpan.textContent = limitVal > 0 ? (fmt(usedVal) + ' / ' + fmt(limitVal)) : (fmt(usedVal) + '（不限）');
+        top.appendChild(lSpan);
+        top.appendChild(rSpan);
+        wrap.appendChild(top);
+        if (limitVal > 0) {
+          const track = document.createElement('div');
+          track.className = 'quota-bar-track';
+          const fill = document.createElement('div');
+          const pct = Math.min(100, Math.max(0, (usedVal / limitVal) * 100));
+          fill.className = 'quota-bar-fill' + (pct >= 100 ? ' err' : (pct >= 80 ? ' warn' : ''));
+          fill.style.width = pct.toFixed(1) + '%';
+          track.appendChild(fill);
+          wrap.appendChild(track);
+        }
+        return wrap;
+      }
+
+      function renderTunnel(tun, dist) {
+        if (!tun) return;
+        lastTunnelSnapshot = tun;
+        const running = Boolean(tun.running);
+        const activeUrl = String(tun.active_url || '').trim();
+        const policyUrl = String((dist && dist.policy && dist.policy.public_base_url) || '').trim();
+        const effOrigin = activeUrl || policyUrl;
+        const effApiUrl = effOrigin ? (effOrigin.replace(/\/+$/, '') + (effOrigin.endsWith('/v1') ? '' : '/v1')) : '';
+
+        const chip = document.getElementById('tunnelStatusChip');
+        const navChip = document.getElementById('navTunnelChip');
+        const subHint = document.getElementById('tunnelSubHint');
+        const urlVal = document.getElementById('tunnelUrlVal');
+        const copyBtn = document.getElementById('tunnelCopyUrlBtn');
+        const startBtn = document.getElementById('tunnelStartQuickBtn');
+        const restartBtn = document.getElementById('tunnelRestartQuickBtn');
+        const stopBtn = document.getElementById('tunnelStopBtn');
+        const probeBox = document.getElementById('tunnelProbeBox');
+
+        if (running && activeUrl) {
+          chip.className = 'chip ok';
+          chip.textContent = tun.mode === 'named' ? '固定域名公网在线' : '免费公网通道在线';
+          if (navChip) {
+            navChip.className = 'chip ok';
+            navChip.textContent = '🌐 公网已连通';
+          }
+          subHint.textContent = '外部仅开放标准 API 接口（需专属密钥），本机管理总台对外完全隐藏隔离';
+          urlVal.textContent = effApiUrl;
+          copyBtn.disabled = false;
+          startBtn.hidden = true;
+          restartBtn.hidden = (tun.mode === 'named');
+          stopBtn.hidden = false;
+        } else if (running) {
+          chip.className = 'chip busy';
+          chip.textContent = '正在分配公网地址...';
+          if (navChip) {
+            navChip.className = 'chip busy';
+            navChip.textContent = '🌐 正在连接公网...';
+          }
+          urlVal.textContent = '正在向 Cloudflare 申请加密公网地址，请稍候 2-3 秒...';
+          copyBtn.disabled = true;
+          startBtn.hidden = true;
+          restartBtn.hidden = true;
+          stopBtn.hidden = false;
+        } else {
+          chip.className = tun.cloudflared_installed ? 'chip' : 'chip warn';
+          chip.textContent = tun.cloudflared_installed ? '未开启（随时一键启动）' : '未安装 cloudflared';
+          if (navChip) {
+            navChip.className = policyUrl ? 'chip ok' : 'chip';
+            navChip.textContent = policyUrl ? '🌐 已配外部域名' : '公网通道未开启';
+          }
+          subHint.textContent = tun.last_error || '免注册免域名，点击右侧「一键开启免费公网」即可生成外部 HTTPS 地址';
+          urlVal.textContent = effApiUrl || '尚未开启公网通道（点击右上角「一键开启免费公网」自动生成）';
+          copyBtn.disabled = !effApiUrl;
+          startBtn.hidden = false;
+          restartBtn.hidden = true;
+          stopBtn.hidden = true;
+        }
+
+        const namedUrlEl = document.getElementById('tunnelNamedUrlInput');
+        if (namedUrlEl && document.activeElement !== namedUrlEl && tun.named_public_url && !namedUrlEl.value) {
+          namedUrlEl.value = tun.named_public_url;
+        }
+
+        const lp = tun.last_probe;
+        if (lp && lp.detail) {
+          probeBox.hidden = false;
+          probeBox.className = 'tunnel-probe-box ' + (lp.ok ? 'ok' : 'warn');
+          const checks = [];
+          checks.push('HTTPS 连通: ' + (lp.health_ok ? '✓' : '✕'));
+          checks.push('免密白嫖拦截: ' + (lp.auth_lock_verified ? '✓' : '✕'));
+          checks.push('总台隐私隔离: ' + (lp.admin_lock_verified ? '✓' : '✕'));
+          if (lp.client_key_verified !== null && lp.client_key_verified !== undefined) {
+            checks.push('专属密钥验证: ' + (lp.client_key_verified ? '✓' : '✕'));
+          }
+          probeBox.textContent = lp.detail + ' ｜ ' + checks.join(' · ');
+        } else if (tun.last_error && !running) {
+          probeBox.hidden = false;
+          probeBox.className = 'tunnel-probe-box warn';
+          probeBox.textContent = tun.last_error;
+        }
       }
 
       function buildClientBundleText(clientObj, policyObj, defModel) {
@@ -3451,6 +4220,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         tbody.replaceChildren();
         clientsList.forEach(function (c) {
           const tr = document.createElement('tr');
+          const tid = c.tenant_id || ('client:' + c.client_id);
 
           // Col 1: Name + Status + Note
           const nameBox = document.createElement('div');
@@ -3458,11 +4228,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           nameRow.style.display = 'flex';
           nameRow.style.alignItems = 'center';
           nameRow.style.gap = '6px';
+          nameRow.style.flexWrap = 'wrap';
           const strong = document.createElement('strong');
           strong.textContent = c.name || c.client_id;
           const st = document.createElement('span');
-          st.className = c.enabled ? 'chip ok' : 'chip warn';
-          st.textContent = c.enabled ? '启用中' : '已暂停';
+          if (c.expired) {
+            st.className = 'chip err';
+            st.textContent = '已到期';
+          } else if (c.enabled) {
+            st.className = 'chip ok';
+            st.textContent = '启用中';
+          } else {
+            st.className = 'chip warn';
+            st.textContent = '已暂停';
+          }
           nameRow.appendChild(strong);
           nameRow.appendChild(st);
           nameBox.appendChild(nameRow);
@@ -3472,6 +4251,24 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             noteSub.style.fontSize = '0.73rem';
             noteSub.textContent = c.note;
             nameBox.appendChild(noteSub);
+          }
+          const ruleTags = [];
+          if (Array.isArray(c.allowed_models) && c.allowed_models.length > 0) {
+            ruleTags.push('限定模型: ' + c.allowed_models.map(friendlyModel).join('/'));
+          }
+          if (Array.isArray(c.allowed_ips) && c.allowed_ips.length > 0) {
+            ruleTags.push('IP 白名单: ' + c.allowed_ips.length + ' 条');
+          }
+          if (Number(c.expires_at || 0) > 0) {
+            ruleTags.push('到期: ' + expiresTsToDateInput(c.expires_at));
+          }
+          if (ruleTags.length > 0) {
+            const ruleDiv = document.createElement('div');
+            ruleDiv.className = 'muted';
+            ruleDiv.style.fontSize = '0.71rem';
+            ruleDiv.style.marginTop = '2px';
+            ruleDiv.textContent = ruleTags.join(' · ');
+            nameBox.appendChild(ruleDiv);
           }
           tr.appendChild(makeCell(nameBox));
 
@@ -3508,35 +4305,110 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           const inf = Number(c.in_flight || 0);
           const qd = Number(c.queued || 0);
           const maxC = Number(c.max_concurrency || 1);
+          const concWrap = document.createElement('div');
           const concChip = document.createElement('span');
           concChip.className = inf > 0 ? 'chip busy' : 'chip';
           concChip.textContent = inf + ' / ' + maxC + ' 并发' + (qd > 0 ? ('（排队 ' + qd + '）') : '');
-          tr.appendChild(makeCell(concChip));
+          concWrap.appendChild(concChip);
+          const rpmSub = document.createElement('div');
+          rpmSub.className = 'muted';
+          rpmSub.style.fontSize = '0.72rem';
+          rpmSub.style.marginTop = '3px';
+          rpmSub.textContent = '限速 ' + (c.rpm_limit || 30) + ' 次/分' + (c.last_model ? (' · ' + friendlyModel(c.last_model)) : '');
+          concWrap.appendChild(rpmSub);
+          tr.appendChild(makeCell(concWrap));
 
           // Col 4: Rate limits & daily quota
           const reqLim = Number(c.daily_request_limit || 0);
           const tokLim = Number(c.daily_token_limit || 0);
+          const costLim = Number(c.daily_cost_limit_usd || 0);
+          const totTokLim = Number(c.total_token_limit || 0);
           const todayReqs = Number(c.today_requests || 0);
           const todayToks = Number(c.today_tokens || 0);
-          const quotaParts = [
-            (c.rpm_limit || 30) + ' 次/分',
-            '今日 ' + todayReqs + (reqLim > 0 ? ('/' + reqLim) : '') + ' 次'
-          ];
+          const todayCostUsd = Number(c.today_cost_usd || 0);
+          const totToks = Number(c.total_tokens || 0);
+          const qStack = document.createElement('div');
+          qStack.className = 'quota-stack';
+          qStack.appendChild(makeQuotaBarLine('今日次数', todayReqs, reqLim, function (v) { return v + ' 次'; }));
           if (tokLim > 0 || todayToks > 0) {
-            quotaParts.push(fmtLedgerTok(todayToks) + (tokLim > 0 ? ('/' + fmtLedgerTok(tokLim)) : '') + ' Tok');
+            qStack.appendChild(makeQuotaBarLine('今日 Token', todayToks, tokLim, fmtLedgerTok));
           }
-          tr.appendChild(makeCell(quotaParts.join(' · ')));
+          if (costLim > 0) {
+            qStack.appendChild(makeQuotaBarLine('今日预算', todayCostUsd, costLim, function (v) { return '$' + Number(v || 0).toFixed(2); }));
+          }
+          if (totTokLim > 0) {
+            qStack.appendChild(makeQuotaBarLine('终身封顶', totToks, totTokLim, fmtLedgerTok));
+          }
+          tr.appendChild(makeCell(qStack));
 
           // Col 5: Cumulative usage & last active
           const totReqs = Number(c.total_requests || 0);
-          const totToks = Number(c.total_tokens || 0);
+          const totCostUsd = Number(c.total_cost_usd || 0);
+          const fxRate = Number((lastUsageSnapshot && lastUsageSnapshot.usd_to_cny_rate) || 6.8);
+          const totErrs = Number(c.total_errors || 0);
           const lastStr = c.last_used_at ? new Date(c.last_used_at * 1000).toLocaleTimeString() : '尚未使用';
-          const statText = totReqs + ' 次 (' + fmtLedgerTok(totToks) + ') · ' + lastStr + (c.last_ip ? (' · ' + c.last_ip) : '');
-          tr.appendChild(makeCell(statText));
+          const statBox = document.createElement('div');
+          const statTop = document.createElement('div');
+          statTop.style.fontWeight = '600';
+          statTop.textContent = '累计 ' + totReqs + ' 次 · ' + fmtLedgerTok(totToks) + ' · ' + fmtMoney(totCostUsd, totCostUsd * fxRate);
+          const statSub = document.createElement('div');
+          statSub.className = 'muted';
+          statSub.style.fontSize = '0.73rem';
+          statSub.textContent = lastStr + (c.last_ip ? (' · ' + c.last_ip) : '') + (totErrs > 0 ? (' · 拦截/异常 ' + totErrs + ' 次') : '');
+          statBox.appendChild(statTop);
+          statBox.appendChild(statSub);
+          tr.appendChild(makeCell(statBox));
 
           // Col 6: Actions (Toggle, Rotate, Revoke)
           const actBox = document.createElement('div');
           actBox.className = 'dist-row-actions';
+
+          const editBtn = document.createElement('button');
+          editBtn.type = 'button';
+          editBtn.className = 'btn sm soft';
+          editBtn.textContent = '编辑限额';
+          editBtn.addEventListener('click', function () {
+            openClientEditModal(c);
+          });
+
+          const viewLedgerBtn = document.createElement('button');
+          viewLedgerBtn.type = 'button';
+          viewLedgerBtn.className = 'btn sm';
+          viewLedgerBtn.textContent = '看用量';
+          viewLedgerBtn.addEventListener('click', function () {
+            selectedTenant = tid;
+            if (lastUsageSnapshot) renderLedger(lastUsageSnapshot, lastCtxSnapshot);
+            const auditTenSel = document.getElementById('auditTenantFilter');
+            if (auditTenSel) {
+              syncTenantSelectOptions(auditTenSel, '全部调用方（本机 + 外部密钥）');
+              auditTenSel.value = tid;
+              renderAuditCenter(lastDistSnapshot, lastUsageSnapshot, lastSessionsOverview);
+            }
+            jumpToSection('secLedger');
+          });
+
+          const discBtn = document.createElement('button');
+          discBtn.type = 'button';
+          discBtn.className = 'btn sm';
+          discBtn.textContent = '断连清场';
+          discBtn.title = '立即中止该密钥正在排队或生成的请求，并释放占用的工作席位';
+          discBtn.addEventListener('click', async function () {
+            discBtn.disabled = true;
+            try {
+              const res = await fetch('/api/distribution/clients/' + encodeURIComponent(c.client_id) + '/disconnect', {
+                method: 'POST',
+                headers: buildAdminHeaders(),
+                body: JSON.stringify({ purge_archive: false })
+              });
+              const d = await res.json().catch(function () { return {}; });
+              if (res.ok && d.distribution) {
+                renderDistribution(d.distribution, lastDefaultModel);
+                refreshStatus();
+              }
+            } finally {
+              discBtn.disabled = false;
+            }
+          });
 
           const toggleBtn = document.createElement('button');
           toggleBtn.type = 'button';
@@ -3626,6 +4498,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             }
           });
 
+          actBox.appendChild(editBtn);
+          actBox.appendChild(viewLedgerBtn);
+          actBox.appendChild(discBtn);
           actBox.appendChild(toggleBtn);
           actBox.appendChild(rotBtn);
           actBox.appendChild(delBtn);
@@ -3693,6 +4568,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             rpm_limit: Math.max(1, Number(document.getElementById('distClientRpm').value || 30)),
             daily_request_limit: Math.max(0, Number(document.getElementById('distClientDailyReq').value || 0)),
             daily_token_limit: Math.max(0, Number(document.getElementById('distClientDailyTok').value || 0)),
+            daily_cost_limit_usd: Math.max(0, Number(document.getElementById('distClientDailyCost').value || 0)),
+            total_token_limit: Math.max(0, Number(document.getElementById('distClientTotalTok').value || 0)),
+            expires_at: dateInputToExpiresTs(document.getElementById('distClientExpiresDate').value),
+            allowed_models: document.getElementById('distClientAllowedModels').value.trim(),
+            allowed_ips: document.getElementById('distClientAllowedIps').value.trim(),
             note: document.getElementById('distClientNote').value.trim()
           };
           const res = await fetch('/api/distribution/clients', {
@@ -3704,8 +4584,200 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           if (res.ok && d.ok) {
             nameEl.value = '';
             document.getElementById('distClientNote').value = '';
+            document.getElementById('distClientExpiresDate').value = '';
+            document.getElementById('distClientAllowedModels').value = '';
+            document.getElementById('distClientAllowedIps').value = '';
             if (d.distribution) renderDistribution(d.distribution, lastDefaultModel);
             if (d.client) showShareBundle(d.client);
+          }
+        } finally {
+          btn.disabled = false;
+        }
+      });
+
+      // Tunnel Controls
+      async function handleTunnelStart(mode, restartFlag) {
+        const startBtn = document.getElementById('tunnelStartQuickBtn');
+        const restartBtn = document.getElementById('tunnelRestartQuickBtn');
+        const namedBtn = document.getElementById('tunnelStartNamedBtn');
+        const probeBox = document.getElementById('tunnelProbeBox');
+        startBtn.disabled = true;
+        restartBtn.disabled = true;
+        namedBtn.disabled = true;
+        probeBox.hidden = false;
+        probeBox.className = 'tunnel-probe-box';
+        probeBox.textContent = '正在启动 Cloudflare 加密公网通道并同步外部访问地址，大约需要 3-6 秒...';
+        try {
+          const body = { mode: mode, restart: Boolean(restartFlag), auto_sync_public_url: true };
+          if (mode === 'named') {
+            body.named_tunnel_token = document.getElementById('tunnelNamedTokenInput').value.trim();
+            body.named_public_url = document.getElementById('tunnelNamedUrlInput').value.trim();
+          }
+          const res = await fetch('/api/tunnel/start', {
+            method: 'POST',
+            headers: buildAdminHeaders(),
+            body: JSON.stringify(body)
+          });
+          const d = await res.json().catch(function () { return {}; });
+          if (!res.ok || !d.ok) {
+            probeBox.className = 'tunnel-probe-box warn';
+            probeBox.textContent = (d && d.detail) ? d.detail : '开启公网通道失败';
+            if (d && d.tunnel) renderTunnel(d.tunnel, lastDistSnapshot);
+            return;
+          }
+          distPolicyDirty = false;
+          if (d.distribution) renderDistribution(d.distribution, lastDefaultModel);
+          if (d.tunnel) renderTunnel(d.tunnel, d.distribution || lastDistSnapshot);
+          probeBox.className = 'tunnel-probe-box ok';
+          probeBox.textContent = '✓ 公网通道已开启，接口地址已自动填入接入包，可点击「公网安全自检」核验外部连通性。';
+        } catch (e) {
+          probeBox.className = 'tunnel-probe-box warn';
+          probeBox.textContent = '开启异常：' + String(e.message || e);
+        } finally {
+          startBtn.disabled = false;
+          restartBtn.disabled = false;
+          namedBtn.disabled = false;
+        }
+      }
+
+      document.getElementById('tunnelStartQuickBtn').addEventListener('click', function () {
+        handleTunnelStart('quick', false);
+      });
+      document.getElementById('tunnelRestartQuickBtn').addEventListener('click', function () {
+        handleTunnelStart('quick', true);
+      });
+      document.getElementById('tunnelStartNamedBtn').addEventListener('click', function () {
+        handleTunnelStart('named', true);
+      });
+      document.getElementById('tunnelStopBtn').addEventListener('click', async function () {
+        const btn = document.getElementById('tunnelStopBtn');
+        btn.disabled = true;
+        try {
+          const res = await fetch('/api/tunnel/stop', {
+            method: 'POST',
+            headers: buildAdminHeaders(),
+            body: JSON.stringify({ clear_public_url: true })
+          });
+          const d = await res.json().catch(function () { return {}; });
+          distPolicyDirty = false;
+          if (d.distribution) renderDistribution(d.distribution, lastDefaultModel);
+          if (d.tunnel) renderTunnel(d.tunnel, d.distribution || lastDistSnapshot);
+          document.getElementById('tunnelProbeBox').hidden = true;
+        } finally {
+          btn.disabled = false;
+        }
+      });
+      document.getElementById('tunnelProbeBtn').addEventListener('click', async function () {
+        const btn = document.getElementById('tunnelProbeBtn');
+        const probeBox = document.getElementById('tunnelProbeBox');
+        btn.disabled = true;
+        probeBox.hidden = false;
+        probeBox.className = 'tunnel-probe-box';
+        probeBox.textContent = '正在从外部视角检测公网 HTTPS 连通、免密拦截与管理台隔离保护...';
+        try {
+          const res = await fetch('/api/tunnel/probe', {
+            method: 'POST',
+            headers: buildAdminHeaders(),
+            body: JSON.stringify({})
+          });
+          const d = await res.json().catch(function () { return {}; });
+          if (!res.ok) {
+            probeBox.className = 'tunnel-probe-box warn';
+            probeBox.textContent = (d && d.detail) ? d.detail : '公网自检未通过';
+            return;
+          }
+          if (d.tunnel) renderTunnel(d.tunnel, lastDistSnapshot);
+        } catch (e) {
+          probeBox.className = 'tunnel-probe-box warn';
+          probeBox.textContent = '自检请求失败：' + String(e.message || e);
+        } finally {
+          btn.disabled = false;
+        }
+      });
+      document.getElementById('tunnelCopyUrlBtn').addEventListener('click', function () {
+        const txt = document.getElementById('tunnelUrlVal').textContent.trim();
+        if (!txt || txt.indexOf('http') !== 0) return;
+        copyTextWithFeedback(document.getElementById('tunnelCopyUrlBtn'), txt, '公网地址已复制 ✓');
+      });
+
+      // Client Edit Modal
+      const clientEditModal = document.getElementById('clientEditModal');
+      function openClientEditModal(c) {
+        editingClientId = c.client_id;
+        document.getElementById('editClientId').value = c.client_id;
+        document.getElementById('editClientName').value = c.name || '';
+        document.getElementById('editClientNote').value = c.note || '';
+        document.getElementById('editClientConcurrency').value = String(c.max_concurrency || 2);
+        document.getElementById('editClientRpm').value = String(c.rpm_limit || 30);
+        document.getElementById('editClientDailyReq').value = String(c.daily_request_limit || 0);
+        document.getElementById('editClientDailyTok').value = String(c.daily_token_limit || 0);
+        document.getElementById('editClientDailyCost').value = String(c.daily_cost_limit_usd || 0);
+        document.getElementById('editClientTotalTok').value = String(c.total_token_limit || 0);
+        document.getElementById('editClientExpiresDate').value = expiresTsToDateInput(c.expires_at);
+        document.getElementById('editClientAllowedModels').value = Array.isArray(c.allowed_models) ? c.allowed_models.join(', ') : '';
+        document.getElementById('editClientAllowedIps').value = Array.isArray(c.allowed_ips) ? c.allowed_ips.join(', ') : '';
+        document.getElementById('editClientMsg').textContent = '保存后立即对该密钥的新请求生效';
+        clientEditModal.hidden = false;
+      }
+
+      document.getElementById('closeClientEditBtn').addEventListener('click', function () {
+        clientEditModal.hidden = true;
+      });
+      clientEditModal.addEventListener('click', function (ev) {
+        if (ev.target === clientEditModal) clientEditModal.hidden = true;
+      });
+
+      document.getElementById('saveClientEditBtn').addEventListener('click', async function () {
+        if (!editingClientId) return;
+        const btn = document.getElementById('saveClientEditBtn');
+        const msg = document.getElementById('editClientMsg');
+        btn.disabled = true;
+        try {
+          const payload = {
+            name: document.getElementById('editClientName').value.trim(),
+            note: document.getElementById('editClientNote').value.trim(),
+            max_concurrency: Math.max(1, Number(document.getElementById('editClientConcurrency').value || 1)),
+            rpm_limit: Math.max(1, Number(document.getElementById('editClientRpm').value || 30)),
+            daily_request_limit: Math.max(0, Number(document.getElementById('editClientDailyReq').value || 0)),
+            daily_token_limit: Math.max(0, Number(document.getElementById('editClientDailyTok').value || 0)),
+            daily_cost_limit_usd: Math.max(0, Number(document.getElementById('editClientDailyCost').value || 0)),
+            total_token_limit: Math.max(0, Number(document.getElementById('editClientTotalTok').value || 0)),
+            expires_at: dateInputToExpiresTs(document.getElementById('editClientExpiresDate').value),
+            allowed_models: document.getElementById('editClientAllowedModels').value.trim(),
+            allowed_ips: document.getElementById('editClientAllowedIps').value.trim()
+          };
+          const res = await fetch('/api/distribution/clients/' + encodeURIComponent(editingClientId), {
+            method: 'PATCH',
+            headers: buildAdminHeaders(),
+            body: JSON.stringify(payload)
+          });
+          const d = await res.json().catch(function () { return {}; });
+          if (!res.ok || !d.ok) {
+            msg.textContent = (d && d.detail) ? d.detail : '保存失败';
+            return;
+          }
+          if (d.distribution) renderDistribution(d.distribution, lastDefaultModel);
+          clientEditModal.hidden = true;
+        } finally {
+          btn.disabled = false;
+        }
+      });
+
+      document.getElementById('editResetTodayQuotaBtn').addEventListener('click', async function () {
+        if (!editingClientId) return;
+        const btn = document.getElementById('editResetTodayQuotaBtn');
+        const msg = document.getElementById('editClientMsg');
+        btn.disabled = true;
+        try {
+          const res = await fetch('/api/distribution/clients/' + encodeURIComponent(editingClientId) + '/reset-quota', {
+            method: 'POST',
+            headers: buildAdminHeaders(),
+            body: JSON.stringify({ reset_total: false })
+          });
+          const d = await res.json().catch(function () { return {}; });
+          if (res.ok && d.distribution) {
+            renderDistribution(d.distribution, lastDefaultModel);
+            msg.textContent = '✓ 今日已用次数、Token 与预算计数已清零';
           }
         } finally {
           btn.disabled = false;
@@ -3724,6 +4796,323 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         document.getElementById('distShareBox').hidden = true;
       });
 
+      // Live Tasks, Sessions & Task Audit Center
+      function friendlyAuditStatusBadge(rec) {
+        const st = String(rec.status || 'ok').toLowerCase();
+        const code = Number(rec.status_code || 200);
+        const span = document.createElement('span');
+        if (st === 'ok' && code < 400) {
+          span.className = 'chip ok';
+          span.textContent = '✓ 成功';
+          return span;
+        }
+        if (code === 429 || st === 'rate_limited') {
+          span.className = 'chip warn';
+          span.textContent = '429 触发限流/配额';
+          return span;
+        }
+        if (code === 401 || code === 403 || st === 'forbidden') {
+          span.className = 'chip err';
+          span.textContent = code + ' 权限拦截';
+          return span;
+        }
+        span.className = 'chip err';
+        span.textContent = (code >= 400 ? (code + ' ') : '') + '执行异常';
+        return span;
+      }
+
+      function renderAuditCenter(dist, usage, sessionsList) {
+        const liveTasks = (dist && Array.isArray(dist.live_tasks)) ? dist.live_tasks : [];
+        const sessions = Array.isArray(sessionsList) ? sessionsList : [];
+        const recents = (usage && Array.isArray(usage.recent_requests)) ? usage.recent_requests : [];
+
+        const navLive = document.getElementById('navLiveTasksChip');
+        if (navLive) {
+          navLive.className = liveTasks.length > 0 ? 'chip busy' : 'chip';
+          navLive.textContent = liveTasks.length > 0 ? ('⚡ ' + liveTasks.length + ' 个任务执行中') : '当前无在途任务';
+        }
+        const sumChip = document.getElementById('auditSummaryChip');
+        if (sumChip) {
+          sumChip.className = liveTasks.length > 0 ? 'chip busy' : 'chip';
+          sumChip.textContent = liveTasks.length + ' 在途 · ' + sessions.length + ' 会话 · ' + recents.length + ' 条记录';
+        }
+
+        // 1) Live In-Flight Tasks
+        const liveChip = document.getElementById('liveTasksCountChip');
+        const liveBody = document.getElementById('liveTasksBody');
+        if (liveChip) {
+          liveChip.className = liveTasks.length > 0 ? 'chip busy' : 'chip';
+          liveChip.textContent = liveTasks.length > 0 ? (liveTasks.length + ' 项正在运行/排队') : '当前空闲';
+        }
+        if (liveTasks.length === 0) {
+          renderEmptyRow(liveBody, 6, '当前没有正在执行或排队的请求');
+        } else {
+          liveBody.replaceChildren();
+          liveTasks.forEach(function (t) {
+            const tr = document.createElement('tr');
+            const pChip = document.createElement('span');
+            const isRunning = (t.phase === 'running' || t.state === 'running');
+            pChip.className = isRunning ? 'chip busy' : 'chip warn';
+            pChip.textContent = (isRunning ? '生成中' : '排队等待') + (t.stream ? ' · 流式' : '');
+            tr.appendChild(makeCell(pChip));
+
+            const whoBox = document.createElement('div');
+            const whoTop = document.createElement('strong');
+            whoTop.textContent = friendlyTenantLabel(t.tenant_id, t.tenant_name);
+            whoBox.appendChild(whoTop);
+            if (t.client_ip) {
+              const ipSub = document.createElement('div');
+              ipSub.className = 'muted';
+              ipSub.style.fontSize = '0.72rem';
+              ipSub.textContent = t.client_ip;
+              whoBox.appendChild(ipSub);
+            }
+            tr.appendChild(makeCell(whoBox));
+
+            const tMeta = TASK_META[t.task_type] || { label: t.task_type || '调用' };
+            tr.appendChild(makeCell(tMeta.label + ' · ' + friendlyModel(t.model)));
+            tr.appendChild(makeCell(t.slot_key || t.tab_id ? friendlySeatLabel(t.slot_key, t.tab_id) : '等待分配'));
+
+            const prevDiv = document.createElement('div');
+            prevDiv.className = 'preview-wrap';
+            const pq = document.createElement('div');
+            pq.className = 'preview-q';
+            pq.textContent = t.prompt_preview || '（无文本摘要）';
+            prevDiv.appendChild(pq);
+            tr.appendChild(makeCell(prevDiv));
+
+            const sec = ((Number(t.elapsed_ms || 0)) / 1000).toFixed(1) + ' 秒';
+            tr.appendChild(makeCell(sec, 'num'));
+            liveBody.appendChild(tr);
+          });
+        }
+
+        // 2) Active & Archived Sessions
+        const sessTenSel = document.getElementById('sessionTenantFilter');
+        syncTenantSelectOptions(sessTenSel, '全部调用方会话');
+        const sessTenVal = (sessTenSel && sessTenSel.value) || 'all';
+        const sessQuery = String((document.getElementById('sessionSearchInput') && document.getElementById('sessionSearchInput').value) || '').trim().toLowerCase();
+        const purgeBtn = document.getElementById('sessionPurgeTenantBtn');
+        if (purgeBtn) {
+          purgeBtn.hidden = (sessTenVal === 'all');
+          if (sessTenVal !== 'all') {
+            purgeBtn.textContent = '清空「' + friendlyTenantLabel(sessTenVal, '') + '」全部会话';
+          }
+        }
+        const filteredSessions = sessions.filter(function (s) {
+          if (sessTenVal !== 'all' && (s.tenant_id || 'host') !== sessTenVal) return false;
+          if (sessQuery) {
+            const hay = [s.session_title, s.session_id, s.tenant_name, s.active_model].join(' ').toLowerCase();
+            if (hay.indexOf(sessQuery) === -1) return false;
+          }
+          return true;
+        });
+        const sessBody = document.getElementById('sessionsTableBody');
+        if (filteredSessions.length === 0) {
+          renderEmptyRow(sessBody, 7, '当前筛选条件下暂无活跃或归档会话');
+        } else {
+          sessBody.replaceChildren();
+          filteredSessions.slice(0, 60).forEach(function (s) {
+            const tr = document.createElement('tr');
+            const stChip = document.createElement('span');
+            if (s.busy || s.state === 'working') {
+              stChip.className = 'chip busy';
+              stChip.textContent = s.activity_label || '工作中';
+            } else if (s.source === 'live') {
+              stChip.className = 'chip ok';
+              stChip.textContent = '在线挂载 (' + friendlySeatLabel(s.slot_key, s.tab_id) + ')';
+            } else {
+              stChip.className = 'chip';
+              stChip.textContent = '历史归档';
+            }
+            tr.appendChild(makeCell(stChip));
+            tr.appendChild(makeCell(friendlyTenantLabel(s.tenant_id, s.tenant_name)));
+
+            const titleWrap = document.createElement('div');
+            titleWrap.className = 'preview-wrap';
+            const tMain = document.createElement('div');
+            tMain.className = 'preview-q';
+            tMain.textContent = s.session_title || '未命名会话';
+            titleWrap.appendChild(tMain);
+            if (s.session_id) {
+              const sidSub = document.createElement('div');
+              sidSub.className = 'muted mono';
+              sidSub.style.fontSize = '0.7rem';
+              sidSub.textContent = 'ID: ' + s.session_id;
+              titleWrap.appendChild(sidSub);
+            }
+            tr.appendChild(makeCell(titleWrap));
+
+            const turnsTxt = friendlyModel(s.active_model) + ' · ' + (s.user_turns || Math.ceil(Number(s.turn_count || 0) / 2)) + ' 轮提问';
+            tr.appendChild(makeCell(turnsTxt));
+            const ctxTok = Number(s.total_context_tokens || 0);
+            const cmpPct = Number(s.compact_pct || 0);
+            tr.appendChild(makeCell(fmtTok(ctxTok) + ' (' + cmpPct.toFixed(0) + '%)' + (s.compaction_count ? (' · 已整理 ' + s.compaction_count + ' 次') : '')));
+            const updStr = s.updated_at ? new Date(s.updated_at * 1000).toLocaleString() : '-';
+            tr.appendChild(makeCell(updStr));
+
+            const delSessBtn = document.createElement('button');
+            delSessBtn.type = 'button';
+            delSessBtn.className = 'btn sm danger-soft';
+            delSessBtn.textContent = s.source === 'live' ? '结束并释放' : '删除归档';
+            delSessBtn.disabled = Boolean(s.busy);
+            delSessBtn.addEventListener('click', async function () {
+              delSessBtn.disabled = true;
+              try {
+                const res = await fetch('/api/sessions/delete', {
+                  method: 'POST',
+                  headers: buildAdminHeaders(),
+                  body: JSON.stringify({ session_ref: s.session_ref })
+                });
+                if (res.ok) await refreshStatus();
+              } finally {
+                delSessBtn.disabled = false;
+              }
+            });
+            tr.appendChild(makeCell(delSessBtn));
+            sessBody.appendChild(tr);
+          });
+        }
+
+        // 3) Searchable Task Audit Log
+        const audTenSel = document.getElementById('auditTenantFilter');
+        syncTenantSelectOptions(audTenSel, '全部调用方（本机 + 外部密钥）');
+        const audTenVal = (audTenSel && audTenSel.value) || 'all';
+        const audStVal = (document.getElementById('auditStatusFilter') && document.getElementById('auditStatusFilter').value) || 'all';
+        const audQuery = String((document.getElementById('auditSearchInput') && document.getElementById('auditSearchInput').value) || '').trim().toLowerCase();
+
+        const filteredAudit = recents.filter(function (r) {
+          if (audTenVal !== 'all' && (r.tenant_id || 'host') !== audTenVal) return false;
+          const code = Number(r.status_code || 200);
+          const st = String(r.status || 'ok').toLowerCase();
+          if (audStVal === 'ok' && !(st === 'ok' && code < 400)) return false;
+          if (audStVal === 'blocked' && !(code === 401 || code === 403 || code === 429 || st === 'forbidden' || st === 'rate_limited')) return false;
+          if (audStVal === 'error' && !(code >= 500 || (st === 'error' && code !== 401 && code !== 403 && code !== 429))) return false;
+          if (audQuery) {
+            const hay = [
+              r.prompt_preview, r.reply_preview, r.error_message, r.error_code,
+              r.session_title, r.session_id, r.tenant_name, r.client_ip, r.model, r.requested_model
+            ].join(' ').toLowerCase();
+            if (hay.indexOf(audQuery) === -1) return false;
+          }
+          return true;
+        });
+
+        const audChip = document.getElementById('auditCountChip');
+        if (audChip) audChip.textContent = '匹配 ' + filteredAudit.length + ' 条记录';
+        const audBody = document.getElementById('auditLogBody');
+        if (filteredAudit.length === 0) {
+          renderEmptyRow(audBody, 6, '当前筛选条件下暂无任务调用记录');
+        } else {
+          audBody.replaceChildren();
+          filteredAudit.slice(0, 80).forEach(function (r) {
+            const tr = document.createElement('tr');
+            const tsBox = document.createElement('div');
+            const tsStr = r.ts ? ((r.day ? r.day.slice(5) + ' ' : '') + new Date(r.ts * 1000).toLocaleTimeString()) : '-';
+            const tsLine = document.createElement('div');
+            tsLine.style.fontSize = '0.75rem';
+            tsLine.style.marginBottom = '3px';
+            tsLine.textContent = tsStr;
+            tsBox.appendChild(tsLine);
+            tsBox.appendChild(friendlyAuditStatusBadge(r));
+            tr.appendChild(makeCell(tsBox));
+
+            const callerBox = document.createElement('div');
+            const callerStrong = document.createElement('strong');
+            callerStrong.textContent = friendlyTenantLabel(r.tenant_id, r.tenant_name);
+            callerBox.appendChild(callerStrong);
+            if (r.client_ip) {
+              const ipLine = document.createElement('div');
+              ipLine.className = 'muted mono';
+              ipLine.style.fontSize = '0.72rem';
+              ipLine.textContent = r.client_ip;
+              callerBox.appendChild(ipLine);
+            }
+            tr.appendChild(makeCell(callerBox));
+
+            const mBox = document.createElement('div');
+            const tMeta = TASK_META[r.task_type] || { label: r.task_label || '调用' };
+            const mTop = document.createElement('div');
+            mTop.textContent = tMeta.label + ' · ' + friendlyModel(r.display_name || r.model);
+            mBox.appendChild(mTop);
+            const mSub = document.createElement('div');
+            mSub.className = 'muted';
+            mSub.style.fontSize = '0.72rem';
+            mSub.textContent = (r.slot_key || r.tab_id ? friendlySeatLabel(r.slot_key, r.tab_id) : '未进席位') + (r.session_title ? (' · ' + r.session_title.slice(0, 18)) : '');
+            mBox.appendChild(mSub);
+            tr.appendChild(makeCell(mBox));
+
+            const pv = document.createElement('div');
+            pv.className = 'preview-wrap';
+            if (r.prompt_preview) {
+              const qEl = document.createElement('div');
+              qEl.className = 'preview-q';
+              qEl.textContent = '问：' + r.prompt_preview;
+              pv.appendChild(qEl);
+            }
+            const ansText = r.error_message || r.reply_preview || '';
+            if (ansText) {
+              const aEl = document.createElement('div');
+              aEl.className = 'preview-a';
+              aEl.textContent = (r.error_message ? '原因：' : '答：') + ansText;
+              pv.appendChild(aEl);
+            }
+            if (!r.prompt_preview && !ansText) {
+              const dash = document.createElement('span');
+              dash.className = 'muted';
+              dash.textContent = '常规调用完成';
+              pv.appendChild(dash);
+            }
+            tr.appendChild(makeCell(pv));
+
+            const rt = resolveTokenParts(r);
+            const tokBox = document.createElement('div');
+            tokBox.textContent = rt.total > 0 ? (fmtLedgerTok(rt.total) + ' · ' + fmtMoney(r.cached_equivalent_cost_usd, r.cached_equivalent_cost_cny)) : '-';
+            if (rt.total > 0) {
+              const tokSub = document.createElement('div');
+              tokSub.className = 'muted';
+              tokSub.style.fontSize = '0.71rem';
+              tokSub.textContent = '入 ' + fmtLedgerTok(rt.input) + ' / 出 ' + fmtLedgerTok(rt.output) + ' / 缓 ' + fmtLedgerTok(rt.cached);
+              tokBox.appendChild(tokSub);
+            }
+            tr.appendChild(makeCell(tokBox));
+            tr.appendChild(makeCell(((Number(r.duration_ms || 0)) / 1000).toFixed(1) + ' 秒', 'num'));
+            audBody.appendChild(tr);
+          });
+        }
+      }
+
+      ['sessionTenantFilter', 'auditTenantFilter', 'auditStatusFilter'].forEach(function (id) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.addEventListener('change', function () {
+          renderAuditCenter(lastDistSnapshot, lastUsageSnapshot, lastSessionsOverview);
+        });
+      });
+      ['sessionSearchInput', 'auditSearchInput'].forEach(function (id) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.addEventListener('input', function () {
+          renderAuditCenter(lastDistSnapshot, lastUsageSnapshot, lastSessionsOverview);
+        });
+      });
+      document.getElementById('sessionPurgeTenantBtn').addEventListener('click', async function () {
+        const btn = document.getElementById('sessionPurgeTenantBtn');
+        const tid = document.getElementById('sessionTenantFilter').value;
+        if (!tid || tid === 'all') return;
+        btn.disabled = true;
+        try {
+          const res = await fetch('/api/sessions/delete', {
+            method: 'POST',
+            headers: buildAdminHeaders(),
+            body: JSON.stringify({ purge_tenant_id: tid, abort_inflight: false })
+          });
+          if (res.ok) await refreshStatus();
+        } finally {
+          btn.disabled = false;
+        }
+      });
+
       // Guide Modal & One-Click Copy
       const modal = document.getElementById('guideModal');
       document.getElementById('openGuideBtn').addEventListener('click', function () {
@@ -3737,6 +5126,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       });
       document.addEventListener('keydown', function (ev) {
         if (ev.key === 'Escape' && !modal.hidden) modal.hidden = true;
+        if (ev.key === 'Escape' && !clientEditModal.hidden) clientEditModal.hidden = true;
       });
 
       document.querySelectorAll('[data-copy-target]').forEach(function (btn) {

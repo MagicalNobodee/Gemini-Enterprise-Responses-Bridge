@@ -2,7 +2,7 @@
 import asyncio
 
 
-async def with_keepalive(stream, interval=14.5, frame=': keepalive\n\n'):
+async def with_keepalive(stream, interval=12.0, frame=': keepalive\n\n'):
     pending = None
     try:
         while True:

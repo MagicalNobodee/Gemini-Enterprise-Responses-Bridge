@@ -5,6 +5,7 @@ import base64
 import io
 import json
 from pathlib import Path
+import struct
 import subprocess
 import wave
 import zipfile
@@ -15,7 +16,14 @@ import pytest
 from config import BridgeSettings
 from extension_exporter import render_spark_icon_png
 from imagegen_mcp import handle as mcp_handle
-from media_inputs import FileStore, InvalidAttachmentError, resolve_mime_and_name
+from media_inputs import (
+    _POSIX_FFMPEG_PATHS,
+    _find_binary,
+    FileStore,
+    InvalidAttachmentError,
+    resolve_mime_and_name,
+)
+from platform_compat import subprocess_hidden_kwargs
 from server import create_app
 from test_responses import browser, packets
 
@@ -59,51 +67,76 @@ def _make_openxml_bytes() -> bytes:
     return buf.getvalue()
 
 
+def _make_bmp_bytes(width: int = 8, height: int = 8) -> bytes:
+    stride = ((width * 3 + 3) // 4) * 4
+    pixel_bytes = (b"\xeb\x63\x25" * width + b"\x00" * (stride - width * 3)) * height
+    file_size = 54 + len(pixel_bytes)
+    header = struct.pack("<2sIHHI", b"BM", file_size, 0, 0, 54)
+    dib = struct.pack("<IiiHHIIiiII", 40, width, height, 1, 24, 0, len(pixel_bytes), 2835, 2835, 0, 0)
+    return header + dib + pixel_bytes
+
+
 def _make_mp4_bytes(tmp_path: Path) -> bytes:
-    png = tmp_path / "f.png"
-    mp4 = tmp_path / "v.mp4"
-    png.write_bytes(render_spark_icon_png(32))
-    subprocess.run(
-        [
-            "/opt/homebrew/bin/ffmpeg", "-y", "-loop", "1", "-i", str(png),
-            "-t", "0.3", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(mp4),
-        ],
-        check=True,
-        capture_output=True,
-    )
-    return mp4.read_bytes()
+    ffmpeg = _find_binary("ffmpeg", _POSIX_FFMPEG_PATHS)
+    if ffmpeg:
+        png = tmp_path / "f.png"
+        mp4 = tmp_path / "v.mp4"
+        png.write_bytes(render_spark_icon_png(32))
+        proc = subprocess.run(
+            [
+                ffmpeg, "-y", "-loop", "1", "-i", str(png),
+                "-t", "0.3", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(mp4),
+            ],
+            check=False,
+            capture_output=True,
+            **subprocess_hidden_kwargs(),
+        )
+        if proc.returncode == 0 and mp4.is_file() and mp4.stat().st_size > 0:
+            return mp4.read_bytes()
+    ftyp = struct.pack(">I4s4sI4s4s", 24, b"ftyp", b"isom", 512, b"isom", b"mp41")
+    moov = struct.pack(">I4s", 8, b"moov")
+    mdat = struct.pack(">I4s8s", 16, b"mdat", b"\x00" * 8)
+    return ftyp + moov + mdat
 
 
 def test_format_validation_and_web_normalization(tmp_path: Path) -> None:
-    # BMP & HEIC normalize to image/png for Gemini Enterprise web compatibility
-    png_src = tmp_path / "src.png"
+    # BMP normalizes to image/png on every platform (Pillow / sips / stdlib fallback)
     bmp_src = tmp_path / "src.bmp"
-    heic_src = tmp_path / "src.heic"
-    png_src.write_bytes(render_spark_icon_png(32))
-    subprocess.run(["/usr/bin/sips", "-s", "format", "bmp", str(png_src), "--out", str(bmp_src)], check=True, capture_output=True)
-    subprocess.run(["/usr/bin/sips", "-s", "format", "heic", str(png_src), "--out", str(heic_src)], check=True, capture_output=True)
+    bmp_src.write_bytes(_make_bmp_bytes(12, 12))
+    img_targets = [bmp_src]
 
-    for img_file in (bmp_src, heic_src):
+    sips = _find_binary("sips", ("/usr/bin/sips",))
+    if sips:
+        png_src = tmp_path / "src.png"
+        heic_src = tmp_path / "src.heic"
+        png_src.write_bytes(render_spark_icon_png(32))
+        subprocess.run([sips, "-s", "format", "heic", str(png_src), "--out", str(heic_src)], check=True, capture_output=True)
+        img_targets.append(heic_src)
+
+    for img_file in img_targets:
         mime, cat, norm_raw, safe_name = resolve_mime_and_name(img_file.read_bytes(), filename=img_file.name)
         assert mime == "image/png"
         assert cat == "image"
         assert norm_raw.startswith(b"\x89PNG\r\n\x1a\n")
         assert safe_name.endswith(".png")
 
-    # WAV normalizes to audio/mp4 (.m4a) when normalize_for_web=True, and stays audio/wav when False
+    # WAV normalizes to audio/mp4 (.m4a) when host audio transcoder is available, and stays audio/wav when False
     wav_raw = _make_wav_bytes()
     mime_w, cat_w, m4a_raw, name_w = resolve_mime_and_name(wav_raw, filename="clip.wav", normalize_for_web=True)
-    assert mime_w == "audio/mp4"
     assert cat_w == "audio"
-    assert name_w == "clip.m4a"
-    assert b"ftyp" in m4a_raw[:16]
+    if mime_w == "audio/mp4":
+        assert name_w == "clip.m4a"
+        assert b"ftyp" in m4a_raw[:16]
+    else:
+        assert mime_w == "audio/wav"
+        assert name_w == "clip.wav"
 
     mime_raw_wav, _, kept_wav, name_raw_wav = resolve_mime_and_name(wav_raw, filename="clip.wav", normalize_for_web=False)
     assert mime_raw_wav == "audio/wav"
     assert kept_wav == wav_raw
     assert name_raw_wav == "clip.wav"
 
-    # RTF normalizes to DOCX via textutil
+    # RTF normalizes to DOCX across all platforms (textutil or built-in OpenXML converter)
     rtf_raw = b"{\\rtf1\\ansi\\deff0 Hello RTF World}"
     mime_d, cat_d, docx_raw, name_d = resolve_mime_and_name(rtf_raw, filename="note.rtf")
     assert mime_d == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -111,15 +144,22 @@ def test_format_validation_and_web_normalization(tmp_path: Path) -> None:
     assert name_d == "note.docx"
     assert docx_raw.startswith(b"PK\x03\x04")
 
-    #MOV normalizes to video/mp4 via ffmpeg
-    mp4_bytes = _make_mp4_bytes(tmp_path)
-    mov_path = tmp_path / "clip.mov"
-    subprocess.run(["/opt/homebrew/bin/ffmpeg", "-y", "-i", str(tmp_path / "v.mp4"), "-c", "copy", str(mov_path)], check=True, capture_output=True)
-    mime_v, cat_v, norm_mp4, name_v = resolve_mime_and_name(mov_path.read_bytes(), filename="clip.mov")
-    assert mime_v == "video/mp4"
-    assert cat_v == "video"
-    assert name_v == "clip.mp4"
-    assert len(norm_mp4) > 0
+    # MOV normalizes to video/mp4 via ffmpeg when available
+    ffmpeg = _find_binary("ffmpeg", _POSIX_FFMPEG_PATHS)
+    if ffmpeg:
+        _make_mp4_bytes(tmp_path)
+        mov_path = tmp_path / "clip.mov"
+        subprocess.run(
+            [ffmpeg, "-y", "-i", str(tmp_path / "v.mp4"), "-c", "copy", str(mov_path)],
+            check=True,
+            capture_output=True,
+            **subprocess_hidden_kwargs(),
+        )
+        mime_v, cat_v, norm_mp4, name_v = resolve_mime_and_name(mov_path.read_bytes(), filename="clip.mov")
+        assert mime_v == "video/mp4"
+        assert cat_v == "video"
+        assert name_v == "clip.mp4"
+        assert len(norm_mp4) > 0
 
     # Mismatched header is rejected
     with pytest.raises(InvalidAttachmentError):
@@ -191,7 +231,7 @@ def test_responses_and_chat_multimodal_parts_and_large_staging(tmp_path: Path) -
         assert len(atts) == 4
         by_cat = {a["category"]: a for a in atts if a["name"] != "huge.csv"}
         assert by_cat["document"]["name"] == "brief.pdf"
-        assert by_cat["audio"]["mime_type"] == "audio/mp4"  # normalized from WAV!
+        assert by_cat["audio"]["mime_type"] in {"audio/mp4", "audio/wav"}
         assert by_cat["video"]["mime_type"] == "video/mp4"
 
         huge_att = next(a for a in atts if a["name"] == "huge.csv")
@@ -244,7 +284,7 @@ def test_multimodal_outputs_image_edits_video_gen_and_audio_transcription(tmp_pa
         )
         assert tr.status_code == 200
         assert tr.json()["text"] == "The verification code is 7492."
-        assert commands[2]["attachments"][0]["name"] == "voice.m4a"
+        assert commands[2]["attachments"][0]["name"] in {"voice.m4a", "voice.wav"}
 
         # 4. Streaming /v1/responses with generated downloadable PDF attachment
         evts = packets(client.post("/v1/responses", json={"input": "Export report", "stream": True}).text)

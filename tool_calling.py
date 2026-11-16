@@ -496,7 +496,7 @@ def parse_assistant_output(
     remaining_text = "".join(pieces) + text[cursor:]
     # Quoted logs are data; alternate executable syntax is rejected, never parsed.
     unquoted = re.sub(
-        r"(?ms)^[ \t]{0,3}(`{3,}|~{3,})([^\n]*)\n.*?^[ \t]{0,3}\1[ \t]*$",
+        r"(?ms)^[ \t]{0,3}(`{3,}|~{3,})([^\r\n]*)\r?\n.*?^[ \t]{0,3}\1[ \t]*\r?$",
         lambda m: m[0] if m[2].strip().lower() in {"tool_call", "tool_use"} else "",
         remaining_text,
     )
@@ -602,9 +602,25 @@ _SIMPLE_READ_BINS = {
     "strings",
     "hexdump",
     "od",
+    "dir",
+    "where",
+    "get-content",
+    "gc",
+    "get-childitem",
+    "gci",
+    "get-item",
+    "gi",
+    "get-location",
+    "gl",
+    "select-object",
+    "measure-object",
+    "where-object",
+    "resolve-path",
+    "test-path",
+    "get-filehash",
 }
 
-_SEARCH_READ_BINS = {"rg", "grep", "egrep", "fgrep"}
+_SEARCH_READ_BINS = {"rg", "grep", "egrep", "fgrep", "findstr", "select-string", "sls"}
 _GIT_READ_SUBCOMMANDS = {
     "status",
     "diff",
@@ -633,11 +649,17 @@ _VERSION_CHECK_BINS = {
     "deno",
     "python",
     "python3",
+    "py",
+    "pwsh",
+    "powershell",
     "pip",
     "pip3",
     "pytest",
     "rg",
     "git",
+    "cloudflared",
+    "ffmpeg",
+    "gcloud",
     "go",
     "rustc",
     "cargo",
@@ -659,11 +681,11 @@ _FIND_UNSAFE_FLAGS = {
     "-fls",
 }
 _SAFE_REDIRECT_RE = re.compile(
-    r"(?:[12]>&[12]|(?:[12&]?>>?|<)[ \t]*/dev/null)(?=$|\s|[|;&])"
+    r"(?i)(?:[12]>&[12]|(?:[12&]?>>?|<)[ \t]*(?:/dev/null|nul|\$null))(?=$|\s|[|;&])"
 )
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _APPLY_PATCH_HEADER_RE = re.compile(
-    r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)$",
+    r"^\*\*\* (?:Add File|Update File|Delete File|Move to): ([^\r\n]+)\r?$",
     re.MULTILINE,
 )
 
@@ -713,13 +735,24 @@ def _split_safe_read_pipeline(cmd: str) -> Optional[List[List[str]]]:
             continue
         if ch == "\\":
             if i + 1 >= n:
-                return None
+                token.append("\\")
+                in_token = True
+                i += 1
+                continue
+            if cmd[i + 1] == "\r" and i + 2 < n and cmd[i + 2] == "\n":
+                i += 3
+                continue
             if cmd[i + 1] in "\r\n":
                 i += 2
                 continue
-            token.append(cmd[i + 1])
+            if cmd[i + 1] in " \t'\"$&|;<>()`\\":
+                token.append(cmd[i + 1])
+                in_token = True
+                i += 2
+                continue
+            token.append("\\")
             in_token = True
-            i += 2
+            i += 1
             continue
         if not in_token and (redir := _SAFE_REDIRECT_RE.match(cmd, i)):
             i = redir.end()
@@ -789,7 +822,8 @@ def _is_safe_read_stage(tokens: List[str]) -> bool:
         tokens = tokens[1:]
     if not tokens:
         return False
-    prog = tokens[0].rsplit("/", 1)[-1]
+    raw_prog = tokens[0].replace("\\", "/").rsplit("/", 1)[-1]
+    prog = re.sub(r"\.(?:exe|cmd|bat)$", "", raw_prog, flags=re.IGNORECASE).lower()
     if prog in _SIMPLE_READ_BINS:
         return True
     if prog == "cd":
@@ -902,10 +936,19 @@ def _is_safe_read_stage(tokens: List[str]) -> bool:
     return False
 
 
+_WIN_ABS_EDIT_RE = re.compile(r"^(?:[A-Za-z]:/|//)")
+
+
+def _is_abs_edit_path(path_str: str) -> bool:
+    return path_str.startswith("/") or bool(_WIN_ABS_EDIT_RE.match(path_str))
+
+
 def _normalize_edit_path(raw: str) -> Optional[str]:
-    cleaned = raw.strip()
+    cleaned = raw.strip().replace("\\", "/")
     if not cleaned:
         return None
+    if cleaned.startswith("//") and not cleaned.startswith("///"):
+        return "//" + posixpath.normpath(cleaned[2:]).lstrip("/")
     return posixpath.normpath(cleaned)
 
 
@@ -938,11 +981,12 @@ def _extract_edit_paths(call: dict) -> Optional[set[str]]:
 
 
 def _paths_may_alias(p1: str, p2: str) -> bool:
-    if p1 == p2:
+    c1, c2 = p1.casefold(), p2.casefold()
+    if c1 == c2:
         return True
-    abs1, abs2 = p1.startswith("/"), p2.startswith("/")
+    abs1, abs2 = _is_abs_edit_path(p1), _is_abs_edit_path(p2)
     if abs1 != abs2:
-        full, rel = (p1, p2) if abs1 else (p2, p1)
+        full, rel = (c1, c2) if abs1 else (c2, c1)
         if rel == "." or full.endswith("/" + rel):
             return True
     return False

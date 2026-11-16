@@ -30,7 +30,13 @@ def test_served_dashboard_javascript_parses(tmp_path: Path) -> None:
     for script in scripts:
         result = subprocess.run(
             [node, "--check", "--input-type=commonjs"],
-            input=script, capture_output=True, text=True, timeout=10, check=False,
+            input=script,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
         )
         assert result.returncode == 0, result.stderr
 

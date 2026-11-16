@@ -293,6 +293,38 @@ class BrowserBridgeHub:
             if mapped == slot.slot_key:
                 self._session_affinity.pop(sid, None)
 
+    def evict_tenant_slots(self, tenant_id: str, *, abort_inflight: bool = False) -> Dict[str, int]:
+        eff_tid = (tenant_id or "").strip()
+        if not eff_tid:
+            return {"evicted_slots": 0, "aborted_requests": 0}
+        evicted_slots = 0
+        aborted_reqs = 0
+        prefix = f"{eff_tid}::"
+        for sid in list(self._session_affinity.keys()):
+            if sid.startswith(prefix):
+                self._session_affinity.pop(sid, None)
+        for slot in list(self._slots.values()):
+            slot_belongs = slot.owner_tenant_id == eff_tid or (
+                bool(slot.pinned_session_id) and slot.pinned_session_id.startswith(prefix)
+            )
+            if not slot_belongs:
+                continue
+            if abort_inflight:
+                for req_id, inflight in list(self._pending.items()):
+                    if inflight.slot_key == slot.slot_key:
+                        inflight.events.put_nowait(
+                            {
+                                "type": "error",
+                                "message": "管理员已断开或重置当前客户端会话连接。",
+                            }
+                        )
+                        self._pending.pop(req_id, None)
+                        aborted_reqs += 1
+            if not slot.is_busy or abort_inflight:
+                self._evict_slot_binding(slot)
+                evicted_slots += 1
+        return {"evicted_slots": evicted_slots, "aborted_requests": aborted_reqs}
+
     def clear_slot_affinity_only(self, slot: WorkerSlot) -> None:
         old_sid = slot.pinned_session_id
         slot.pinned_session_id = None
@@ -1192,6 +1224,17 @@ class BrowserBridgeHub:
     ) -> bool:
         if now < slot.pending_tool_call_until:
             return True
+        if (
+            self.session_affinity_ttl_seconds > 0
+            and slot.owner_tenant_id
+            and slot.owner_tenant_id != "host"
+            and not slot.is_busy
+            and slot.waiting_count == 0
+            and slot.last_used_at > 0.0
+            and (now - slot.last_used_at) > self.session_affinity_ttl_seconds
+        ):
+            self._evict_slot_binding(slot)
+            return False
         if slot.owner_tenant_id and requester_tenant_id and slot.owner_tenant_id != requester_tenant_id:
             return True
         if slot.pinned_session_id and slot.pinned_session_id != explicit_session_id:
@@ -1210,6 +1253,7 @@ class BrowserBridgeHub:
         preferred_session_url: Optional[str] = None,
         ephemeral_probe: bool = False,
         tenant_id: str = "host",
+        avoid_affinity_slot: bool = False,
     ) -> AsyncIterator[WorkerSlot]:
         """Atomically select/spawn and lock an isolated `WorkerSlot` for parallel execution."""
         queue_deadline = asyncio.get_running_loop().time() + queue_timeout
@@ -1248,24 +1292,51 @@ class BrowserBridgeHub:
 
             ready_map = {s.slot_key: s for s in ready_slots}
             now = time.time()
+            in_flight_or_waiting = sum(
+                1 for s in ready_slots if s.is_busy or s.waiting_count > 0
+            ) + sum(c.spawning_count for c in self._clients.values())
+            has_parallel_headroom = in_flight_or_waiting < self.max_parallel_tabs
+            busy_affinity_cand: Optional[WorkerSlot] = None
+
+            valid_matches = (
+                [
+                    ready_map[k]
+                    for k in matching_slot_keys
+                    if k in ready_map
+                    and (
+                        not ready_map[k].owner_tenant_id
+                        or not effective_tenant_id
+                        or ready_map[k].owner_tenant_id == effective_tenant_id
+                    )
+                ]
+                if matching_slot_keys
+                else []
+            )
+            idle_matches = [
+                s for s in valid_matches if not s.is_busy and s.waiting_count == 0
+            ]
 
             # 1) Explicit session_id affinity (`X-Session-Id` / `session_id` / `model@session`)
             aff_key = self.get_affinity_slot_key(effective_session_id)
             if aff_key in ready_map:
                 cand = ready_map[aff_key]
                 if not cand.owner_tenant_id or not effective_tenant_id or cand.owner_tenant_id == effective_tenant_id:
-                    chosen = cand
-                    reused_existing_session = True
+                    if not cand.is_busy and cand.waiting_count == 0 and not avoid_affinity_slot:
+                        chosen = idle_matches[0] if (idle_matches and cand not in idle_matches) else cand
+                        reused_existing_session = True
+                    else:
+                        busy_affinity_cand = cand
 
             # 2) Multi-turn conversation history prefix affinity (`matching_slot_keys`)
-            if chosen is None and matching_slot_keys:
-                valid_matches = [ready_map[k] for k in matching_slot_keys if k in ready_map]
-                if valid_matches:
-                    idle_matches = [
-                        s for s in valid_matches if not s.is_busy and s.waiting_count == 0
-                    ]
-                    chosen = idle_matches[0] if idle_matches else valid_matches[0]
+            if chosen is None and valid_matches:
+                if idle_matches:
+                    chosen = idle_matches[0]
                     reused_existing_session = True
+                elif not has_parallel_headroom:
+                    chosen = valid_matches[0]
+                    reused_existing_session = True
+                elif busy_affinity_cand is None:
+                    busy_affinity_cand = valid_matches[0]
 
             # 2.5) Live tab already sitting on the target archived `/r/session/<id>` URL
             if chosen is None and preferred_vsid:
@@ -1279,8 +1350,12 @@ class BrowserBridgeHub:
                     idle_url_matches = [
                         s for s in url_matches if not s.is_busy and s.waiting_count == 0
                     ]
-                    chosen = idle_url_matches[0] if idle_url_matches else url_matches[0]
-                    reused_existing_session = True
+                    if idle_url_matches:
+                        chosen = idle_url_matches[0]
+                        reused_existing_session = True
+                    elif not has_parallel_headroom:
+                        chosen = url_matches[0]
+                        reused_existing_session = True
 
             # 3) Truly blank/unoccupied idle slot not holding any prior conversation
             if chosen is None:
@@ -1289,6 +1364,7 @@ class BrowserBridgeHub:
                     for s in ready_slots
                     if not s.is_busy
                     and s.waiting_count == 0
+                    and not (avoid_affinity_slot and s.slot_key == aff_key)
                     and not self._is_slot_holding_protected_session(
                         s, effective_session_id, now, requester_tenant_id=effective_tenant_id
                     )
@@ -1322,9 +1398,25 @@ class BrowserBridgeHub:
 
             # 5) Pool at max_parallel_tabs (or spawn unavailable): pick true LRU idle slot, else least-loaded busy slot
             if chosen is None and spawn_target is None:
-                chosen = self._select_fallback_slot(
-                    ready_slots, now, requester_tenant_id=effective_tenant_id or "host"
+                fallback_pool = (
+                    [s for s in ready_slots if s.slot_key != aff_key]
+                    if (avoid_affinity_slot and len(ready_slots) > 1)
+                    else ready_slots
                 )
+                fallback = self._select_fallback_slot(
+                    fallback_pool, now, requester_tenant_id=effective_tenant_id or "host"
+                )
+                if (
+                    busy_affinity_cand is not None
+                    and not avoid_affinity_slot
+                    and (fallback.is_busy or fallback.waiting_count > 0)
+                    and (busy_affinity_cand.waiting_count + (1 if busy_affinity_cand.is_busy else 0))
+                    <= (fallback.waiting_count + (1 if fallback.is_busy else 0))
+                ):
+                    chosen = busy_affinity_cand
+                    reused_existing_session = True
+                else:
+                    chosen = fallback
 
             if chosen is not None:
                 chosen.waiting_count += 1
@@ -1332,7 +1424,9 @@ class BrowserBridgeHub:
                     reused_existing_session
                     or (not chosen.is_busy and chosen.waiting_count == 1 and not self._is_slot_occupied(chosen))
                 ):
-                    self._session_affinity[effective_session_id] = chosen.slot_key
+                    existing_aff = self.get_affinity_slot_key(effective_session_id)
+                    if existing_aff is None or existing_aff == chosen.slot_key or reused_existing_session:
+                        self._session_affinity[effective_session_id] = chosen.slot_key
                     chosen.pinned_session_id = effective_session_id
                     if effective_tenant_id:
                         chosen.owner_tenant_id = effective_tenant_id
@@ -1375,7 +1469,9 @@ class BrowserBridgeHub:
                     reused_existing_session
                     or (not chosen.is_busy and chosen.waiting_count == 1 and not self._is_slot_occupied(chosen))
                 ):
-                    self._session_affinity[effective_session_id] = chosen.slot_key
+                    existing_aff = self.get_affinity_slot_key(effective_session_id)
+                    if existing_aff is None or existing_aff == chosen.slot_key or reused_existing_session:
+                        self._session_affinity[effective_session_id] = chosen.slot_key
                     chosen.pinned_session_id = effective_session_id
                     if effective_tenant_id:
                         chosen.owner_tenant_id = effective_tenant_id
@@ -1425,7 +1521,9 @@ class BrowserBridgeHub:
                 )):
                     self._evict_slot_binding(chosen)
                 if effective_session_id:
-                    self._session_affinity[effective_session_id] = chosen.slot_key
+                    existing_aff = self.get_affinity_slot_key(effective_session_id)
+                    if existing_aff is None or existing_aff == chosen.slot_key or reused_existing_session:
+                        self._session_affinity[effective_session_id] = chosen.slot_key
                     chosen.pinned_session_id = effective_session_id
                 if effective_tenant_id:
                     chosen.owner_tenant_id = effective_tenant_id
