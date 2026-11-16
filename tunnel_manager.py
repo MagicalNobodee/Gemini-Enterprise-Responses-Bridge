@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import http.client
+import ipaddress
 import json
 import logging
 import re
+import socket
 import ssl
 import subprocess
 import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -79,6 +83,192 @@ def _normalize_https_origin(raw: str) -> str:
     if cleaned.endswith("/v1"):
         cleaned = cleaned[:-3].rstrip("/")
     return cleaned
+
+
+_DOH_JSON_ENDPOINTS: tuple[str, ...] = (
+    "https://1.1.1.1/dns-query",
+    "https://223.5.5.5/resolve",
+)
+
+
+def _is_dns_resolution_error(exc: BaseException) -> bool:
+    if isinstance(exc, socket.gaierror):
+        return True
+    if isinstance(exc, urllib.error.URLError) and isinstance(getattr(exc, "reason", None), socket.gaierror):
+        return True
+    msg = str(exc or "").lower()
+    dns_markers = (
+        "nodename nor servname",
+        "name or service not known",
+        "getaddrinfo failed",
+        "temporary failure in name resolution",
+        "no address associated with hostname",
+        "errno 8",
+        "errno -2",
+        "errno -3",
+        "errno 11001",
+    )
+    return any(m in msg for m in dns_markers)
+
+
+def _resolve_host_via_doh(hostname: str, *, timeout: float = 2.5) -> Optional[str]:
+    """Resolve A record via public DoH IP literals without touching or poisoning OS DNS cache."""
+    host_clean = (hostname or "").strip().rstrip(".")
+    if not host_clean:
+        return None
+    try:
+        ipaddress.ip_address(host_clean)
+        return host_clean
+    except ValueError:
+        pass
+
+    ctx = ssl.create_default_context()
+    q = urllib.parse.urlencode({"name": host_clean, "type": "A"})
+    for endpoint in _DOH_JSON_ENDPOINTS:
+        req = urllib.request.Request(
+            f"{endpoint}?{q}",
+            headers={
+                "Accept": "application/dns-json",
+                "User-Agent": "GeminiEnterpriseBridge-DoH/1.0",
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                if int(resp.status) != 200:
+                    continue
+                payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            if not isinstance(payload, dict) or int(payload.get("Status", -1)) != 0:
+                continue
+            for ans in payload.get("Answer") or []:
+                if not isinstance(ans, dict) or int(ans.get("type") or 0) != 1:
+                    continue
+                candidate = str(ans.get("data") or "").strip()
+                try:
+                    ip_obj = ipaddress.ip_address(candidate)
+                    if not ip_obj.is_loopback and not ip_obj.is_private and not ip_obj.is_unspecified:
+                        return candidate
+                except ValueError:
+                    continue
+        except Exception:
+            continue
+    return None
+
+
+class _PinnedIPHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection dialing a DoH-resolved edge IP while preserving strict TLS SNI & hostname check."""
+
+    def __init__(
+        self,
+        host: str,
+        *,
+        pinned_ip: str,
+        port: int = 443,
+        timeout: float = 8.0,
+        context: Optional[ssl.SSLContext] = None,
+    ) -> None:
+        super().__init__(host, port=port, timeout=timeout, context=context)
+        self._pinned_ip = pinned_ip
+
+    def connect(self) -> None:
+        raw_sock = socket.create_connection((self._pinned_ip, self.port), self.timeout)
+        if self._tunnel_host:
+            self.sock = raw_sock
+            self._tunnel()
+            server_host = self._tunnel_host
+        else:
+            server_host = self.host
+        ctx = self._context or ssl.create_default_context()
+        self.sock = ctx.wrap_socket(raw_sock, server_hostname=server_host)
+
+
+def _http_get_with_doh_fallback(
+    url: str,
+    *,
+    headers: Dict[str, str],
+    timeout: float = 8.0,
+    ctx: Optional[ssl.SSLContext] = None,
+    pinned_ip_cache: Optional[Dict[str, str]] = None,
+) -> tuple[int, str]:
+    """Perform GET via standard urllib, falling back to DoH + strict SNI if OS DNS has stale NXDOMAIN."""
+    ssl_ctx = ctx or ssl.create_default_context()
+    parsed = urllib.parse.urlparse(url)
+    hostname = (parsed.hostname or "").strip()
+    scheme = (parsed.scheme or "https").lower()
+    cache = pinned_ip_cache if pinned_ip_cache is not None else {}
+
+    def _via_pinned_ip(edge_ip: str) -> tuple[int, str]:
+        port = parsed.port or 443
+        path_q = parsed.path or "/"
+        if parsed.query:
+            path_q = f"{path_q}?{parsed.query}"
+        req_headers = dict(headers)
+        req_headers.setdefault("Host", parsed.netloc or hostname)
+        req_headers.setdefault("Connection", "close")
+        conn = _PinnedIPHTTPSConnection(
+            hostname,
+            pinned_ip=edge_ip,
+            port=port,
+            timeout=timeout,
+            context=ssl_ctx,
+        )
+        try:
+            conn.request("GET", path_q, headers=req_headers)
+            resp = conn.getresponse()
+            body_text = resp.read().decode("utf-8", errors="ignore")
+            return int(resp.status), body_text
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    if scheme == "https" and hostname and hostname in cache:
+        return _via_pinned_ip(cache[hostname])
+
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ssl_ctx) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+            return int(resp.status), raw
+    except urllib.error.HTTPError as he:
+        try:
+            err_body = he.read().decode("utf-8", errors="ignore")
+        except Exception:
+            err_body = ""
+        return int(he.code), err_body
+    except Exception as exc:
+        if scheme == "https" and hostname and _is_dns_resolution_error(exc):
+            doh_ip = _resolve_host_via_doh(hostname, timeout=min(3.0, timeout))
+            if doh_ip:
+                cache[hostname] = doh_ip
+                return _via_pinned_ip(doh_ip)
+        raise
+
+
+def _humanize_probe_failure(raw_exc: str, status_code: int) -> str:
+    low = (raw_exc or "").lower()
+    if any(
+        m in low
+        for m in (
+            "nodename nor servname",
+            "name or service not known",
+            "getaddrinfo",
+            "errno 8",
+            "errno -2",
+            "errno 11001",
+        )
+    ):
+        return "新公网域名正在全球 DNS 同步生效中，请等待 3–5 秒后再点一次「安全自检」"
+    if status_code == 530 or "530" in low:
+        return "Cloudflare 边缘节点正在绑定本机隧道（HTTP 530），请等待 3 秒后重试"
+    if status_code in {502, 503}:
+        return f"隧道边缘暂未就绪（HTTP {status_code}），请稍候重试"
+    if "timed out" in low or "timeout" in low:
+        return "公网探测连接超时，请检查本机网络后重试"
+    if status_code > 0:
+        return f"公网地址暂未就绪（HTTP {status_code}），请稍候再测"
+    return f"公网地址暂未连通（{raw_exc or '连接未就绪'}），请等 3 秒后再测"
 
 
 class PublicTunnelManager:
@@ -177,6 +367,15 @@ class PublicTunnelManager:
         except Exception:
             return ""
 
+    def _is_tunnel_registered_in_log(self) -> bool:
+        if not self._log_path.is_file():
+            return False
+        try:
+            text = self._log_path.read_text(encoding="utf-8", errors="ignore")
+            return "Registered tunnel connection" in text
+        except Exception:
+            return False
+
     def _tail_log_lines(self, max_lines: int = 12) -> list[str]:
         if not self._log_path.is_file():
             return []
@@ -191,6 +390,7 @@ class PublicTunnelManager:
             self._pid = 0
             if self.mode == "quick":
                 self._active_url = ""
+            self._last_probe = None
             if not self._last_error:
                 self._last_error = "公网隧道进程已退出，可点击一键重新开启。"
             self._save_locked()
@@ -216,6 +416,7 @@ class PublicTunnelManager:
             self._active_url = ""
             self._started_at = 0
             self._last_error = ""
+            self._last_probe = None
             self._save_locked()
 
         if pid > 0 and _is_cloudflared_pid_alive(pid):
@@ -236,7 +437,7 @@ class PublicTunnelManager:
         named_public_url: Optional[str] = None,
         auto_sync_public_url: Optional[bool] = None,
         restart: bool = False,
-        wait_seconds: float = 14.0,
+        wait_seconds: float = 18.0,
     ) -> Dict[str, Any]:
         bin_path = find_cloudflared_binary()
         if not bin_path:
@@ -314,6 +515,7 @@ class PublicTunnelManager:
             self._pid = int(proc.pid)
             self._started_at = int(time.time())
             self._last_error = ""
+            self._last_probe = None
             self._active_url = self.named_public_url if self.mode == "named" else ""
             self._save_locked()
 
@@ -327,6 +529,22 @@ class PublicTunnelManager:
                 if discovered:
                     break
                 await asyncio.sleep(0.25)
+
+            if discovered and _is_cloudflared_pid_alive(self._pid):
+                reg_deadline = min(deadline, time.monotonic() + 4.0)
+                while time.monotonic() < reg_deadline:
+                    if not _is_cloudflared_pid_alive(self._pid) or self._is_tunnel_registered_in_log():
+                        break
+                    await asyncio.sleep(0.25)
+
+                disc_host = (urllib.parse.urlparse(discovered).hostname or "").strip()
+                if disc_host and _is_cloudflared_pid_alive(self._pid):
+                    dns_deadline = min(deadline, time.monotonic() + 5.0)
+                    while time.monotonic() < dns_deadline:
+                        resolved_ip = await asyncio.to_thread(_resolve_host_via_doh, disc_host, timeout=2.0)
+                        if resolved_ip or not _is_cloudflared_pid_alive(self._pid):
+                            break
+                        await asyncio.sleep(0.6)
 
             with self._lock:
                 if discovered:
@@ -365,6 +583,16 @@ class PublicTunnelManager:
     # End-to-End Public Reachability Self-Test
     # ------------------------------------------------------------------
 
+    def note_verified_external_traffic(self, public_origin: str) -> None:
+        """Clear stale failed probe banner when genuine external traffic arrives over the active tunnel."""
+        clean = _normalize_https_origin(public_origin)
+        if not clean:
+            return
+        with self._lock:
+            lp = self._last_probe
+            if isinstance(lp, dict) and not lp.get("ok") and _normalize_https_origin(str(lp.get("public_url") or "")) == clean:
+                self._last_probe = None
+
     async def probe_public_reachability(
         self,
         public_url: Optional[str] = None,
@@ -382,6 +610,7 @@ class PublicTunnelManager:
         def _sync_probe() -> Dict[str, Any]:
             ctx = ssl.create_default_context()
             ua = "GeminiEnterpriseBridge-Probe/1.0"
+            pinned_ips: Dict[str, str] = {}
             t0 = time.perf_counter()
 
             # 1) Health check (retry briefly if trycloudflare DNS is still warming up)
@@ -389,31 +618,29 @@ class PublicTunnelManager:
             health_status = 0
             health_body: Dict[str, Any] = {}
             last_exc = ""
-            for attempt in range(4):
-                req_h = urllib.request.Request(
-                    f"{target_base}/health",
-                    headers={"User-Agent": ua, "Accept": "application/json"},
-                    method="GET",
-                )
+            max_attempts = 5
+            for attempt in range(max_attempts):
                 try:
-                    with urllib.request.urlopen(req_h, timeout=8.0, context=ctx) as resp:
-                        health_status = int(resp.status)
-                        raw = resp.read().decode("utf-8", errors="ignore")
-                        health_body = json.loads(raw) if raw.strip().startswith("{") else {}
-                        if health_status == 200 and health_body.get("status") == "ok":
-                            health_ok = True
-                            break
-                except urllib.error.HTTPError as he:
-                    health_status = int(he.code)
-                    last_exc = f"HTTP {he.code}"
-                    if he.code in {502, 503, 530} and attempt < 3:
-                        time.sleep(1.2)
+                    health_status, raw = _http_get_with_doh_fallback(
+                        f"{target_base}/health",
+                        headers={"User-Agent": ua, "Accept": "application/json"},
+                        timeout=8.0,
+                        ctx=ctx,
+                        pinned_ip_cache=pinned_ips,
+                    )
+                    health_body = json.loads(raw) if raw.strip().startswith("{") else {}
+                    if health_status == 200 and health_body.get("status") == "ok":
+                        health_ok = True
+                        break
+                    last_exc = f"HTTP {health_status}"
+                    if health_status in {404, 502, 503, 530} and attempt < (max_attempts - 1):
+                        time.sleep(1.4)
                         continue
                     break
                 except Exception as exc:
                     last_exc = str(exc)
-                    if attempt < 3:
-                        time.sleep(1.2)
+                    if attempt < (max_attempts - 1):
+                        time.sleep(1.4)
                         continue
             latency_ms = int((time.perf_counter() - t0) * 1000)
 
@@ -427,56 +654,53 @@ class PublicTunnelManager:
                     "auth_lock_verified": False,
                     "admin_lock_verified": False,
                     "client_key_verified": None,
-                    "detail": f"公网地址暂未连通（{last_exc or ('HTTP ' + str(health_status))}）。若刚开启隧道，请等 3 秒后再测。",
+                    "detail": _humanize_probe_failure(last_exc, health_status),
                 }
 
             # 2) Verify keyless public request is blocked with 401/403
             auth_lock_ok = False
-            req_unauth = urllib.request.Request(
-                f"{target_base}/v1/models",
-                headers={"User-Agent": ua, "Accept": "application/json"},
-                method="GET",
-            )
             try:
-                with urllib.request.urlopen(req_unauth, timeout=8.0, context=ctx) as resp:
-                    auth_lock_ok = int(resp.status) in {401, 403}
-            except urllib.error.HTTPError as he:
-                auth_lock_ok = int(he.code) in {401, 403}
+                unauth_code, _ = _http_get_with_doh_fallback(
+                    f"{target_base}/v1/models",
+                    headers={"User-Agent": ua, "Accept": "application/json"},
+                    timeout=8.0,
+                    ctx=ctx,
+                    pinned_ip_cache=pinned_ips,
+                )
+                auth_lock_ok = int(unauth_code) in {401, 403}
             except Exception:
                 auth_lock_ok = False
 
             # 3) Verify admin console is strictly blocked from public internet (403)
             admin_lock_ok = False
-            req_admin = urllib.request.Request(
-                f"{target_base}/api/status",
-                headers={"User-Agent": ua, "Accept": "application/json"},
-                method="GET",
-            )
             try:
-                with urllib.request.urlopen(req_admin, timeout=8.0, context=ctx) as resp:
-                    admin_lock_ok = int(resp.status) == 403
-            except urllib.error.HTTPError as he:
-                admin_lock_ok = int(he.code) == 403
+                admin_code, _ = _http_get_with_doh_fallback(
+                    f"{target_base}/api/status",
+                    headers={"User-Agent": ua, "Accept": "application/json"},
+                    timeout=8.0,
+                    ctx=ctx,
+                    pinned_ip_cache=pinned_ips,
+                )
+                admin_lock_ok = int(admin_code) == 403
             except Exception:
                 admin_lock_ok = False
 
             # 4) Optional client key verification
             client_key_ok: Optional[bool] = None
             if sample_api_key:
-                req_key = urllib.request.Request(
-                    f"{target_base}/v1/models",
-                    headers={
-                        "User-Agent": ua,
-                        "Accept": "application/json",
-                        "Authorization": f"Bearer {sample_api_key}",
-                    },
-                    method="GET",
-                )
                 try:
-                    with urllib.request.urlopen(req_key, timeout=8.0, context=ctx) as resp:
-                        client_key_ok = int(resp.status) == 200
-                except urllib.error.HTTPError:
-                    client_key_ok = False
+                    key_code, _ = _http_get_with_doh_fallback(
+                        f"{target_base}/v1/models",
+                        headers={
+                            "User-Agent": ua,
+                            "Accept": "application/json",
+                            "Authorization": f"Bearer {sample_api_key}",
+                        },
+                        timeout=8.0,
+                        ctx=ctx,
+                        pinned_ip_cache=pinned_ips,
+                    )
+                    client_key_ok = int(key_code) == 200
                 except Exception:
                     client_key_ok = False
 

@@ -82,6 +82,24 @@ def test_dashboard_ui_structure_and_slot_reset_api(tmp_path: Path) -> None:
             "distClientsTable",
             "detailTenantChip",
             "secDiag",
+            "navBtnSeats",
+            "navBtnDist",
+            "navBtnAudit",
+            "navBtnLedger",
+            "navBtnProbe",
+            "navBtnDiag",
+            "gatewaySettingsDrawer",
+            "toggleCreateKeyBtn",
+            "createKeyPanel",
+            "liveTasksFold",
+            "auditSubTabs",
+            "sessionsPager",
+            "sessionsPrevBtn",
+            "sessionsNextBtn",
+            "auditLogsPager",
+            "auditLogsPrevBtn",
+            "auditLogsNextBtn",
+            "ledgerSubTabs",
         ):
             assert required_id in html
         for removed_marker in (
@@ -103,6 +121,9 @@ def test_dashboard_ui_structure_and_slot_reset_api(tmp_path: Path) -> None:
         assert "grid-template-columns: repeat(3, minmax(0, 1fr))" in html
         assert "[hidden] { display: none !important; }" in html
         assert "@keyframes refreshSpin" in html
+        assert ".app-shell" in html
+        assert ".table-viewport" in html
+        assert "max-height: 460px" in html
 
         status = client.get("/api/status").json()
         assert status["default_model"] == "gemini-4-carbon"

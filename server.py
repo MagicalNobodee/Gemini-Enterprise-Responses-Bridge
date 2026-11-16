@@ -44,11 +44,13 @@ from distribution import (
     resolve_public_base_url,
 )
 from tunnel_manager import PublicTunnelManager
+from public_status import PublicStatusMonitor, get_public_status_html
 from extension_exporter import export_extension_bundle
 from gcloud_provider import GCloudUpstreamError, GCloudVertexProvider
 from platform_compat import reconfigure_stdio_utf8
 from schemas import (
     AVAILABLE_MODELS,
+    DEFAULT_MODEL_ID,
     estimate_tokens,
     BridgeCallbackPayload,
     BridgeEventPayload,
@@ -58,6 +60,7 @@ from schemas import (
     build_chat_completion_chunk,
     build_chat_completion_response,
     build_usage,
+    normalize_default_model,
     parse_model_and_session,
     resolve_target_web_model,
 )
@@ -175,6 +178,8 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
         state_path=tunnel_file,
         on_url_changed=lambda url: distribution.update_policy(public_base_url=url),
     )
+    status_history_file = str(Path(dist_file).parent / "public_status_history.json")
+    public_status_monitor = PublicStatusMonitor(storage_path=status_history_file)
     init_tun = tunnel_manager.snapshot()
     if init_tun.get("running") and init_tun.get("active_url") and tunnel_manager.auto_sync_public_url and not distribution.public_base_url:
         distribution.update_policy(public_base_url=str(init_tun["active_url"]))
@@ -315,6 +320,24 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
         if gcloud.is_configured() and cfg.backend_mode in {"auto", "gcloud"}:
             return 8
         return 0
+
+    def _public_gateway_health() -> tuple[bool, bool]:
+        if cfg.backend_mode == "gcloud":
+            return gcloud.is_configured(), False
+        ready_keys = hub.list_ready_slot_keys()
+        if ready_keys:
+            busy_cnt = sum(
+                1
+                for k in ready_keys
+                if (slot_obj := hub._slots.get(k)) is not None
+                and (slot_obj.is_busy or slot_obj.waiting_count > 0)
+            )
+            return True, (busy_cnt >= len(ready_keys))
+        if hub.has_ready_client():
+            return True, False
+        if cfg.backend_mode == "auto" and gcloud.is_configured():
+            return True, False
+        return False, False
 
     def build_live_ledger_snapshot(include_catalog: bool = False, hub_snap: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if sync_and_hydrate_idle_slots():
@@ -524,9 +547,31 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
             cfg.host,
             cfg.port,
         )
+        async def _status_heartbeat_loop() -> None:
+            while True:
+                try:
+                    is_up, is_busy = _public_gateway_health()
+                    ledger_stats = public_status_monitor._extract_sanitized_ledger_metrics(
+                        usage_ledger, time.time()
+                    )
+                    public_status_monitor.record_sample(
+                        online=is_up,
+                        busy=is_busy,
+                        latest_chat_ms=ledger_stats.get("gateway_chat_ms"),
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(60.0)
+
+        heartbeat_task = asyncio.create_task(_status_heartbeat_loop())
         try:
             yield
         finally:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
             response_store.close()
             context_builder.close()
 
@@ -545,6 +590,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
     app.state.distribution = distribution
     app.state.tunnel = tunnel_manager
     app.state.tunnel_manager = tunnel_manager
+    app.state.public_status_monitor = public_status_monitor
     image_output_dir = Path(cfg.generated_dir) if cfg.generated_dir else (Path(__file__).resolve().parent / "generated")
     file_store = FileStore(image_output_dir)
     response_store = ResponseStore(file_store=file_store, directory=cfg.response_store_dir,
@@ -801,6 +847,109 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
             "gcloud_configured": gcloud.is_configured(),
             "backend_mode": cfg.backend_mode,
         }
+
+    @app.get("/status", response_class=HTMLResponse, include_in_schema=False)
+    async def public_status_page() -> HTMLResponse:
+        return HTMLResponse(
+            content=get_public_status_html(),
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+        )
+
+    @app.api_route("/status/ping", methods=["GET", "HEAD"], include_in_schema=False)
+    async def public_status_ping(http_request: Request) -> JSONResponse:
+        if not is_direct_local_connection(http_request):
+            req_orig = resolve_public_base_url(http_request, distribution.public_base_url, callback_origin)
+            tunnel_manager.note_verified_external_traffic(req_orig)
+        online, busy = _public_gateway_health()
+        code = 200 if online else 503
+        return JSONResponse(
+            status_code=code,
+            content={
+                "status": "ok" if online else "offline",
+                "online": online,
+                "busy": busy,
+                "ts": int(time.time()),
+            },
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+
+    def _resolve_effective_public_origin(http_request: Request) -> str:
+        tun_snap = tunnel_manager.snapshot()
+        active_tun_url = str(tun_snap.get("active_url") or "").strip() if tun_snap.get("running") else ""
+        req_origin = resolve_public_base_url(http_request, distribution.public_base_url, callback_origin)
+        if is_direct_local_connection(http_request) and (active_tun_url or distribution.public_base_url):
+            return active_tun_url or distribution.public_base_url
+        return req_origin
+
+    @app.get("/api/public/status", include_in_schema=False)
+    async def api_public_status(http_request: Request) -> JSONResponse:
+        online, busy = _public_gateway_health()
+        is_local_req = is_direct_local_connection(http_request)
+        eff_origin = _resolve_effective_public_origin(http_request)
+        if not is_local_req:
+            tunnel_manager.note_verified_external_traffic(eff_origin)
+        tun_snap = tunnel_manager.snapshot()
+        last_probe = tun_snap.get("last_probe") if isinstance(tun_snap.get("last_probe"), dict) else None
+        probe_matches_origin = bool(
+            last_probe
+            and eff_origin
+            and str(last_probe.get("public_url") or "").rstrip("/") == eff_origin.rstrip("/")
+        )
+        srv_probe_ms = (
+            int(last_probe["latency_ms"])
+            if (probe_matches_origin and last_probe.get("health_ok") and last_probe.get("latency_ms"))
+            else None
+        )
+        local_only_view = bool(
+            is_local_req and not tun_snap.get("running") and not (distribution.public_base_url or "").strip()
+        )
+        tunnel_probe_failed = bool(
+            is_local_req and probe_matches_origin and (last_probe.get("health_ok") is False)
+        )
+        payload = public_status_monitor.build_public_snapshot(
+            online=online,
+            busy=busy,
+            public_origin=eff_origin,
+            usage_ledger=usage_ledger,
+            server_probe_ms=srv_probe_ms,
+            local_only_view=local_only_view,
+            tunnel_probe_failed=tunnel_probe_failed,
+        )
+        return JSONResponse(
+            status_code=200,
+            content=payload,
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+
+    @app.post("/api/public/network-map", include_in_schema=False)
+    async def api_public_network_map(http_request: Request) -> JSONResponse:
+        eff_origin = _resolve_effective_public_origin(http_request)
+        # Only allow force-bypassing the 90s cache from local host admin
+        allow_force = is_direct_local_connection(http_request) and (
+            http_request.query_params.get("force") == "1"
+        )
+        try:
+            res = await public_status_monitor.run_network_map_probe(eff_origin, force=allow_force)
+        except Exception as exc:
+            return JSONResponse(
+                status_code=502,
+                content={"ok": False, "detail": f"分布式硬件节点拨测暂时繁忙：{exc}"},
+                headers={"Cache-Control": "no-store"},
+            )
+        return JSONResponse(
+            status_code=200 if res.get("ok") else 400,
+            content=res,
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
 
     @app.get("/api/status", dependencies=[Depends(require_local_admin)])
     async def api_status() -> Dict[str, Any]:
@@ -1464,7 +1613,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
     ) -> Dict[str, Any]:
         principal = current_principal()
         pub_base = current_public_base_url()
-        img_model = str(img_payload.get("model") or cfg.default_model)
+        img_model = normalize_default_model(img_payload.get("model"), cfg.default_model)
         img_prompt_prev = str(img_payload.get("prompt") or "").strip()[:140]
         t_kind = explicit_task or ("image_edit" if img_attachments else "image_gen")
         task_id = f"img_{uuid.uuid4().hex[:12]}"
@@ -1556,7 +1705,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                     parts.append({"type": "image_url", "image_url": {"url": saved["id"]}})
                 payload = {
                     "prompt": fields.get("prompt", ""),
-                    "model": fields.get("model") or cfg.default_model,
+                    "model": normalize_default_model(fields.get("model"), cfg.default_model),
                     "n": int(fields.get("n", "1") or "1"),
                     "size": fields.get("size", "auto"),
                     "response_format": fields.get("response_format", "b64_json"),
@@ -1615,7 +1764,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
     async def video_generations(payload: Dict[str, Any]) -> Any:
         principal = current_principal()
         pub_base = current_public_base_url()
-        v_model = str(payload.get("model") or cfg.default_model)
+        v_model = normalize_default_model(payload.get("model"), cfg.default_model)
         try:
             raw_refs = payload.get("images") or payload.get("files") or []
             if not isinstance(raw_refs, list):
@@ -1694,7 +1843,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                     tenant_id=principal.tenant_id,
                 )
                 fid = saved["id"]
-                model_req = fields.get("model") or cfg.default_model
+                model_req = normalize_default_model(fields.get("model"), cfg.default_model)
                 hint = fields.get("prompt", "").strip()
                 lang = fields.get("language", "").strip()
                 resp_fmt = (fields.get("response_format") or "json").strip().lower()
@@ -1713,7 +1862,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                         tenant_id=principal.tenant_id,
                     )
                     fid = saved["id"]
-                model_req = payload.get("model") or cfg.default_model
+                model_req = normalize_default_model(payload.get("model"), cfg.default_model)
                 hint = str(payload.get("prompt") or "").strip()
                 lang = str(payload.get("language") or "").strip()
                 resp_fmt = str(payload.get("response_format") or "json").strip().lower()
@@ -1873,9 +2022,10 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                 )
                 return [a for a in rebuilt if a["category"] == "image"]
 
-            return await translate_response(upstream, payload, request.model or cfg.default_model, mapping, history, response_store,
+            eff_resp_model = normalize_default_model(request.model, cfg.default_model)
+            return await translate_response(upstream, payload, eff_resp_model, mapping, history, response_store,
                 image_generator=lambda prompt: _run_tracked_image_gen(
-                    {"prompt": prompt, "model": request.model or cfg.default_model},
+                    {"prompt": prompt, "model": eff_resp_model},
                     _responses_gen_images(),
                 ),
                 tenant_id=principal.tenant_id,
@@ -1983,10 +2133,10 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
 
         principal = current_principal()
         pub_base_url = current_public_base_url()
-        raw_model_name = request.model or cfg.default_model
+        raw_model_name = normalize_default_model(request.model, cfg.default_model)
         distribution.preflight_check(principal, requested_model=raw_model_name)
         base_model_name, model_session_tag = parse_model_and_session(raw_model_name)
-        model_name = base_model_name or cfg.default_model
+        model_name = normalize_default_model(base_model_name, cfg.default_model)
         clean_x_bridge = x_bridge_session.strip() if isinstance(x_bridge_session, str) and x_bridge_session.strip() else None
         clean_thread_hdr = (
             (x_thread_id.strip() if isinstance(x_thread_id, str) and x_thread_id.strip() else None)
@@ -2092,7 +2242,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
             if not gcloud.is_configured():
                 return _openai_error_response(
                     status_code=503,
-                    message="未配置 GCP_PROJECT_ID，无法使用 gemini-enterprise-gcloud 模式。请在 .env 中配置或改用 gemini-enterprise-web。",
+                    message=f"未配置 GCP_PROJECT_ID，无法使用 gemini-enterprise-gcloud 模式。请在 .env 中配置或改用 {DEFAULT_MODEL_ID}。",
                     error_type="service_unavailable_error",
                     code="gcloud_not_configured",
                 )

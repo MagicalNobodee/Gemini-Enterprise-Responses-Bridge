@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
 
+from schemas import DEFAULT_MODEL_ID, normalize_default_model
+
 
 def _read_dotenv_text(dotenv_path: Path) -> str:
     """Decode .env resiliently across UTF-8, UTF-8 with BOM (Notepad/PS5.1), and GBK/GB18030."""
@@ -80,7 +82,7 @@ class BridgeSettings:
     api_key: str = ""
     backend_mode: str = "browser"  # browser | auto | gcloud
     context_mode: str = "smart"  # smart | last_message | transcript
-    default_model: str = "gemini-enterprise-web"
+    default_model: str = DEFAULT_MODEL_ID
     request_timeout_seconds: float = 600.0
     queue_timeout_seconds: float = 300.0
     auto_reset_new_chat: bool = True
@@ -110,6 +112,9 @@ class BridgeSettings:
     gcp_collection_id: str = "default_collection"
     gcloud_binary: str = "gcloud"
 
+    def __post_init__(self) -> None:
+        self.default_model = normalize_default_model(self.default_model, DEFAULT_MODEL_ID)
+
     @classmethod
     def from_env(cls, base_dir: Path | None = None) -> "BridgeSettings":
         root = base_dir or Path(__file__).resolve().parent
@@ -132,8 +137,10 @@ class BridgeSettings:
             api_key=os.getenv("BRIDGE_API_KEY", "").strip(),
             backend_mode=backend_mode,
             context_mode=context_mode,
-            default_model=os.getenv("BRIDGE_DEFAULT_MODEL", "gemini-enterprise-web").strip()
-            or "gemini-enterprise-web",
+            default_model=normalize_default_model(
+                os.getenv("BRIDGE_DEFAULT_MODEL", DEFAULT_MODEL_ID),
+                DEFAULT_MODEL_ID,
+            ),
             request_timeout_seconds=_env_float("BRIDGE_REQUEST_TIMEOUT", 600.0),
             queue_timeout_seconds=_env_float("BRIDGE_QUEUE_TIMEOUT", 300.0),
             auto_reset_new_chat=_env_bool("BRIDGE_AUTO_RESET_NEW_CHAT", True),

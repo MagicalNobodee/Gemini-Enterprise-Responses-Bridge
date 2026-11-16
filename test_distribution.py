@@ -145,7 +145,7 @@ def test_client_lifecycle_model_whitelist_rotation_and_pause(tmp_path: Path) -> 
         models_resp = client.get("/v1/models", headers=ext_headers)
         assert models_resp.status_code == 200
         model_ids = [m["id"] for m in models_resp.json()["data"]]
-        assert set(model_ids) == {"gemini-4-argon", "gemini-4-argon-newchat"}
+        assert set(model_ids) == {"gemini-4-argon"}
 
         # Calling disallowed model fails immediately with 403 model_not_allowed
         denied = client.post(

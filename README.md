@@ -121,8 +121,7 @@ cp -n env.example .env
 |---|---|
 | **Base URL** | `http://127.0.0.1:8000/v1`（亦兼容 `http://127.0.0.1:8000`） |
 | **API Key** | `.env` 中 `BRIDGE_API_KEY` 留空时可填任意值或留空；若已设置则填对应密钥 |
-| **主力模型（自动切换网页模型）** | `gemini-4-carbon`、`gemini-4-argon`、`gemini-3.1-pro`、`gemini-3.8-flash` |
-| **保持网页当前模型** | `gemini-enterprise-web` |
+| **可用模型列表（默认首选 Carbon）** | `gemini-4-carbon`（默认主力）、`gemini-4-argon`、`gemini-3.1-pro`、`gemini-3.8-flash` |
 | **强制新建网页对话后缀** | 在任意模型名后追加 `-newchat`（如 `gemini-4-carbon-newchat`） |
 | **固定绑定独立会话槽位** | 在模型名后追加 `@会话标识`（如 `gemini-4-carbon@task1`）或传请求头 `X-Session-Id` |
 | **自定义网页菜单模型透传** | `gemini-web:<网页菜单显示名称>` |
@@ -175,7 +174,7 @@ for event in response:
 | `BRIDGE_HOST` | `127.0.0.1` | 监听地址（强烈建议保持 `127.0.0.1`） |
 | `BRIDGE_PORT` | `8000` | 本地服务监听端口 |
 | `BRIDGE_API_KEY` | 空 | 留空时不强制校验密钥；设置非空值后所有接口均需 Bearer 鉴权 |
-| `BRIDGE_DEFAULT_MODEL` | `gemini-enterprise-web` | 客户端未指定模型或请求默认模型时选用的目标模型（如 `gemini-4-carbon`） |
+| `BRIDGE_DEFAULT_MODEL` | `gemini-4-carbon` | 客户端未指定模型或请求默认模型时选用的目标模型 |
 | `BRIDGE_BACKEND_MODE` | `browser` | 上游模式：`browser`（浏览器桥接）、`gcloud`（官方 ADC）、`auto` |
 | `BRIDGE_CONTEXT_MODE` | `smart` | 多轮上下文策略：`smart`（智能增量）、`last_message`、`transcript` |
 | `BRIDGE_AUTO_RESET_NEW_CHAT` | `true` | 本地开启新对话或切换分支时自动在网页端开启干净新对话 |

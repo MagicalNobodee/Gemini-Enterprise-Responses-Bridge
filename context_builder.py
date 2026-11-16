@@ -1222,7 +1222,7 @@ class ConversationContextBuilder:
         self,
         messages: Sequence[ChatMessage],
         *,
-        model: str = "gemini-enterprise-web",
+        model: str = "gemini-4-carbon",
         explicit_session_id: Optional[str] = None,
         exclude_vertex_session_ids: Sequence[str] = (),
         tenant_id: str = "host",
@@ -1695,7 +1695,7 @@ class ConversationContextBuilder:
         self,
         candidate_slot_keys: Sequence[str],
         messages: Sequence[ChatMessage],
-        model: str = "gemini-enterprise-web",
+        model: str = "gemini-4-carbon",
         tenant_id: str = "host",
     ) -> List[str]:
         """Find worker slot keys whose active browser conversation matches `messages`'s prefix."""
@@ -1843,7 +1843,7 @@ class ConversationContextBuilder:
     def build(
         self,
         messages: Sequence[ChatMessage],
-        model: str = "gemini-enterprise-web",
+        model: str = "gemini-4-carbon",
         session_key: str = "default",
         mode_override: str | None = None,
         tools: Optional[Sequence[Dict[str, Any]]] = None,

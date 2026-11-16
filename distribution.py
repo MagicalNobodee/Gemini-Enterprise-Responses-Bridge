@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Deque, Dict, List, Optional, Sequence
 
 from platform_compat import SHANGHAI_TZ, atomic_write_json
-from schemas import parse_model_and_session, resolve_target_web_model
+from schemas import normalize_default_model, parse_model_and_session, resolve_target_web_model
 
 logger = logging.getLogger("gemini_bridge.distribution")
 
@@ -988,10 +988,10 @@ class DistributionManager:
     def _check_model_allowed_locked(self, rec: ClientRecord, requested_model: Optional[str]) -> None:
         if not rec.allowed_models:
             return
-        raw = (requested_model or "").strip()
+        raw = normalize_default_model(requested_model)
         base_model, _ = parse_model_and_session(raw)
         target_web = resolve_target_web_model(base_model)
-        allowed_norm = {m.strip().lower() for m in rec.allowed_models if m.strip()}
+        allowed_norm = {normalize_default_model(m).lower() for m in rec.allowed_models if m.strip()}
         allowed_web = {resolve_target_web_model(m) for m in rec.allowed_models if m.strip()}
         if base_model.lower() in allowed_norm or (target_web and target_web in allowed_web):
             return

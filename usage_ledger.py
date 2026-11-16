@@ -125,7 +125,7 @@ def resolve_canonical_billing_model(
     if from_fuzzy:
         return from_fuzzy
 
-    return "gemini-enterprise-auto"
+    return "gemini-4-carbon"
 
 
 def get_model_pricing(
@@ -253,9 +253,6 @@ def list_pricing_catalog(
         "gemini-4-argon",
         "gemini-3.1-pro",
         "gemini-3.8-flash",
-        "gemini-2.5-pro",
-        "gemini-2.5-flash",
-        "gemini-enterprise-auto",
     ]
     return [get_model_pricing(m, prompt_tokens=0, overrides=overrides).to_dict() for m in ordered]
 
