@@ -1,0 +1,17 @@
+{
+  "port": 18001,
+  "default_upstream": "https://api.openai.com/v1",
+  "routes": [
+    {
+      "name": "local-bridge",
+      "upstream": "http://127.0.0.1:8000/v1",
+      "models": [
+        "gemini-*"
+      ],
+      "strip_auth": true,
+      "strip_hosted_web_search": true,
+      "match_bridge_resources": true,
+      "timeout": 660
+    }
+  ]
+}

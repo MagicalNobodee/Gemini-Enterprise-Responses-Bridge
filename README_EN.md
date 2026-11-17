@@ -166,6 +166,7 @@ Double-click **`start.bat`**, or manage background execution in PowerShell:
 - **API Key**: Any non-empty string (e.g., `sk-local`) when `BRIDGE_API_KEY` is blank
 - **Primary Models**: `gemini-4-carbon` (general coding & multimodal, 1M context), `gemini-4-argon` (deep reasoning), `gemini-3.1-pro`, `gemini-3.8-flash`
 - **Codex 1M Context Sync**: Run `./.venv/bin/python configure_codex_context.py --apply` (or `.\start.ps1 -EnsureCodexProfile` on Windows).
+- **Codex Multi-Provider Model Router & Agent Instructions**: Keep your default upstream models and any routed local/secondary models (via exact slugs or wildcards like `gemini-*`, with automatic upstream credential stripping) side-by-side in one Codex dropdown via `./.venv/bin/python codex_model_router/install_router.py --apply`. See [`docs/CODEX_MODEL_ROUTER.md`](docs/CODEX_MODEL_ROUTER.md), [`AGENTS.md`](AGENTS.md), and [`codex_model_router/AGENTS.global.example.md`](codex_model_router/AGENTS.global.example.md).
 
 ---
 

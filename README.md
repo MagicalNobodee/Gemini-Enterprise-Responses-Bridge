@@ -224,6 +224,7 @@ cp -n env.example .env
         <li><b>Base URL</b>：<code>http://127.0.0.1:8000/v1</code></li>
         <li><b>Codex 协议模式</b>：<code>wire_api = "responses"</code></li>
         <li><b>一键同步百万上下文配置（Codex 专属）</b>：<br/>运行 <code>./.venv/bin/python configure_codex_context.py --apply</code>（Windows 可运行 <code>.\start.ps1 -EnsureCodexProfile</code>），自动备份并写入 1M 上下文参数。</li>
+        <li><b>GPT + Gemini 同菜单自动分流（Codex 进阶）</b>：<br/>运行 <code>./.venv/bin/python codex_model_router/install_router.py --apply</code>，即可保留原供应商全部模型并在同一列表中随选随切 Gemini，自动隔离原密钥。详见 <a href="docs/CODEX_MODEL_ROUTER.md">《Codex 模型分流系统与协作指示指南》</a>。</li>
       </ul>
     </td>
   </tr>
@@ -479,6 +480,8 @@ print(resp.choices[0].message)
 ├── dashboard_html.py                  # http://127.0.0.1:8000/ 全中文可视化管理总台前端
 ├── platform_compat.py                 # macOS / Windows / Linux 跨平台文件锁、UTF-8/GBK 编码与进程兼容
 ├── configure_codex_context.py         # 本地 Codex 模型目录（codex-models.json）与配置自动同步工具
+├── codex_model_router/                # Codex 多供应商同菜单模型分流器、一键安装脚本与全局 AGENTS 指示模板
+├── AGENTS.md                          # 仓库维护规范、多会话并行协作与服务安全指示
 ├── background.js                      # MV3 扩展后台（多标签页池调度、免接管持久化、驱动热升级）
 ├── content-bridge.js                  # ISOLATED 世界安全中继与右下角闭合 Shadow DOM 状态胶囊
 ├── page-driver.js                     # MAIN 世界页面驱动（原生 streamAssist 流解析与深层组件操控）
