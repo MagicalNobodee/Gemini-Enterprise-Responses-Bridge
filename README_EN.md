@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/assets/hero-banner.png" alt="Gemini Enterprise Bridge Hero Banner" width="100%" />
+<img src="docs/assets/hero-banner-en.png" alt="Gemini Enterprise Bridge" width="100%" />
 
 <br />
 
@@ -16,11 +16,12 @@
 </p>
 
 <p align="center">
-  <a href="#overview">✨ Overview</a> ·
-  <a href="#gallery">🖼️ UI Gallery</a> ·
-  <a href="#quickstart">🚀 Quick Start</a> ·
-  <a href="#client-setup">🔌 App Setup</a> ·
-  <a href="#tech-reference">🛠️ Technical Reference</a>
+  <a href="#overview">Overview</a> ·
+  <a href="#features">Key Features</a> ·
+  <a href="#preview">Interface Preview</a> ·
+  <a href="#quickstart">Quick Start</a> ·
+  <a href="#clients">Client Setup</a> ·
+  <a href="#reference">Architecture & API Reference</a>
 </p>
 
 </div>
@@ -29,194 +30,210 @@
 
 <a id="overview"></a>
 
-## ✨ What Is This?
+## Overview
 
-If your university, lab, or company provides access to **Google Cloud Gemini Enterprise** (`vertexaisearch.cloud.google.com`), you already have access to frontier **Carbon / Argon** models, a **1M-token context window**, grounded web search, and native image & video generation.
+**Gemini Enterprise Bridge** is a local protocol gateway and browser extension system that exposes authenticated **Google Gemini Enterprise** (`vertexaisearch.cloud.google.com`) web sessions as a standard **OpenAI-compatible API** (`/v1/responses` and `/v1/chat/completions`).
 
-**Gemini Enterprise Bridge** unlocks that browser workspace and turns it into a **standard, local OpenAI-compatible gateway (`127.0.0.1:8000/v1`)** on your computer:
-
-> Keep your browser signed in as usual—**no cookie extraction, no token scraping, and no per-token API bills**. Tools like **Codex Desktop/CLI, Cursor, Cline, Cherry Studio, ChatBox, NextChat, and Open WebUI** can immediately connect to write code, patch files, analyze PDFs/audio/video, generate images, and even share access securely with your phone or teammates.
+By operating through your existing browser session and native `streamAssist` transport, it requires no manual cookie extraction and no external relay server. Local developer tools and desktop clients—including **Codex CLI / App, Cursor, Cline, Cherry Studio, ChatBox**, and standard OpenAI SDKs—can directly leverage Gemini Enterprise's 1M-token context window, multimodal document analysis, web grounding, and native image/video generation.
 
 <p align="center">
-  <img src="docs/assets/how-it-works.png" alt="How It Works" width="100%" />
+  <img src="docs/assets/how-it-works.png" alt="Architecture Workflow" width="100%" />
 </p>
 
 ---
 
-## 🌟 Highlights at a Glance
+<a id="features"></a>
+
+## Key Features
 
 <table>
   <tr>
-    <td width="33%" valign="top">
-      <h3>🔌 Plug-and-Play Compatibility</h3>
-      <p>Native dual-stack support for <b>OpenAI Responses API</b> (<code>/v1/responses</code>) and <b>Chat Completions API</b> (<code>/v1/chat/completions</code>). Works out of the box with Codex, Cursor, Cline, Cherry Studio, ChatBox, and official OpenAI SDKs.</p>
+    <td width="50%" valign="top">
+      <h4>Dual OpenAI API Compatibility</h4>
+      <p>Implements both <code>/v1/responses</code> and <code>/v1/chat/completions</code> (streaming SSE and non-streaming JSON), with full support for Function Calling, reasoning effort controls, and structured outputs.</p>
     </td>
-    <td width="33%" valign="top">
-      <h3>🧭 Visual Local Control Center</h3>
-      <p>No terminal babysitting required. Monitor parallel browser seats, run 1-click connectivity probes, test multimodal prompts, and copy ready-made client configs from <code>http://127.0.0.1:8000/</code>.</p>
-    </td>
-    <td width="33%" valign="top">
-      <h3>⚡ True Multi-Tab Parallelism</h3>
-      <p>Multiple Gemini tabs form a concurrent worker pool with automatic background tab spawning. Click the bottom-right pill on any tab to lock it as <b>Personal / Do-Not-Take-Over</b> so background tasks never touch your own chats.</p>
+    <td width="50%" valign="top">
+      <h4>Multi-Tab Worker Pool & Personal Tab Isolation</h4>
+      <p>Schedules concurrent requests across multiple logged-in tabs with automatic background tab scaling under load. Any tab can be marked as personal-only via the bottom-right status pill so background API jobs never touch manual chats.</p>
     </td>
   </tr>
   <tr>
-    <td width="33%" valign="top">
-      <h3>🎨 Full Multimodal I/O</h3>
-      <p>Upload PDFs, Office docs, code, audio, video, and Apple HEIC/MOV files (with automatic local transcoding). Generated full-resolution images and MP4 videos are persisted straight to disk.</p>
+    <td width="50%" valign="top">
+      <h4>Stateful 1M-Token Session Reuse</h4>
+      <p>Persists mappings between client message prefixes and upstream <code>conversation_id</code>s, transmitting only incremental deltas on multi-turn chats and tool round-trips to minimize latency.</p>
     </td>
-    <td width="33%" valign="top">
-      <h3>🌐 1-Click Public Tunnel & Sub-Keys</h3>
-      <p>Built-in Cloudflare tunnel with automatic sleep/wake recovery. Issue isolated <code>sk-geb-...</code> client keys with per-key concurrency, RPM, daily USD budget, expiry, and host seat reservation.</p>
+    <td width="50%" valign="top">
+      <h4>Multimodal File Pipeline & Native Media</h4>
+      <p>Accepts PDFs, Office documents, audio, video, and images (with automatic local transcoding for Apple HEIC/MOV formats), and archives full-resolution generated images and videos locally.</p>
     </td>
-    <td width="33%" valign="top">
-      <h3>📊 Cost-Savings Ledger & Status Map</h3>
-      <p>Track token usage, context-cache hit rates, and equivalent API cost savings in USD/CNY—plus a zero-PII public <code>/status</code> page with 7-day uptime bars and multi-ISP latency mapping.</p>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <h4>Local Management Console</h4>
+      <p>Built-in Web dashboard at <code>http://127.0.0.1:8000/</code> for worker health monitoring, end-to-end self-tests, interactive playground testing, token & equivalent API cost tracking, and live request auditing.</p>
+    </td>
+    <td width="50%" valign="top">
+      <h4>Cloudflare Tunnel & Scoped Sub-Keys</h4>
+      <p>Integrated one-click Cloudflare Quick Tunnel with sleep/wake auto-recovery, scoped <code>sk-geb-...</code> sub-keys (per-key concurrency, daily request caps, expiration), and a read-only <code>/status</code> page.</p>
     </td>
   </tr>
 </table>
 
 ---
 
-<a id="gallery"></a>
+<a id="preview"></a>
 
-## 🖼️ Live UI Gallery
+## Interface Preview
+
+### Management Console & Worker Pool
+
+Monitor connected browser tabs, account groups, active conversations, and session reuse hit rates, or run one-click diagnostics.
 
 <p align="center">
-  <img src="docs/assets/dashboard-overview.png" alt="Local Admin Dashboard Overview" width="100%" />
+  <img src="docs/assets/dashboard-overview.png" alt="Management Console Overview" width="100%" />
 </p>
 
-<table>
-  <tr>
-    <td width="50%" valign="top">
-      <img src="docs/assets/extension-and-pill.png" alt="Browser Extension & In-Page Status Pill" width="100%" />
-      <p align="center"><b>🧩 MV3 Browser Extension & In-Page Status Pill</b></p>
-    </td>
-    <td width="50%" valign="top">
-      <img src="docs/assets/dashboard-tunnel-keys.png" alt="Public Tunnel & Multi-Client API Keys" width="100%" />
-      <p align="center"><b>🌐 1-Click Public Tunnel & Multi-Tenant API Keys</b></p>
-    </td>
-  </tr>
-  <tr>
-    <td width="50%" valign="top">
-      <img src="docs/assets/public-status-map.png" alt="Public Availability & Latency Map" width="100%" />
-      <p align="center"><b>📡 Shareable 7-Day Uptime & Multi-Region Latency Map (<code>/status</code>)</b></p>
-    </td>
-    <td width="50%" valign="top">
-      <img src="docs/assets/dashboard-ledger.png" alt="Usage & Equivalent Cost Ledger" width="100%" />
-      <p align="center"><b>💰 Equivalent API Cost Ledger & Cache Analytics</b></p>
-    </td>
-  </tr>
-</table>
+### Browser Extension & Shadow DOM Status Pill
+
+Configure worker pool limits from the extension popup, and toggle individual Gemini tabs between API worker mode and personal manual-chat mode.
+
+<p align="center">
+  <img src="docs/assets/extension-and-pill.png" alt="Browser Extension and Status Pill" width="100%" />
+</p>
+
+### Public Tunnel & Sub-Key Quota Controls
+
+Manage Cloudflare HTTPS tunnels and issue scoped `sk-geb-...` sub-keys with independent concurrency limits, daily quotas, and expiration dates.
+
+<p align="center">
+  <img src="docs/assets/dashboard-tunnel-keys.png" alt="Tunnel and Sub-Key Controls" width="100%" />
+</p>
+
+<details>
+  <summary><b>More Interface Previews (Public Status Page / Usage Ledger / Live Request Audit)</b></summary>
+  <br />
+
+  <h4>Public Service Status Page (<code>/status</code>)</h4>
+  <p align="center">
+    <img src="docs/assets/public-status-map.png" alt="Public Status Page" width="100%" />
+  </p>
+
+  <h4>Token Usage & Equivalent API Cost Ledger</h4>
+  <p align="center">
+    <img src="docs/assets/dashboard-ledger.png" alt="Usage Cost Ledger" width="100%" />
+  </p>
+
+  <h4>Live Request Audit & Diagnostics</h4>
+  <p align="center">
+    <img src="docs/assets/dashboard-audit.png" alt="Live Request Audit" width="100%" />
+  </p>
+</details>
 
 ---
 
 <a id="quickstart"></a>
 
-## 🚀 3-Minute Quick Start
+## Quick Start
 
 <a id="requirements"></a>
 
-### 📋 System Requirements
+### Requirements
 
-| Requirement | Details | Default |
-|---|---|---|
-| **OS** | **macOS**, **Windows 10 / 11**, **Linux** | Cross-platform UTF-8 & process handling |
-| **Runtime** | **Python 3.10+** | Auto-bootstrapped on Windows via `start.bat` / `start.ps1` |
-| **Browser** | **Google Chrome** or **Microsoft Edge** (Tampermonkey userscript also included) | Auto-exports unpacked `extension/` on startup |
-| **Account** | Signed in to `vertexaisearch.cloud.google.com` in your browser | Zero cookie/token extraction |
-| **Endpoint** | Base URL `http://127.0.0.1:8000/v1` · Console `http://127.0.0.1:8000/` | Default model: `gemini-4-carbon` |
+| Component | Requirement |
+| :--- | :--- |
+| **OS** | macOS, Windows 10 / 11, or Linux |
+| **Python** | Python `3.10+` (virtual environment and dependencies are provisioned automatically on first launch) |
+| **Browser** | Google Chrome or Microsoft Edge (MV3 extension recommended; Userscript fallback included) |
+| **Account** | Active browser access to Google Gemini Enterprise (`vertexaisearch.cloud.google.com`) |
 
-### Step 1: Start the Local Gateway
+### 1. Start the Local Gateway
 
-**macOS / Linux:**
+**macOS / Linux**
 
 ```bash
-python3 -m venv .venv
-./.venv/bin/pip install -r requirements.txt
-cp -n env.example .env
-./.venv/bin/python server.py
+git clone https://github.com/MagicalNobodee/Gemini-Enterprise-Responses-Bridge.git
+cd Gemini-Enterprise-Responses-Bridge
+./start.sh
 ```
 
-**Windows 10 / 11:**
+**Windows (CMD / PowerShell)**
 
-Double-click **`start.bat`**, or manage background execution in PowerShell:
+Double-click `start.bat`, or manage background execution in PowerShell:
 
 ```powershell
-.\start.ps1 -Background
-.\start.ps1 -Status
-.\start.ps1 -Stop
-.\start.ps1 -InstallStartup -Background
+.\start.ps1 -Action start
+.\start.ps1 -Action status
+.\start.ps1 -Action stop
 ```
+
+Default local endpoints:
+- **Management Console**: `http://127.0.0.1:8000/`
+- **OpenAI API Base URL**: `http://127.0.0.1:8000/v1`
+- **Public Status Page**: `http://127.0.0.1:8000/status`
 
 <a id="extension-setup"></a>
 
-### Step 2: Load the Browser Extension
+### 2. Load the Browser Extension
 
-1. Open `chrome://extensions/` (or `edge://extensions/`) and enable **Developer mode**.
-2. Click **Load unpacked** and select the generated **`extension`** folder inside this repository.
-3. Open and sign in to **[Gemini Enterprise](https://vertexaisearch.cloud.google.com/)**.
-4. Once the green **`Bridge 已接管`** pill appears in the bottom-right corner, your local gateway is live!
-
-<a id="client-setup"></a>
-
-### Step 3: Connect Your Favorite AI Tools
-
-- **Base URL**: `http://127.0.0.1:8000/v1`
-- **API Key**: Any non-empty string (e.g., `sk-local`) when `BRIDGE_API_KEY` is blank
-- **Primary Models**: `gemini-4-carbon` (general coding & multimodal, 1M context), `gemini-4-argon` (deep reasoning), `gemini-3.1-pro`, `gemini-3.8-flash`
-- **Codex 1M Context Sync**: Run `./.venv/bin/python configure_codex_context.py --apply` (or `.\start.ps1 -EnsureCodexProfile` on Windows).
-- **Codex Multi-Provider Model Router & Agent Instructions**: Keep your default upstream models and any routed local/secondary models (via exact slugs or wildcards like `gemini-*`, with automatic upstream credential stripping) side-by-side in one Codex dropdown via `./.venv/bin/python codex_model_router/install_router.py --apply`. See [`docs/CODEX_MODEL_ROUTER.md`](docs/CODEX_MODEL_ROUTER.md), [`AGENTS.md`](AGENTS.md), and [`codex_model_router/AGENTS.global.example.md`](codex_model_router/AGENTS.global.example.md).
+1. Open `chrome://extensions` (or `edge://extensions`) and enable **Developer mode**.
+2. Click **Load unpacked** and select the `extension` folder inside this repository.
+3. Visit `https://vertexaisearch.cloud.google.com` and sign in with your enterprise account.
 
 ---
 
-<a id="tech-reference"></a>
+<a id="clients"></a>
 
-## 🛠️ Technical Architecture & Engineering Reference
+## Client Setup
 
-```mermaid
-flowchart LR
-    Client["Codex / Cursor / Cline\nCherry Studio / OpenAI SDK"] -->|"/v1/responses & /v1/chat/completions\nHTTP JSON / SSE Keepalive"| Gateway["FastAPI Dual-Stack Gateway\n(Delta Context + Tool Fences + Tenant Auth + Ledger)"]
-    Gateway <-->|"WebSocket /ws/browser\n+ POST /api/bridge/callback"| SW["Chrome / Edge MV3 Worker\nbackground.js (Parallel Slot Pool)"]
-    SW <-->|"ISOLATED <-> MAIN Bridge\n+ Closed Shadow DOM Pill"| Driver["Page Driver page-driver.js\n(Native streamAssist Parser + Model Switcher)"]
-    Driver <-->|"Reuses Native Browser Session"| Web["vertexaisearch.cloud.google.com\nGemini Enterprise Workspace"]
-    Gateway -.->|"Optional Direct Upstream"| GCloud["Google Cloud ADC\nVertex AI / Agentspace API"]
-```
+- **Base URL**: `http://127.0.0.1:8000/v1` (or your `https://xxx.trycloudflare.com/v1` tunnel URL for remote clients)
+- **API Key**: Any non-empty string (e.g. `sk-local`) for localhost when `BRIDGE_API_KEY` is blank; remote tunnel traffic strictly requires the master key or an active `sk-geb-...` sub-key
+- **Primary Models**: `gemini-4-carbon` (default 1M context), `gemini-4-argon` (deep reasoning), `gemini-3.1-pro`, `gemini-3.8-flash`, `gemini-enterprise`
+- **Codex 1M Context Sync**: Run `./.venv/bin/python configure_codex_context.py --apply` (or `.\start.ps1 -EnsureCodexProfile` on Windows)
+- **Codex Multi-Provider Model Router (Optional)**: Keep your existing provider models and local Gemini models side-by-side in a single Codex model menu via `./.venv/bin/python codex_model_router/install_router.py --apply`. See [docs/CODEX_MODEL_ROUTER.md](docs/CODEX_MODEL_ROUTER.md), [AGENTS.md](AGENTS.md), and [codex_model_router/AGENTS.global.example.md](codex_model_router/AGENTS.global.example.md).
 
-### Core Engineering Pillars
+---
 
-1. **Native `streamAssist` Single Source of Truth (`page-driver.js` + `web_text.py`)**: Shadow DOM is used strictly for input dispatch, model switching, and attachment mounting; streaming tokens are parsed directly from the raw `streamAssist` network stream with `primaryStreamToken` RPC isolation, XSSI prefix stripping, UTF-8 boundary flushing, and lossless removal of `[[section:...]]` / `suggested_questions` artifacts.
-2. **Agentic Tool-Calling Protocol (`tool_calling.py`)**: Enforces strict RFC 8259 JSON inside dedicated `codex_tool_call` / `codex_tool_result` / `codex_history` fences, blocks Markdown backslash corruption, supports Codex `freeform` `apply_patch`, permits safe parallel read-only shell/tool inspection while serializing stateful mutations, and chunks `>32KB` payloads via `ReassemblyBuffer` + `/api/bridge/callback`.
-3. **1M Incremental Context & Compaction (`context_builder.py` + `agent_policy.py`)**: Uses prefix-fingerprinted `smart_incremental_delta` turns on active browser sessions, resets cleanly on topic/branch switches, and exposes `/v1/responses/compact` + `/v1/responses/input_tokens` calibrated for Carbon/Argon 1,048,576-token windows.
-4. **Multi-Tenant Distribution & Sleep-Resilient Tunnels (`distribution.py` + `tunnel_manager.py` + `public_status.py`)**: Isolates `sk-geb-...` tenants across sessions, files, and ledgers; locks admin routes (`/`, `/api/status`, `/api/distribution/*`, `/api/tunnel/*`) strictly to loopback connections; auto-recovers stale Cloudflare quick tunnels after OS sleep when idle; and serves zero-PII `/status` monitoring with Globalping multi-region HTTP probes.
+<a id="reference"></a>
+
+## Architecture & API Reference
 
 <a id="model-routing"></a>
 
 ### Model Routing & Modifiers
 
-- `gemini-4-carbon` (default) · `gemini-4-argon` · `gemini-3.1-pro` · `gemini-3.8-flash`
-- `<model>-newchat`: Force a fresh web conversation
-- `<model>@<session_id>` or header `X-Session-Id`: Pin requests to a dedicated browser worker slot
-- `gemini-web:<menu label>`: Match any custom workspace model label dynamically
-- `gemini-enterprise-gcloud`: Route via official Google Cloud ADC
+| Model Slug / Suffix Pattern | Target & Behavior |
+| :--- | :--- |
+| `gemini-4-carbon` (Default) | Maps to **Carbon** (1M context window, primary coding & multimodal model) |
+| `gemini-4-argon` | Maps to **Argon** (deep reasoning & complex architecture analysis) |
+| `gemini-3.1-pro` / `gemini-3.8-flash` / `gemini-auto` | Maps to **3.1 Pro**, **3.8 Flash**, or **Auto** |
+| `gemini-enterprise` | Uses the currently selected model in the worker tab without switching |
+| `*-nothinking` / `*-minimal` / `*-low` / `*-medium` / `*-high` / `*-xhigh` | Overrides reasoning effort (e.g. `gemini-4-argon-high`) |
+| `*-search` | Enforces live web search and source verification (e.g. `gemini-4-carbon-search`) |
 
 <a id="api-routes"></a>
 
-### Complete API Route Matrix
+### API Endpoints
 
-- **OpenAI Endpoints**: `POST /v1/responses`, `GET|DELETE /v1/responses/{id}`, `POST /v1/responses/input_tokens`, `POST /v1/responses/compact`, `POST /v1/chat/completions`, `GET /v1/models`, `POST|GET|DELETE /v1/files*`, `POST /v1/images/generations`, `POST /v1/images/edits`, `POST /v1/videos/generations`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations`
-- **Local-Only Admin Endpoints**: `GET /`, `GET /api/status`, `GET /api/usage`, `POST /api/slots/reset`, `POST /api/extension/reload`, `GET|POST /api/tunnel/*`, `GET|POST|DELETE /api/distribution/*`, `GET|POST /api/sessions*`
-- **Public Zero-PII Endpoints**: `GET /health`, `GET /status`, `GET|HEAD /status/ping`, `GET /api/public/status`, `POST /api/public/network-map`
+| Category | Endpoint | Description |
+| :--- | :--- | :--- |
+| **OpenAI Compatible** | `GET /v1/models` | List available models and modifier variants |
+| | `POST /v1/responses` | OpenAI Responses API (SSE streaming, `previous_response_id`, multimodal, tools) |
+| | `POST /v1/chat/completions` | OpenAI Chat Completions API (SSE streaming, multimodal, tools) |
+| | `POST /v1/images/generations` · `edits` | Native image generation and editing |
+| | `POST /v1/files` · `GET /v1/files` | Multimodal file staging and management |
+| **Console & Operations** | `GET /` · `GET /status` | Local management console & public read-only status page |
+| | `GET /api/status` · `GET /api/usage` · `GET /api/audit` | Worker pool status, SQLite usage ledger, and live audit ring |
+| | `GET /api/keys` · `POST /api/keys` | Issue, update, or revoke `sk-geb-...` sub-keys |
+| | `POST /api/tunnel/start` · `stop` · `install` | Cloudflare Quick Tunnel lifecycle management |
 
-### Automated Offline Verification
+### Verification & License
 
 ```bash
 ./.venv/bin/pytest -q
-for f in test_*.mjs; do node "$f"; done
+python3 sync_extension.py
+node test_page_driver_Logic.mjs
+node test_background_Logic.mjs
+node test_dashboard_Logic.mjs
 ```
 
----
-
-## Disclaimer & License
-
-This project is an unofficial open-source local protocol adapter and is not affiliated with, endorsed by, or sponsored by Google LLC or Google Cloud. Always comply with your organization's IT policies and Google's Terms of Service. Released under the **[MIT License](LICENSE)**.
+Released under the [MIT License](LICENSE). All session caches, usage ledgers, staged files, and key hashes remain strictly on your local machine (`.cache/`).
