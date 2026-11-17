@@ -2122,7 +2122,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <!-- Generated Share Bundle Box -->
             <div class="dist-share-box" id="distShareBox" hidden>
               <div class="dist-share-head">
-                <span id="distShareTitle">专属接入配置包（可直接发给对方）</span>
+                <span id="distShareTitle">API 接入凭证 (API Credentials)</span>
                 <div class="dist-row-actions">
                   <button type="button" class="btn sm primary" id="distCopyBundleBtn">复制完整接入包</button>
                   <button type="button" class="btn sm soft" id="distCopyKeyOnlyBtn">仅复制密钥</button>
@@ -4356,19 +4356,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         const apiBase = resolveShareApiBase(policyObj);
         const baseOrigin = apiBase.endsWith('/v1') ? stripTrailingSlashes(apiBase.slice(0, -3)) : stripTrailingSlashes(apiBase);
         const statusUrl = baseOrigin + '/status';
-        const recModel = defModel || 'gemini-4-carbon';
         const keyStr = clientObj.api_key || clientObj.key_preview || '';
+        const defaultCatalog = ['gemini-4-carbon', 'gemini-4-argon', 'gemini-3.1-pro', 'gemini-3.8-flash'];
+        if (defModel && defaultCatalog.indexOf(defModel) === -1) defaultCatalog.unshift(defModel);
+        const modelList = (Array.isArray(clientObj.allowed_models) && clientObj.allowed_models.length > 0)
+          ? clientObj.allowed_models
+          : defaultCatalog;
+        const clientLabel = String(clientObj.name || 'Client').trim();
         const lines = [
-          '【' + (clientObj.name || '共享客户端') + ' · AI 接口接入信息】',
+          '[' + clientLabel + ' · API 接入凭证 | API Credentials]',
           '接口地址 (Base URL): ' + apiBase,
-          '专属密钥 (API Key): ' + keyStr,
-          '推荐主力模型: ' + recModel,
-          '其他可选模型: gemini-4-argon, gemini-3.1-pro, gemini-3.8-flash',
-          '实时状态与全国三网测速地图: ' + statusUrl
+          '访问密钥 (API Key): ' + keyStr,
+          '可用模型 (Models): ' + modelList.join(', '),
+          '状态监控 (Status Monitor): ' + statusUrl
         ];
-        lines.push(
-          '使用方法: 打开 Cursor / Codex / Cherry Studio / ChatBox 等任意支持 OpenAI 接口的软件，填入以上接口地址和专属密钥即可直接使用（无需安装插件）。'
-        );
         return lines.join('\n');
       }
 
@@ -4376,7 +4377,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         const policyObj = (lastDistSnapshot && lastDistSnapshot.policy) || {};
         currentShareKey = String(clientObj.api_key || '');
         currentShareBundle = buildClientBundleText(clientObj, policyObj, lastDefaultModel);
-        document.getElementById('distShareTitle').textContent = '「' + (clientObj.name || '客户端') + '」专属接入包（可直接复制发给对方）';
+        document.getElementById('distShareTitle').textContent = (clientObj.name || 'Client') + ' · API 接入凭证 (API Credentials)';
         document.getElementById('distSharePre').textContent = currentShareBundle;
         document.getElementById('distShareBox').hidden = false;
       }
