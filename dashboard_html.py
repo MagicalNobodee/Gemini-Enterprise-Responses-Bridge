@@ -4271,17 +4271,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           lp && cleanOrigin && (!lp.public_url || stripTrailingSlashes(lp.public_url) === cleanOrigin)
         );
         const lpFailed = Boolean(lpMatchesOrigin && lp.health_ok === false);
+        const lpHealthy = Boolean(lpMatchesOrigin && lp.health_ok === true);
 
         if (running && activeUrl) {
-          chip.className = lpFailed ? 'chip busy' : 'chip ok';
-          chip.textContent = lpFailed ? '域名同步中...' : (tun.mode === 'named' ? '固定域名在线' : '公网通道在线');
+          chip.className = lpFailed ? 'chip warn' : 'chip ok';
+          chip.textContent = lpFailed ? '公网连接异常' : (tun.mode === 'named' ? '固定域名通道运行中' : '公网通道运行中');
           if (navChip) {
             navChip.className = lpFailed ? 'side-badge busy' : 'side-badge ok';
-            navChip.textContent = lpFailed ? '同步中' : '已开启';
+            navChip.textContent = lpFailed ? '连接异常' : '已开启';
           }
-          if (ovTVal) ovTVal.textContent = lpFailed ? '域名同步中...' : '公网已连通';
+          if (ovTVal) ovTVal.textContent = lpFailed ? '公网未连通' : (lpHealthy ? '公网已连通' : '公网待自检');
           if (ovTSub) ovTSub.textContent = effOrigin.replace(/^https?:\/\//, '') + ' · ' + keyCnt + ' 把密钥';
-          if (ovTBadge) { ovTBadge.className = 'chip ok'; ovTBadge.textContent = '在线 →'; }
+          if (ovTBadge) {
+            ovTBadge.className = lpFailed ? 'chip warn' : (lpHealthy ? 'chip ok' : 'chip');
+            ovTBadge.textContent = lpFailed ? '连接异常 →' : (lpHealthy ? '在线 →' : '待自检 →');
+          }
           subHint.textContent = '外部软件填入下方接口地址与专属密钥即可使用；本机管理页面对外完全隐藏隔离';
           urlVal.textContent = effApiUrl;
           copyBtn.disabled = false;
@@ -4293,6 +4297,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           chip.textContent = '正在分配地址...';
           if (navChip) { navChip.className = 'side-badge busy'; navChip.textContent = '连接中'; }
           if (ovTVal) ovTVal.textContent = '正在申请地址...';
+          if (ovTBadge) { ovTBadge.className = 'chip busy'; ovTBadge.textContent = '连接中 →'; }
           urlVal.textContent = '正在向 Cloudflare 申请加密公网地址，请稍候 2-3 秒...';
           copyBtn.disabled = true;
           startBtn.hidden = true;
@@ -4302,12 +4307,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           chip.className = tun.cloudflared_installed ? 'chip' : 'chip warn';
           chip.textContent = tun.cloudflared_installed ? '未开启' : '未装 cloudflared';
           if (navChip) {
-            navChip.className = policyUrl ? 'side-badge ok' : 'side-badge';
-            navChip.textContent = policyUrl ? '外部域名' : '未开启';
+            navChip.className = policyUrl && lpHealthy ? 'side-badge ok' : (lpFailed ? 'side-badge busy' : 'side-badge');
+            navChip.textContent = policyUrl ? (lpFailed ? '连接异常' : '外部域名') : '未开启';
           }
-          if (ovTVal) ovTVal.textContent = policyUrl ? '自定义域名在线' : '仅本机使用';
+          if (ovTVal) ovTVal.textContent = policyUrl ? (lpFailed ? '公网未连通' : (lpHealthy ? '公网已连通' : '公网待自检')) : '仅本机使用';
           if (ovTSub) ovTSub.textContent = keyCnt > 0 ? ('已创建 ' + keyCnt + ' 把专属密钥 · 点击开启公网') : '点击一键生成免费公网接口地址';
-          if (ovTBadge) { ovTBadge.className = 'chip'; ovTBadge.textContent = '查看 →'; }
+          if (ovTBadge) {
+            ovTBadge.className = lpFailed ? 'chip warn' : (policyUrl && lpHealthy ? 'chip ok' : 'chip');
+            ovTBadge.textContent = lpFailed ? '连接异常 →' : (policyUrl && lpHealthy ? '在线 →' : '查看 →');
+          }
           subHint.textContent = tun.last_error || '免买服务器免域名，点击右侧「一键开启免费公网」即可生成外部 HTTPS 地址';
           urlVal.textContent = effApiUrl || '尚未开启公网通道（点击右上角「一键开启免费公网」自动生成）';
           copyBtn.disabled = !effApiUrl;
@@ -4866,10 +4874,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           const prData = await prRes.json().catch(function () { return {}; });
           tunnelActionInFlight = false;
           if (prRes.ok && prData && prData.tunnel) {
-            renderTunnel(prData.tunnel, d.distribution || lastDistSnapshot);
+            if (prData.distribution) renderDistribution(prData.distribution, lastDefaultModel);
+            renderTunnel(prData.tunnel, prData.distribution || d.distribution || lastDistSnapshot);
           } else {
-            probeBox.className = 'tunnel-probe-box ok';
-            probeBox.textContent = '✓ 公网通道已开启，接口地址已自动填入接入包，可点击「安全自检」核验外部连通性。';
+            probeBox.className = 'tunnel-probe-box warn';
+            probeBox.textContent = '公网通道已申请，但安全自检未完成：' + ((prData && prData.detail) || '请重新点击「安全自检」确认公网是否可用');
           }
         } catch (e) {
           tunnelActionInFlight = false;
@@ -4989,7 +4998,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             probeBox.textContent = (d && d.detail) ? d.detail : '公网自检未通过';
             return;
           }
-          if (d.tunnel) renderTunnel(d.tunnel, lastDistSnapshot);
+          if (d.distribution) renderDistribution(d.distribution, lastDefaultModel);
+          if (d.tunnel) renderTunnel(d.tunnel, d.distribution || lastDistSnapshot);
         } catch (e) {
           tunnelActionInFlight = false;
           probeBox.className = 'tunnel-probe-box warn';

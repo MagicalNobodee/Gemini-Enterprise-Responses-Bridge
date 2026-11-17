@@ -294,7 +294,7 @@ def test_tunnel_dns_negative_cache_doh_fallback_and_status_consistency(tmp_path:
         assert local_closed["tunnel_state"] == "local_only"
         assert "公网通道未开启" in local_closed["overall_label"]
 
-        # 2) Stale failed probe on active tunnel shows warming state locally & hides timeout latency
+        # 2) Failed reachability is offline, even when the browser worker remains healthy.
         pub_origin = "https://fresh-quick-node.trycloudflare.com"
         app.state.distribution.update_policy(public_base_url=pub_origin)
         tm._last_probe = {
@@ -303,11 +303,17 @@ def test_tunnel_dns_negative_cache_doh_fallback_and_status_consistency(tmp_path:
             "public_url": pub_origin,
             "latency_ms": 3882,
             "health_ok": False,
-            "detail": "新公网域名正在全球 DNS 同步生效中",
+            "detail": "公网连接异常",
         }
-        local_warming = client.get("/api/public/status").json()
-        assert local_warming["tunnel_state"] == "warming"
-        assert local_warming["server_probe_ms"] is None
+        local_failed = client.get("/api/public/status").json()
+        assert local_failed["tunnel_state"] == "down"
+        assert local_failed["status"] == "offline"
+        assert local_failed["online"] is False
+        assert local_failed["busy"] is False
+        assert local_failed["overall_label"] == "本机服务正常 · 公网连接异常"
+        assert local_failed["server_probe_ms"] is None
+        assert local_failed["gateway_ticks"][-1]["state"] == "down"
+        assert all(item["state"] == "down" for item in local_failed["monitors"])
 
         # 3) Real external traffic arriving over that public tunnel clears stale failed _last_probe
         ext_headers = {

@@ -1137,7 +1137,14 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                     sample_key = str(c_item["api_key"])
                     break
         try:
-            probe_res = await tunnel_manager.probe_public_reachability(pub_url or None, sample_api_key=sample_key)
+            probe_res = await tunnel_manager.probe_and_recover(
+                pub_url or None,
+                sample_api_key=sample_key,
+                can_restart=lambda: not any(
+                    hub.status_snapshot().get(key)
+                    for key in ("in_flight_requests", "queued_requests")
+                ),
+            )
         except ValueError as exc:
             return JSONResponse(status_code=400, content={"ok": False, "detail": str(exc)})
         return JSONResponse(
@@ -1146,6 +1153,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                 "ok": bool(probe_res.get("ok")),
                 "probe": probe_res,
                 "tunnel": tunnel_manager.snapshot(),
+                "distribution": distribution.snapshot(include_secrets=True, pool_capacity=_effective_pool_capacity()),
             },
         )
 

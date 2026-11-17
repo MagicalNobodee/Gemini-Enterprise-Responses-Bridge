@@ -429,11 +429,12 @@ class PublicStatusMonitor:
         ts = float(now_ts if now_ts is not None else time.time())
         ledger_stats = self._extract_sanitized_ledger_metrics(usage_ledger, ts)
         gateway_chat_ms = ledger_stats["gateway_chat_ms"]
+        reachable = online and not tunnel_probe_failed
 
         # Ensure at least one fresh heartbeat exists even if background loop hasn't ticked yet
         self.record_sample(
-            online=online,
-            busy=busy,
+            online=reachable,
+            busy=busy and reachable,
             latest_chat_ms=gateway_chat_ms,
             now_ts=ts,
             force=False,
@@ -444,7 +445,7 @@ class PublicStatusMonitor:
             heartbeat_ticks = list(self._recent_ticks[-HISTORY_BAR_COUNT:])
 
         # Make the rightmost tick reflect instantaneous real-time status
-        live_state = "down" if not online else ("busy" if busy else "up")
+        live_state = "down" if not reachable else ("busy" if busy else "up")
         if heartbeat_ticks:
             heartbeat_ticks[-1] = {
                 "ts": int(ts),
@@ -465,7 +466,7 @@ class PublicStatusMonitor:
         for spec in MONITORED_MODELS:
             is_primary = bool(spec.get("is_primary"))
             m_stat = by_model.get(spec["canonical"]) or {}
-            if not online:
+            if not reachable:
                 card_state = "down"
             elif busy:
                 card_state = "busy"
@@ -481,7 +482,7 @@ class PublicStatusMonitor:
                 else float(m_stat["success_rate_7d"])
             )
             raw_ticks = m_stat["call_ticks"] if m_stat.get("call_ticks") else heartbeat_ticks
-            if raw_ticks and not online:
+            if raw_ticks and not reachable:
                 raw_ticks = list(raw_ticks[:-1]) + [{"ts": int(ts), "state": "down", "chat_ms": None}]
 
             monitors.append(
@@ -512,8 +513,8 @@ class PublicStatusMonitor:
             overall_label = "本机服务正常 · 公网通道未开启"
             tunnel_state = "local_only"
         elif tunnel_probe_failed:
-            overall_label = "本机服务正常 · 公网域名同步中"
-            tunnel_state = "warming"
+            overall_label = "本机服务正常 · 公网连接异常"
+            tunnel_state = "down"
         elif busy:
             overall_label = "高负载排队中"
             tunnel_state = "busy"
@@ -522,9 +523,9 @@ class PublicStatusMonitor:
             tunnel_state = "up"
 
         return {
-            "status": "ok" if online else "offline",
-            "online": online,
-            "busy": busy,
+            "status": "ok" if reachable else "offline",
+            "online": reachable,
+            "busy": busy and reachable,
             "tunnel_state": tunnel_state,
             "overall_label": overall_label,
             "updated_at": int(ts),

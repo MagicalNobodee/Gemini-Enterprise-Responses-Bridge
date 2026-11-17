@@ -224,7 +224,10 @@ def _http_get_with_doh_fallback(
                 pass
 
     if scheme == "https" and hostname and hostname in cache:
-        return _via_pinned_ip(cache[hostname])
+        try:
+            return _via_pinned_ip(cache[hostname])
+        except (OSError, http.client.HTTPException):
+            cache.pop(hostname, None)
 
     req = urllib.request.Request(url, headers=headers, method="GET")
     try:
@@ -248,20 +251,10 @@ def _http_get_with_doh_fallback(
 
 def _humanize_probe_failure(raw_exc: str, status_code: int) -> str:
     low = (raw_exc or "").lower()
-    if any(
-        m in low
-        for m in (
-            "nodename nor servname",
-            "name or service not known",
-            "getaddrinfo",
-            "errno 8",
-            "errno -2",
-            "errno 11001",
-        )
-    ):
-        return "新公网域名正在全球 DNS 同步生效中，请等待 3–5 秒后再点一次「安全自检」"
-    if status_code == 530 or "530" in low:
-        return "Cloudflare 边缘节点正在绑定本机隧道（HTTP 530），请等待 3 秒后重试"
+    if _is_dns_resolution_error(RuntimeError(raw_exc)):
+        return "公网域名暂时无法解析，可能是休眠后网络尚未恢复或临时地址已失效；请检查网络后重新自检"
+    if status_code == 530:
+        return "Cloudflare 暂时无法连接本机公网通道（HTTP 530），可能是休眠或断网后连接尚未恢复"
     if status_code in {502, 503}:
         return f"隧道边缘暂未就绪（HTTP {status_code}），请稍候重试"
     if "timed out" in low or "timeout" in low:
@@ -269,6 +262,25 @@ def _humanize_probe_failure(raw_exc: str, status_code: int) -> str:
     if status_code > 0:
         return f"公网地址暂未就绪（HTTP {status_code}），请稍候再测"
     return f"公网地址暂未连通（{raw_exc or '连接未就绪'}），请等 3 秒后再测"
+
+
+def _quick_hostname_expired(hostname: str) -> bool:
+    """Only treat matching NXDOMAIN replies as expiry, never a local DNS/network failure."""
+    if not hostname.endswith(".trycloudflare.com"):
+        return False
+    query = urllib.parse.urlencode({"name": hostname, "type": "A"})
+    for endpoint in _DOH_JSON_ENDPOINTS:
+        req = urllib.request.Request(
+            f"{endpoint}?{query}", headers={"Accept": "application/dns-json"}, method="GET"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=3.0, context=ssl.create_default_context()) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+                if resp.status != 200 or not isinstance(payload, dict) or payload.get("Status") != 3:
+                    return False
+        except Exception:
+            return False
+    return True
 
 
 class PublicTunnelManager:
@@ -301,6 +313,9 @@ class PublicTunnelManager:
         self._started_at: int = 0
         self._last_error: str = ""
         self._last_probe: Optional[Dict[str, Any]] = None
+        self._recovery_lock = asyncio.Lock()
+        self._last_recovery_at: float = 0.0
+        self._last_external_traffic_at: float = 0.0
 
         if self._state_path is not None:
             self._load()
@@ -589,6 +604,8 @@ class PublicTunnelManager:
         if not clean:
             return
         with self._lock:
+            if clean == _normalize_https_origin(self._active_url or self.named_public_url):
+                self._last_external_traffic_at = time.monotonic()
             lp = self._last_probe
             if isinstance(lp, dict) and not lp.get("ok") and _normalize_https_origin(str(lp.get("public_url") or "")) == clean:
                 self._last_probe = None
@@ -618,6 +635,7 @@ class PublicTunnelManager:
             health_status = 0
             health_body: Dict[str, Any] = {}
             last_exc = ""
+            failure_kind = "connection"
             max_attempts = 5
             for attempt in range(max_attempts):
                 try:
@@ -633,12 +651,19 @@ class PublicTunnelManager:
                         health_ok = True
                         break
                     last_exc = f"HTTP {health_status}"
+                    failure_kind = (
+                        "tunnel_disconnected"
+                        if health_status == 530 and re.search(r"\b1033\b", raw)
+                        else "http"
+                    )
                     if health_status in {404, 502, 503, 530} and attempt < (max_attempts - 1):
                         time.sleep(1.4)
                         continue
                     break
                 except Exception as exc:
                     last_exc = str(exc)
+                    health_status = 0
+                    failure_kind = "dns" if _is_dns_resolution_error(exc) else "connection"
                     if attempt < (max_attempts - 1):
                         time.sleep(1.4)
                         continue
@@ -651,6 +676,7 @@ class PublicTunnelManager:
                     "public_url": target_base,
                     "latency_ms": latency_ms,
                     "health_ok": False,
+                    "failure_kind": failure_kind,
                     "auth_lock_verified": False,
                     "admin_lock_verified": False,
                     "client_key_verified": None,
@@ -727,6 +753,72 @@ class PublicTunnelManager:
         with self._lock:
             self._last_probe = result
         return result
+
+    async def probe_and_recover(
+        self,
+        public_url: Optional[str] = None,
+        *,
+        sample_api_key: Optional[str] = None,
+        can_restart: Optional[Callable[[], bool]] = None,
+    ) -> Dict[str, Any]:
+        """Retry the existing route first; replace an expired managed tunnel only when idle."""
+        async with self._recovery_lock:
+            with self._lock:
+                original_pid = self._pid
+                original_url = self._active_url
+                started_at = self._started_at
+                mode = self.mode
+            result = await self.probe_public_reachability(public_url, sample_api_key=sample_api_key)
+            target = result.get("public_url")
+            if (
+                result.get("health_ok") is not False
+                or not original_pid
+                or target != original_url
+                or not started_at
+                or time.time() - started_at < 60
+                or (self._last_recovery_at and time.monotonic() - self._last_recovery_at < 60)
+            ):
+                return result
+
+            disconnected = result.get("failure_kind") == "tunnel_disconnected"
+            if not disconnected and mode == "quick" and result.get("failure_kind") == "dns":
+                hostname = urllib.parse.urlparse(original_url).hostname or ""
+                disconnected = await asyncio.to_thread(_quick_hostname_expired, hostname)
+            if not disconnected:
+                return result
+            with self._lock:
+                # Another admin action or genuine public traffic takes precedence over this probe.
+                if (
+                    self._pid != original_pid
+                    or self._active_url != original_url
+                    or (self._last_external_traffic_at and time.monotonic() - self._last_external_traffic_at < 60)
+                ):
+                    return result
+            if can_restart is not None and not can_restart():
+                result["detail"] += "；当前有任务正在执行或排队，待任务结束后再次自检即可修复"
+                return result
+
+            self._last_recovery_at = time.monotonic()
+            try:
+                snap = await self.start(restart=True)
+                new_url = snap.get("active_url")
+                if not new_url:
+                    raise RuntimeError("尚未取得可用的公网地址，请稍后再次自检")
+                result = await self.probe_public_reachability(new_url, sample_api_key=sample_api_key)
+                result["recovery_attempted"] = True
+                result["url_changed"] = new_url != original_url
+                if result["url_changed"]:
+                    result["detail"] = "已重新申请公网通道；请将外部软件更新为页面上的新地址。" + result["detail"]
+                else:
+                    result["detail"] = (
+                        "已重新连接原公网通道。" if result.get("health_ok") else "已尝试重新连接原公网通道，仍未连通。"
+                    ) + result["detail"]
+            except (RuntimeError, ValueError, OSError) as exc:
+                result["recovery_attempted"] = True
+                result["detail"] = f"公网连接自动修复未完成：{exc}；请检查网络后再次自检"
+            with self._lock:
+                self._last_probe = result
+            return result
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
