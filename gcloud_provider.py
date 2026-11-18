@@ -215,6 +215,7 @@ class GCloudVertexProvider:
             norm_tools,
             tool_choice=tool_choice,
             has_tool_results=bool(messages and (messages[-1].role or "").lower() in {"tool", "function"}),
+            parallel_tool_calls=parallel_tool_calls,
         )
         if reminder:
             query_blocks.append(reminder)
@@ -313,6 +314,7 @@ class GCloudVertexProvider:
             norm_tools,
             tool_choice=tool_choice,
             has_tool_results=bool(messages and (messages[-1].role or "").lower() in {"tool", "function"}),
+            parallel_tool_calls=parallel_tool_calls,
         )
         if reminder:
             _append_vertex_turn("user", reminder)

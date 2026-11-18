@@ -187,6 +187,21 @@ def build_tool_system_instructions(
                 if isinstance(field, dict):
                     field['maximum'] = min(field.get('maximum', limit), limit)
             spec['description'] += '\nRead at most 10 turns and 20000 characters per item. For orientation start with turnLimit=2, maxOutputCharsPerItem=1000 and includeOutputs=false; expand only when needed and use cursor for older turns.'
+        if fn.get('name') in {'spawn_agent', 'multi_agent_v1.spawn_agent'} and 'message' in raw_params.get('properties', {}):
+            spec['description'] = re.sub(
+                r"Do not spawn sub-agents unless[^\n]*\nRequests for depth[^\n]*\nAgent-role guidance[^\n]*",
+                (
+                    "Follow user and AGENTS.md delegation rules: when sub-agent coordination is authorized or "
+                    "the task spans multiple independent modules, files, investigations, or sidecar deliverables, "
+                    "proactively spawn sub-agents in parallel in the same turn."
+                ),
+                spec['description'],
+            )
+            spec['description'] += (
+                "\nCoordinator note: you may emit multiple codex_tool_call blocks in the same turn to spawn "
+                "parallel sub-agents (and optionally run one non-overlapping local step); close completed "
+                "sub-agents with close_agent to free concurrency slots."
+            )
         tool_specs.append(spec)
 
     # Use compact JSON automatically when tool schemas are large (>8 KB) to save context window
@@ -210,17 +225,23 @@ def build_tool_system_instructions(
     ]
 
     if parallel_tool_calls is False:
-        rules.append(
-            "- Emit at most ONE codex_tool_call code block in this turn, then wait for the client result."
+        rules.extend(
+            [
+                "- Emit at most ONE codex_tool_call code block in this turn, then wait for the client result.",
+                "- Send file changes or shell commands one at a time; wait for the real client result before issuing dependent checks.",
+            ]
         )
     else:
-        rules.append(
-            "- Default to ONE codex_tool_call code block per turn. Emit multiple codex_tool_call blocks ONLY for independent pure read-only lookups (such as read_thread, view_image, codegraph_explore, list_*, or simple read-only rg/nl/sed -n/cat/ls/git status/diff/log commands); NEVER emit multiple blocks when any call runs scripts/tests/builds (node, python, npm, swift, curl) or modifies files/state."
+        rules.extend(
+            [
+                "- Batch independent read-only inspections in the same turn by emitting multiple codex_tool_call blocks (typically 2-6 focused calls) ONLY when every workspace call in the turn is a read-only tool (codegraph_*, read_thread, read_file, view_image, list_*/read_*/get_*/search_* MCP tools) or a static read-only shell command (rg, grep, sed -n, awk, cat, head, tail, nl, ls, stat, wc, find, diff, jq, ps, lsof, launchctl list/print, plutil -p/-lint, defaults read, sysctl, pmset -g, git status/diff/log/show/branch --show-current) with NO $(...) subshells, backticks, shell loops, heredocs, curl, or python/node scripts.",
+                "- Disjoint file edits (apply_patch / write_file / edit_file on strictly non-overlapping files, or multi-file hunks inside one apply_patch) and independent sub-agent / coordinator calls (spawn_agent, send_input, close_agent, update_plan) may also be batched when they do not depend on each other; NEVER mix apply_patch/file writes with exec_command or read tools in the same turn.",
+                "- Keep non-read shell commands, scripts, builds, tests (node, python, python3, npm, pytest, swift, curl, shell loops/$(...), service control, git mutations), same-file edits, and any step that depends on a prior result strictly ONE per turn — emit ONLY that single codex_tool_call block in the entire turn (never pair python/node/curl/scripts alongside read_file, codegraph_explore, sed, rg, or ls in the same turn; combine multiple checks inside that single command if needed) and wait for the real client result before issuing dependent edits or checks.",
+            ]
         )
 
     rules.extend(
         [
-            "- Send file changes or shell commands one at a time; wait for the real client result before issuing dependent checks.",
             "- Place one JSON object per codex_tool_call block. `arguments` MUST be a valid RFC 8259 JSON object matching the tool's `parameters` schema (never backslash-escape markdown or shell characters such as `*`, `_`, `|`, `#`, `[`, `]`, `'`, space, or backtick inside JSON strings).",
             "- Output only brief user-facing progress, tool calls, or the final answer. Never output an internal thinking transcript or a 'Thinking Process:' / '思考过程：' section.",
             "- Never fabricate client results and never emit a `suggested_questions` block on a tool-call turn. Stop immediately after the closing fence of your codex_tool_call block(s); the client must execute them first.",
@@ -245,6 +266,7 @@ def build_tool_delta_reminder(
     tools: Sequence[Dict[str, Any]],
     tool_choice: Optional[Any] = None,
     has_tool_results: bool = False,
+    parallel_tool_calls: Optional[bool] = True,
 ) -> str:
     """Compact per-turn instruction for incremental multi-turn agentic continuation."""
     if isinstance(tool_choice, str) and tool_choice == "none":
@@ -260,8 +282,19 @@ def build_tool_delta_reminder(
         action = "You MUST invoke at least one declared tool in this turn."
     else:
         action = "Continue from the real client results above." if has_tool_results else "Continue the current task."
+    if parallel_tool_calls is False:
+        step_rule = (
+            "For another tool step, emit one fenced codex_tool_call JSON block and stop immediately "
+            "after the closing fence without suggested_questions. "
+        )
+    else:
+        step_rule = (
+            "For another tool step, batch independent read-only lookups or disjoint file patches "
+            "(and independent sub-agent calls) as separate fenced codex_tool_call JSON blocks in this turn, "
+            "or emit one block for non-read commands/tests (never mix python/node scripts, curl, loops/$(...), or file edits with other read/exec calls in the same turn) and dependent steps; stop immediately after the final closing fence without suggested_questions. "
+        )
     return (CLIENT_TOOL_BOUNDARY + "\n" + action + "\n"
-            "For another tool step, emit one fenced codex_tool_call JSON block and stop immediately after the closing fence without suggested_questions. "
+            + step_rule +
             "For file changes, prefer a small patch and wait before checking. "
             "Otherwise give the final answer. Example format:\n" + CLIENT_CALL_EXAMPLE)
 
@@ -513,8 +546,10 @@ def parse_assistant_output(
     extracted_calls = _normalize_query_calls(extracted_calls)
     if parallel_tool_calls is False and len(extracted_calls) > 1:
         raise ToolProtocolError("客户端要求逐项执行，未执行同批的多个请求。")
-    if len(extracted_calls) > 1 and _has_conflicting_parallel_calls(extracted_calls):
-        raise ToolProtocolError("文件修改或命令执行必须等待真实结果后再检查；未执行这批可能互相依赖的请求。")
+    if len(extracted_calls) > 1 and (conflict_detail := _find_parallel_conflict_reason(extracted_calls)):
+        raise ToolProtocolError(
+            f"文件修改或命令执行必须等待真实结果后再检查；未执行这批可能互相依赖的请求。（{conflict_detail}）"
+        )
 
     cleaned_preamble = clean_web_text(remaining_text).strip()
     return ParsedAssistantTurn(
@@ -528,8 +563,20 @@ _READ_ONLY_TOOL_NAMES = {
     "read_thread",
     "read_file",
     "read_text_file",
+    "read_multiple_files",
+    "list_directory",
+    "directory_tree",
+    "search_files",
+    "get_file_info",
     "view_image",
     "codegraph_explore",
+    "codegraph_search",
+    "codegraph_context",
+    "codegraph_callers",
+    "codegraph_callees",
+    "codegraph_node",
+    "codegraph_status",
+    "codegraph_symbols",
     "list_threads",
     "list_archived_threads",
     "list_projects",
@@ -540,17 +587,60 @@ _READ_ONLY_TOOL_NAMES = {
     "load_workspace_dependencies",
     "read_thread_terminal",
     "get_goal",
+    "check_app_update",
+    "get_handoff_status",
+    "get_worktree_creation_status",
+    "get_commit",
+    "get_file_contents",
+    "get_label",
+    "get_latest_release",
+    "get_me",
+    "get_release_by_tag",
+    "get_tag",
+    "get_team_members",
+    "get_teams",
+    "issue_read",
+    "list_branches",
+    "list_commits",
+    "list_issue_fields",
+    "list_issue_types",
+    "list_issues",
+    "list_pull_requests",
+    "list_releases",
+    "list_repository_collaborators",
+    "list_tags",
+    "pull_request_read",
+    "search_code",
+    "search_commits",
+    "search_issues",
+    "search_pull_requests",
+    "search_repositories",
+    "search_users",
 }
 
 _WORKSPACE_TOOLS = {
     "exec_command",
+    "shell_command",
+    "run_shell_command",
     "apply_patch",
     "write_file",
     "edit_file",
     "write_stdin",
     "read_file",
     "read_text_file",
+    "read_multiple_files",
+    "list_directory",
+    "directory_tree",
+    "search_files",
+    "get_file_info",
     "codegraph_explore",
+    "codegraph_search",
+    "codegraph_context",
+    "codegraph_callers",
+    "codegraph_callees",
+    "codegraph_node",
+    "codegraph_status",
+    "codegraph_symbols",
 }
 
 _SIMPLE_READ_BINS = {
@@ -595,6 +685,14 @@ _SIMPLE_READ_BINS = {
     "ps",
     "pgrep",
     "lsof",
+    "vm_stat",
+    "uptime",
+    "arch",
+    "nproc",
+    "getconf",
+    "dig",
+    "nslookup",
+    "host",
     "tree",
     "md5",
     "shasum",
@@ -684,6 +782,41 @@ _SAFE_REDIRECT_RE = re.compile(
     r"(?i)(?:[12]>&[12]|(?:[12&]?>>?|<)[ \t]*(?:/dev/null|nul|\$null))(?=$|\s|[|;&])"
 )
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_LAUNCHCTL_READ_SUBCOMMANDS = {
+    "list",
+    "print",
+    "print-disabled",
+    "print-cache",
+    "blame",
+    "managerpid",
+    "manageruid",
+    "managername",
+    "error",
+    "variant",
+    "version",
+    "help",
+}
+_SAFE_READ_ENV_VARS = (
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "PWD",
+    "OLDPWD",
+    "TMPDIR",
+    "CODEX_HOME",
+    "PATH",
+    "SHELL",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+)
+_SAFE_ENV_VAR_RE = re.compile(
+    r"\$(?:(?:"
+    + "|".join(_SAFE_READ_ENV_VARS)
+    + r")(?![A-Za-z0-9_])|\{(?:"
+    + "|".join(_SAFE_READ_ENV_VARS)
+    + r")\})"
+)
 _APPLY_PATCH_HEADER_RE = re.compile(
     r"^\*\*\* (?:Add File|Update File|Delete File|Move to): ([^\r\n]+)\r?$",
     re.MULTILINE,
@@ -717,6 +850,10 @@ def _split_safe_read_pipeline(cmd: str) -> Optional[List[List[str]]]:
                 continue
             if ch in "`\r\n":
                 return None
+            if ch == "$" and (env_m := _SAFE_ENV_VAR_RE.match(cmd, i)):
+                token.append(env_m.group(0))
+                i = env_m.end()
+                continue
             if ch == "$" and i + 1 < n and (
                 cmd[i + 1] in "({0123456789?@#*$!-" or cmd[i + 1].isalpha() or cmd[i + 1] == "_"
             ):
@@ -778,7 +915,14 @@ def _split_safe_read_pipeline(cmd: str) -> Optional[List[List[str]]]:
                 return None
             i += 1
             continue
-        if ch == "$" or ch in ";&<>()`":
+        if ch == "$":
+            if env_m := _SAFE_ENV_VAR_RE.match(cmd, i):
+                token.append(env_m.group(0))
+                in_token = True
+                i = env_m.end()
+                continue
+            return None
+        if ch in ";&<>()`":
             return None
         if ch == "|":
             if i + 1 < n and cmd[i + 1] in "|&":
@@ -822,10 +966,36 @@ def _is_safe_read_stage(tokens: List[str]) -> bool:
         tokens = tokens[1:]
     if not tokens:
         return False
+    if "$" in tokens[0]:
+        return False
     raw_prog = tokens[0].replace("\\", "/").rsplit("/", 1)[-1]
     prog = re.sub(r"\.(?:exe|cmd|bat)$", "", raw_prog, flags=re.IGNORECASE).lower()
     if prog in _SIMPLE_READ_BINS:
         return True
+    if prog == "launchctl":
+        return len(tokens) >= 2 and tokens[1] in _LAUNCHCTL_READ_SUBCOMMANDS
+    if prog == "plutil":
+        flags = [t for t in tokens[1:] if t.startswith("-") and t != "--"]
+        return (
+            bool(flags)
+            and any(f in {"-p", "-lint"} for f in flags)
+            and all(f in {"-p", "-lint", "-s"} for f in flags)
+        )
+    if prog == "defaults":
+        return len(tokens) >= 2 and tokens[1] in {"read", "read-type", "domains", "find", "help"}
+    if prog == "sysctl":
+        return not any(
+            t in {"-w", "--write"} or t.startswith("-w") or "=" in t
+            for t in tokens[1:]
+        )
+    if prog == "scutil":
+        if len(tokens) < 2 or tokens[1] not in {"--dns", "--nc", "--proxy", "--nwi", "--get"}:
+            return False
+        if tokens[1] == "--nc":
+            return len(tokens) >= 3 and tokens[2] in {"list", "status", "show", "statistics", "help"}
+        return True
+    if prog == "pmset":
+        return len(tokens) >= 2 and tokens[1] == "-g"
     if prog == "cd":
         return len(tokens) <= 3 and not any(t.startswith("-") and t not in {"-P", "-L"} for t in tokens[1:])
     if prog == "env":
@@ -931,6 +1101,8 @@ def _is_safe_read_stage(tokens: List[str]) -> bool:
                 return not rest or rest[0] in {"-l", "--list"}
             if sub == "config":
                 return any(r in {"--get", "--get-all", "--get-regexp", "-l", "--list"} for r in rest)
+            if sub in {"worktree", "stash"}:
+                return bool(rest) and rest[0] == "list" and all(r.startswith("-") for r in rest[1:])
             return False
         return False
     return False
@@ -1014,29 +1186,64 @@ def _canonical_call_key(call: dict) -> Tuple[str, str]:
     return (fn["name"], canon_args)
 
 
-def _has_conflicting_parallel_calls(calls: List[Dict[str, Any]]) -> bool:
+def _describe_call_for_conflict(call: Dict[str, Any]) -> str:
+    fn = call.get("function") or {}
+    raw_name = str(fn.get("name") or "tool")
+    short_name = raw_name.rsplit(".", 1)[-1]
+    if short_name in {"exec_command", "shell_command", "run_shell_command"}:
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except (ValueError, TypeError):
+            args = {}
+        cmd_val = ""
+        if isinstance(args, dict):
+            cmd_val = str(args.get("cmd") if "cmd" in args else args.get("command") or "")
+        preview = re.sub(r"\s+", " ", cmd_val).replace("`", "'").strip()
+        if len(preview) > 48:
+            preview = preview[:45] + "..."
+        if preview:
+            return f"{short_name}('{preview}')"
+    return short_name
+
+
+def _find_parallel_conflict_reason(calls: List[Dict[str, Any]]) -> Optional[str]:
     if len(calls) <= 1:
-        return False
+        return None
     if all(_is_read_query(c) for c in calls):
-        return False
+        return None
     seen_non_read: set[Tuple[str, str]] = set()
     for c in calls:
         if not _is_read_query(c):
             key = _canonical_call_key(c)
             if key in seen_non_read:
-                return True
+                return f"同一轮重复发送了相同的非只读调用 {_describe_call_for_conflict(c)}"
             seen_non_read.add(key)
     workspace_calls = [
         c for c in calls
         if c["function"]["name"].rsplit(".", 1)[-1] in _WORKSPACE_TOOLS
     ]
     if len(workspace_calls) <= 1:
-        return False
+        return None
     if all(_is_read_query(c) for c in workspace_calls):
-        return False
+        return None
     if _are_disjoint_file_edits(workspace_calls):
-        return False
-    return True
+        return None
+    edit_only = all(
+        c["function"]["name"].rsplit(".", 1)[-1] in {"apply_patch", "write_file", "edit_file"}
+        for c in workspace_calls
+    )
+    if edit_only:
+        return "同一轮存在同文件或路径重叠的多个修改块；请合并为单个补丁或分轮顺序执行"
+    non_reads = [_describe_call_for_conflict(c) for c in workspace_calls if not _is_read_query(c)]
+    offender = non_reads[0] if non_reads else _describe_call_for_conflict(workspace_calls[0])
+    return (
+        f"同轮混用了非纯静态只读调用 {offender} 与其他工作区工具；"
+        "凡含 python/node 脚本、curl、循环/子shell、服务控制或文件修改，该轮只能单独输出 1 个 codex_tool_call 代码块"
+    )
+
+
+def _has_conflicting_parallel_calls(calls: List[Dict[str, Any]]) -> bool:
+    return _find_parallel_conflict_reason(calls) is not None
 
 
 def _is_read_query(call: dict) -> bool:
@@ -1044,12 +1251,12 @@ def _is_read_query(call: dict) -> bool:
     name = fn['name'].rsplit('.', 1)[-1]
     if name in _READ_ONLY_TOOL_NAMES:
         return True
-    if name != 'exec_command':
+    if name not in {'exec_command', 'shell_command', 'run_shell_command'}:
         return False
     args = json.loads(fn['arguments'])
     if not isinstance(args, dict):
         return False
-    cmd = args.get('cmd', '')
+    cmd = args.get('cmd') if 'cmd' in args else args.get('command', '')
     stages = _split_safe_read_pipeline(cmd)
     if not stages:
         return False

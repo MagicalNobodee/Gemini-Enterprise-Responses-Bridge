@@ -552,6 +552,12 @@ class SessionArchiveStore:
                 if prev_row and prev_row[0]:
                     sid = str(prev_row[0])
             archive_key = f"sid:{sid}" if sid else f"vsid:{vsid}"
+            previous = self._db.execute(
+                "SELECT updated_at FROM session_archive WHERE archive_key = ?",
+                (archive_key,),
+            ).fetchone()
+            if previous and float(previous[0]) > now:
+                return archive_key
             self._db.execute(
                 "DELETE FROM session_archive WHERE vertex_session_id = ? AND archive_key != ?",
                 (vsid, archive_key),
@@ -724,6 +730,8 @@ class ConversationContextBuilder:
         self._compaction_seq_counter: int = 0
         self._slot_turn_seq: Dict[str, int] = {}
         self._pending_compactions: Dict[str, PendingCompactionCleanup] = {}
+        self._slot_last_untracked_sig: Dict[str, str] = {}
+        self._untracked_protocol_recovery: Dict[str, Tuple[float, SessionRecoveryNotice]] = {}
 
     def close(self) -> None:
         self._archive.close()
@@ -745,6 +753,7 @@ class ConversationContextBuilder:
         self._hydration_misses.pop(session_key, None)
         self._ephemeral_probe_slots.discard(session_key)
         self._pending_compactions.pop(session_key, None)
+        self._slot_last_untracked_sig.pop(session_key, None)
         self._slot_turn_seq[session_key] = self._slot_turn_seq.get(session_key, 0) + 1
 
     def invalidate_session(self, session_key: str) -> None:
@@ -769,6 +778,24 @@ class ConversationContextBuilder:
         if not submitted:
             return bool(tracked)
         if not tracked or session_key in self._session_recovery:
+            if not tracked and kind == "protocol_error":
+                untracked_sig = self._slot_last_untracked_sig.get(session_key)
+                if untracked_sig:
+                    now = time.time()
+                    stale_sigs = [
+                        sig
+                        for sig, (ts, _) in self._untracked_protocol_recovery.items()
+                        if now - ts > 180.0
+                    ]
+                    for sig in stale_sigs:
+                        self._untracked_protocol_recovery.pop(sig, None)
+                    self._untracked_protocol_recovery[untracked_sig] = (
+                        now,
+                        SessionRecoveryNotice(
+                            kind="protocol_error",
+                            reason=(reason or "").strip(),
+                        ),
+                    )
             self.invalidate_session(session_key)
             return False
         self._session_recovery[session_key] = SessionRecoveryNotice(
@@ -792,7 +819,7 @@ class ConversationContextBuilder:
                 lines.extend(
                     [
                         '- For client tool calls, use a standalone three-backtick `codex_tool_call` code block on its own line containing valid RFC 8259 JSON `{"name": "...", "arguments": {...}}` (never backslash-escape Markdown characters inside JSON strings), close with three backticks on its own line, and stop immediately without `suggested_questions`.',
-                        "- Emit ONE `codex_tool_call` block for edits or shell/script commands (multiple blocks are allowed ONLY for independent pure read-only lookups).",
+                        "- Batch independent read-only lookups or disjoint file patches as separate `codex_tool_call` blocks ONLY when every call is a pure static read or disjoint file patch; if you run `python`/`node` scripts, `curl`, shell loops/`$(...)`, builds/tests, or file edits+checks, emit ONLY ONE `codex_tool_call` block in the entire turn (never mix them with `read_*`/`codegraph_*`/`sed`/`rg`/`ls`).",
                         "- Never output internal thinking ('Thinking Process:' / '思考过程：') or host-native tool calls.",
                     ]
                 )
@@ -825,7 +852,8 @@ class ConversationContextBuilder:
                         self._session_urls, self._session_explicit_ids, self._session_tenants,
                         self._session_recovery,
                         self._hydration_misses, self._evicted_slot_vsids,
-                        self._slot_turn_seq, self._pending_compactions):
+                        self._slot_turn_seq, self._pending_compactions,
+                        self._slot_last_untracked_sig):
             if old_key in mapping:
                 mapping[new_key] = mapping.pop(old_key)
         if new_key in self._pending_compactions:
@@ -1066,6 +1094,7 @@ class ConversationContextBuilder:
             tools_fp=self._session_tools_fp.get(session_key, ""),
             system_fp=self._session_system_fp.get(session_key, ""),
             metrics=self._session_metrics.get(session_key),
+            updated_at=self.get_slot_last_updated_at(session_key) or None,
             tenant_id=eff_tenant,
         )
 
@@ -1760,6 +1789,9 @@ class ConversationContextBuilder:
         self._slot_turn_seq[session_key] = self._slot_turn_seq.get(session_key, 0) + 1
         self._session_recovery.pop(session_key, None)
         self._session_force_reset.discard(session_key)
+        untracked_sig = self._slot_last_untracked_sig.pop(session_key, None)
+        if untracked_sig:
+            self._untracked_protocol_recovery.pop(untracked_sig, None)
         if active_model is not None:
             self._session_models[session_key] = active_model
         if tools_fingerprint is not None:
@@ -1835,7 +1867,7 @@ class ConversationContextBuilder:
             "last_delta_tokens": max(0, int(web_prompt_tokens or 0)),
             "last_completion_tokens": comp_tokens,
             "last_strategy": last_strategy or "smart_single_turn",
-            "updated_at": int(time.time()),
+            "updated_at": time.time(),
         }
         if not is_compaction:
             self.flush_slot_to_archive(session_key)
@@ -1855,8 +1887,9 @@ class ConversationContextBuilder:
         had_pending_compaction = session_key in self._pending_compactions
         if had_pending_compaction:
             self.retire_reused_compaction_slot(session_key)
+        user_requested_new_chat = model_requests_new_chat(model)
         explicit_new_chat = (
-            model_requests_new_chat(model)
+            user_requested_new_chat
             or session_key in self._session_force_reset
             or had_pending_compaction
         )
@@ -1883,7 +1916,7 @@ class ConversationContextBuilder:
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,
         )
-        if has_coding_tools(norm_tools) and tool_sys_text and CODING_WORKFLOW.strip() not in effective_system_text:
+        if has_coding_tools(norm_tools) and tool_sys_text and "[Coding workflow]" not in effective_system_text:
             tool_sys_text += "\n\n" + CODING_WORKFLOW
         fmt_sys_text = build_response_format_instructions(response_format)
 
@@ -1908,6 +1941,7 @@ class ConversationContextBuilder:
 
         # Check inline [NEW_CHAT] directive on trailing user turn
         if dialogue[-1][0] == "user" and dialogue[-1][1].startswith("[NEW_CHAT]"):
+            user_requested_new_chat = True
             explicit_new_chat = True
             stripped_user = dialogue[-1][1][len("[NEW_CHAT]") :].lstrip()
             dialogue[-1] = ("user", stripped_user)
@@ -1919,6 +1953,20 @@ class ConversationContextBuilder:
 
         tracked = self._session_turns.get(session_key)
         recovery_notice = self._build_recovery_prompt_block(pending_recovery, has_tools=tools_enabled) if pending_recovery else ""
+        dialogue_sig = ""
+        untracked_retry_notice = ""
+        if not tracked and dialogue:
+            dialogue_sig = hashlib.sha1(
+                json.dumps(dialogue, ensure_ascii=False).encode("utf-8", "ignore")
+            ).hexdigest()
+            if user_requested_new_chat:
+                self._untracked_protocol_recovery.pop(dialogue_sig, None)
+            else:
+                saved_untracked = self._untracked_protocol_recovery.pop(dialogue_sig, None)
+                if saved_untracked is not None and (time.time() - saved_untracked[0]) <= 180.0:
+                    untracked_retry_notice = self._build_recovery_prompt_block(
+                        saved_untracked[1], has_tools=tools_enabled
+                    )
 
         has_trailing_tool_results = any(
             r == "tool" for r, _ in self._trailing_non_assistant_slice(dialogue)
@@ -1927,6 +1975,7 @@ class ConversationContextBuilder:
             norm_tools,
             tool_choice=tool_choice,
             has_tool_results=has_trailing_tool_results,
+            parallel_tool_calls=parallel_tool_calls,
         )
 
         if has_coding_tools(norm_tools):
@@ -1953,8 +2002,12 @@ class ConversationContextBuilder:
             if reset_last:
                 self.clear_session(session_key, keep_force_reset=True)
                 self._session_force_reset.add(session_key)
+                if untracked_retry_notice:
+                    tail_prompt = f"{untracked_retry_notice}\n\n{tail_prompt}"
             elif recovery_notice and matches_last:
                 tail_prompt = f"{recovery_notice}\n\n{tail_prompt}"
+            if dialogue_sig and not self._session_turns.get(session_key):
+                self._slot_last_untracked_sig[session_key] = dialogue_sig
             self._record_dialogue_title(session_key, dialogue)
             prompt = self._with_system_if_first_turn(
                 last_text=tail_prompt,
@@ -1976,11 +2029,18 @@ class ConversationContextBuilder:
             if reset_trans:
                 self.clear_session(session_key, keep_force_reset=True)
                 self._session_force_reset.add(session_key)
+            if dialogue_sig and not self._session_turns.get(session_key):
+                self._slot_last_untracked_sig[session_key] = dialogue_sig
             self._record_dialogue_title(session_key, dialogue)
+            trans_reminder = (
+                "\n\n".join(filter(None, [untracked_retry_notice, delta_reminder]))
+                if untracked_retry_notice
+                else delta_reminder
+            )
             prompt = self._format_full_transcript(
                 system_text=combined_system_text,
                 dialogue=dialogue,
-                trailing_reminder=delta_reminder,
+                trailing_reminder=trans_reminder,
             )
             return PreparedPrompt(
                 prompt=prompt,
@@ -2004,9 +2064,16 @@ class ConversationContextBuilder:
                 self._session_force_reset.add(session_key)
                 if target_model is not None:
                     self._session_models[session_key] = target_model
+            if dialogue_sig:
+                self._slot_last_untracked_sig[session_key] = dialogue_sig
             self._record_dialogue_title(session_key, dialogue)
+            first_user_text = (
+                f"{untracked_retry_notice}\n\n{dialogue[0][1]}"
+                if untracked_retry_notice
+                else dialogue[0][1]
+            )
             prompt = self._with_system_if_first_turn(
-                last_text=dialogue[0][1],
+                last_text=first_user_text,
                 system_text=combined_system_text,
                 is_first_turn=True,
             )
@@ -2047,6 +2114,7 @@ class ConversationContextBuilder:
                 norm_tools,
                 tool_choice=tool_choice,
                 has_tool_results=delta_has_tools,
+                parallel_tool_calls=parallel_tool_calls,
             )
             if has_coding_tools(norm_tools):
                 read_hint = reading_reminder(reading_diagnostics(messages))
@@ -2075,11 +2143,18 @@ class ConversationContextBuilder:
             self._session_force_reset.add(session_key)
             if target_model is not None:
                 self._session_models[session_key] = target_model
+        if dialogue_sig and not self._session_turns.get(session_key):
+            self._slot_last_untracked_sig[session_key] = dialogue_sig
         self._record_dialogue_title(session_key, dialogue)
+        packed_reminder = (
+            "\n\n".join(filter(None, [untracked_retry_notice, delta_reminder]))
+            if untracked_retry_notice
+            else delta_reminder
+        )
         prompt = self._format_full_transcript(
             system_text=combined_system_text,
             dialogue=dialogue,
-            trailing_reminder=delta_reminder,
+            trailing_reminder=packed_reminder,
         )
         return PreparedPrompt(
             prompt=prompt,

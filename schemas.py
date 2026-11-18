@@ -7,7 +7,7 @@ import re
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Union
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 try:
     from pydantic import ConfigDict
@@ -108,6 +108,7 @@ class ChatMessage(_FlexibleModel):
 
 
 class ChatCompletionRequest(_FlexibleModel):
+    _bridge_thread_id: Optional[str] = PrivateAttr(default=None)
     model: str = Field(default="")
     messages: List[ChatMessage]
     stream: bool = False

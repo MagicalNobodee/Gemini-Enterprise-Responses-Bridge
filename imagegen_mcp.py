@@ -25,7 +25,8 @@ TOOLS = [
         "description": (
             "Generate a real image using Gemini Enterprise, or edit/combine reference image(s) "
             "by supplying image_path or image_paths (supports PNG, JPEG, WebP, GIF, HEIC, HEIF, BMP, TIFF, SVG, AVIF). "
-            "Returns a real local file and the image itself. Use this when the user requests an image artifact."
+            "Returns a real local file and the image itself. Use on Gemini models, for multi-image reference synthesis "
+            "(image_paths), or for HEIC/HEIF/AVIF/SVG/TIFF/BMP/GIF inputs; on GPT models prefer built-in image_gen for ordinary single-image requests."
         ),
         "inputSchema": {
             "type": "object",
@@ -41,7 +42,7 @@ TOOLS = [
             "required": ["prompt"],
             "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
     },
     {
         "name": "generate_video",
@@ -62,7 +63,7 @@ TOOLS = [
             "required": ["prompt"],
             "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
     },
     {
         "name": "analyze_media",
@@ -84,7 +85,7 @@ TOOLS = [
             "required": ["prompt", "file_paths"],
             "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+        "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     },
 ]
 

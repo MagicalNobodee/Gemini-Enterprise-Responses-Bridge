@@ -492,6 +492,93 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       margin-bottom: 14px;
     }
 
+    .seat-cap-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .seat-cap-group {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      padding: 3px 4px 3px 10px;
+      border-radius: 999px;
+      background: var(--surface-soft);
+      border: 1px solid var(--border);
+    }
+
+    .seat-cap-label {
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: var(--muted);
+      margin-right: 3px;
+      user-select: none;
+    }
+
+    .seat-cap-btn {
+      border: none;
+      border-radius: 999px;
+      height: 23px;
+      padding: 0 8px;
+      background: transparent;
+      color: var(--muted);
+      font: inherit;
+      font-size: 0.75rem;
+      font-weight: 650;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .seat-cap-btn:hover:not(:disabled) { color: var(--text); background: #eaf0fa; }
+    .seat-cap-btn.active { background: #ffffff; color: var(--primary); box-shadow: 0 1px 4px rgba(15, 23, 42, 0.1); }
+    .seat-cap-btn:disabled { opacity: 0.55; cursor: wait; }
+
+    .seat-cap-custom-wrap {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      margin-left: 2px;
+    }
+    .seat-cap-custom-wrap[hidden] { display: none !important; }
+
+    .seat-cap-input {
+      width: 60px;
+      height: 23px;
+      padding: 0 7px;
+      border-radius: 999px;
+      border: 1px solid #cbd5e1;
+      background: #ffffff;
+      color: var(--text);
+      font: inherit;
+      font-size: 0.75rem;
+      font-weight: 650;
+      text-align: center;
+      outline: none;
+      -moz-appearance: textfield;
+    }
+    .seat-cap-input::-webkit-outer-spin-button,
+    .seat-cap-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+    .seat-cap-input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15); }
+
+    .seat-cap-apply-btn {
+      border: none;
+      border-radius: 999px;
+      height: 23px;
+      padding: 0 9px;
+      background: var(--primary);
+      color: #ffffff;
+      font: inherit;
+      font-size: 0.72rem;
+      font-weight: 650;
+      cursor: pointer;
+      transition: opacity 0.15s ease;
+      white-space: nowrap;
+    }
+    .seat-cap-apply-btn:hover:not(:disabled) { opacity: 0.9; }
+    .seat-cap-apply-btn:disabled { opacity: 0.55; cursor: wait; }
+
     .card-title-group {
       display: flex;
       align-items: center;
@@ -1864,7 +1951,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                   <div class="card-subtitle">默认仅展示正在工作或有对话记忆的活跃席位 · 点击任意卡片查看详情或开启新对话</div>
                 </div>
               </div>
-              <span class="chip" id="seatsSummaryChip">0 个席位待命</span>
+              <div class="seat-cap-toolbar">
+                <div class="seat-cap-group" id="dashSeatCapGroup" role="group" aria-label="席位上限">
+                  <span class="seat-cap-label" id="dashSeatCapLabel">席位上限</span>
+                  <button type="button" class="seat-cap-btn" data-cap="1">1</button>
+                  <button type="button" class="seat-cap-btn" data-cap="5">5</button>
+                  <button type="button" class="seat-cap-btn" data-cap="10">10</button>
+                  <button type="button" class="seat-cap-btn" id="dashSeatCapCustomBtn" data-cap="custom">自定义</button>
+                  <span class="seat-cap-custom-wrap" id="dashSeatCapCustomWrap" hidden>
+                    <input type="number" class="seat-cap-input" id="dashSeatCapCustomInput" min="1" max="200" step="1" inputmode="numeric" placeholder="1-200" aria-label="自定义席位数量" />
+                    <button type="button" class="seat-cap-apply-btn" id="dashSeatCapCustomApply">确定</button>
+                  </span>
+                </div>
+                <span class="chip" id="seatsSummaryChip">0 个席位待命</span>
+              </div>
             </div>
 
             <div class="seat-detail-panel" id="seatDetailPanel">
@@ -3038,8 +3138,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       }
 
       function friendlySeatLabel(slotKey, tabId) {
-        if (slotKey && seatIndexBySlotKey[slotKey]) return seatIndexBySlotKey[slotKey] + '号席位';
-        if (tabId && seatIndexByTabId[String(tabId)]) return seatIndexByTabId[String(tabId)] + '号席位';
+        const num = slotKey ? seatIndexBySlotKey[slotKey] : seatIndexByTabId[String(tabId)];
+        if (num) return num + '号席位';
         if (tabId) return '工作页 #' + String(tabId).slice(-4);
         return '自动分配';
       }
@@ -3076,7 +3176,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         tag.textContent = tagText;
         tag.className = 'chip ' + (state === 'ok' ? 'ok' : (state === 'warn' ? 'warn' : 'err'));
       }
-      async function resetSingleSeat(slotKey, seatNum, btn) {
+      async function resetSingleSeat(slotKey, seatLabel, btn) {
         const origText = btn.textContent;
         btn.disabled = true;
         btn.textContent = '重置中...';
@@ -3098,7 +3198,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             }, 2000);
             return;
           }
-          btn.textContent = seatNum + '号已换新 ✓';
+          btn.textContent = seatLabel + '已换新 ✓';
           setTimeout(function () {
             btn.textContent = '开启新对话';
             btn.disabled = false;
@@ -3139,7 +3239,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           ? Number(cs.utilization_pct)
           : ((usedTok / Math.max(1, limTok)) * 100);
 
-        document.getElementById('detailSeatBadge').textContent = item.seatNum + ' 号席位';
+        document.getElementById('detailSeatBadge').textContent = friendlySeatLabel(s.slot_key, s.tab_id);
         const tenantChip = document.getElementById('detailTenantChip');
         if (item.isExternalTenant) {
           tenantChip.hidden = false;
@@ -3233,7 +3333,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       function buildSeatCard(item) {
         const s = item.slot;
         const cs = item.cs;
-        const seatNum = item.seatNum;
         const turns = item.turns;
         const cmpPct = Math.min(100, Math.max(0, Number(cs.compact_pct || 0)));
         const isSelected = Boolean(s.slot_key && selectedSlotKey === s.slot_key);
@@ -3250,7 +3349,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         top.className = 'seat-top';
         const nameWrap = document.createElement('div');
         nameWrap.className = 'seat-name';
-        nameWrap.textContent = seatNum + ' 号席位';
+        nameWrap.textContent = friendlySeatLabel(s.slot_key, s.tab_id);
 
         const stateChip = document.createElement('span');
         if (item.isWorking) {
@@ -3362,9 +3461,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
         let busyCount = 0;
         const enrichedSlots = slots.map(function (s, idx) {
-          const num = idx + 1;
-          if (s.slot_key) seatIndexBySlotKey[s.slot_key] = num;
-          if (s.tab_id) seatIndexByTabId[String(s.tab_id)] = num;
+          const num = s.seat_index === undefined ? idx + 1 : s.seat_index;
+          if (num && s.slot_key) seatIndexBySlotKey[s.slot_key] = num;
+          if (num && s.tab_id) seatIndexByTabId[String(s.tab_id)] = num;
           const cs = ctxSlotsMap[s.slot_key] || {};
           const waitingCnt = Number(s.waiting_count || cs.waiting_count || 0);
           const sessionActive = Boolean(cs.session_active);
@@ -3390,7 +3489,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           const enriched = {
             slot: s,
             cs: cs,
-            seatNum: num,
+            seatNum: num || Number.MAX_SAFE_INTEGER,
             waitingCnt: waitingCnt,
             isWorking: isWorking,
             activityPhase: activityPhase,
@@ -3922,7 +4021,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           );
 
           const extOnline = clients.length > 0 || slots.length > 0 || Boolean(active);
-          const extParallelCap = (active && active.max_parallel_tabs) || hub.client_max_parallel_tabs || hub.max_parallel_tabs || 10;
+          const rawExtCap = (active && active.max_parallel_tabs !== undefined && active.max_parallel_tabs !== null)
+            ? Number(active.max_parallel_tabs)
+            : (hub.client_max_parallel_tabs !== undefined && hub.client_max_parallel_tabs !== null)
+              ? Number(hub.client_max_parallel_tabs)
+              : (hub.max_parallel_tabs !== undefined && hub.max_parallel_tabs !== null)
+                ? Number(hub.max_parallel_tabs)
+                : 10;
+          const extParallelCap = (Number.isFinite(rawExtCap) && rawExtCap >= 1) ? Math.min(200, Math.round(rawExtCap)) : 10;
+          if (!seatCapSaving && !seatCapCustomEditing) syncDashSeatCapUI(extParallelCap);
+          const extCapLabel = '上限 ' + extParallelCap + ' 路并行';
+          const transportCapLabel = '上限 ' + extParallelCap + ' 并发';
           const authBtn = document.getElementById('stepAuthBtn');
           const workingTotal = renderSeatsGrid(slots, data.context_monitor) || 0;
 
@@ -3933,13 +4042,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             dot.className = 'dot err';
             txt.textContent = '等待插件连接';
           } else if (slots.length === 0) {
-            setStepState('stepExtCard', 'stepExtIcon', 'stepExtDesc', 'stepExtTag', 'ok', '✓', '上限 ' + extParallelCap + ' 路并行', '已连接');
+            setStepState('stepExtCard', 'stepExtIcon', 'stepExtDesc', 'stepExtTag', 'ok', '✓', extCapLabel, '已连接');
             setStepState('stepAuthCard', 'stepAuthIcon', 'stepAuthDesc', 'stepAuthTag', 'warn', '!', '请打开并登录网页', '待打开');
             authBtn.hidden = false;
             dot.className = 'dot';
             txt.textContent = '请打开工作页';
           } else {
-            setStepState('stepExtCard', 'stepExtIcon', 'stepExtDesc', 'stepExtTag', 'ok', '✓', '上限 ' + extParallelCap + ' 路并行', '已连接');
+            setStepState('stepExtCard', 'stepExtIcon', 'stepExtDesc', 'stepExtTag', 'ok', '✓', extCapLabel, '已连接');
             setStepState('stepAuthCard', 'stepAuthIcon', 'stepAuthDesc', 'stepAuthTag', 'ok', '✓', slots.length + ' 页已登录', '就绪');
             authBtn.hidden = true;
             dot.className = 'dot ok';
@@ -3954,7 +4063,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           renderAuditCenter(data.distribution, data.usage, lastSessionsOverview);
 
           document.getElementById('modeVal').textContent = '浏览器桥接 · 智能增量记忆';
-          document.getElementById('transportVal').textContent = extOnline ? ('WebSocket 实时双工 · 上限 ' + extParallelCap + ' 并发') : '未连接';
+          document.getElementById('transportVal').textContent = extOnline ? ('WebSocket 实时双工 · ' + transportCapLabel) : '未连接';
           document.getElementById('rpcVal').textContent = (active && active.captured_rpc) ? '已捕获流式通道' : '页面组件与流式双监听';
           const effBusy = Math.max(Number(hub.working_slots || 0), Number(hub.active_slots_busy || 0), workingTotal);
           document.getElementById('statsVal').textContent = effBusy + ' 工作中 / ' + (hub.queued_requests || 0) + ' 排队 / ' + (hub.total_requests || 0) + ' 累计';
@@ -4133,7 +4242,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       document.getElementById('detailResetBtn').addEventListener('click', function () {
         const item = selectedSlotKey ? enrichedBySlotKey[selectedSlotKey] : null;
         if (!item || item.isWorking) return;
-        resetSingleSeat(item.slot.slot_key, item.seatNum, document.getElementById('detailResetBtn'));
+        const s = item.slot;
+        resetSingleSeat(s.slot_key, friendlySeatLabel(s.slot_key, s.tab_id), document.getElementById('detailResetBtn'));
       });
       document.getElementById('periodTabs').addEventListener('click', function (ev) {
         const btn = ev.target && ev.target.closest('.period-tab');
@@ -5570,6 +5680,142 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           copyTextWithFeedback(btn, el.textContent.trim(), '已复制 ✓');
         });
       });
+
+      let seatCapSaving = false;
+      let seatCapCustomEditing = false;
+      let currentSeatCapValue = 10;
+      let seatCapToastTimer = null;
+
+      function syncDashSeatCapUI(capVal) {
+        const group = document.getElementById('dashSeatCapGroup');
+        if (!group) return;
+        const num = Number(capVal);
+        const safeNum = (Number.isFinite(num) && num >= 1) ? Math.min(200, Math.round(num)) : 10;
+        currentSeatCapValue = safeNum;
+        const normalized = String(safeNum);
+        const isPreset = (safeNum === 1 || safeNum === 5 || safeNum === 10);
+        const btns = group.querySelectorAll('.seat-cap-btn');
+        btns.forEach(function (b) {
+          const d = b.getAttribute('data-cap');
+          if (d === 'custom') {
+            b.classList.toggle('active', seatCapCustomEditing || !isPreset);
+            b.textContent = !isPreset ? ('自定义 · ' + safeNum) : '自定义';
+          } else {
+            b.classList.toggle('active', !seatCapCustomEditing && d === normalized);
+          }
+        });
+      }
+
+      (function bindSeatCapControls() {
+        const group = document.getElementById('dashSeatCapGroup');
+        const labelEl = document.getElementById('dashSeatCapLabel');
+        const customWrap = document.getElementById('dashSeatCapCustomWrap');
+        const customInput = document.getElementById('dashSeatCapCustomInput');
+        const customApply = document.getElementById('dashSeatCapCustomApply');
+        if (!group) return;
+
+        function showSeatCapToast(text, colorVar, ms) {
+          if (!labelEl) return;
+          labelEl.textContent = text;
+          labelEl.style.color = colorVar || '';
+          if (seatCapToastTimer) clearTimeout(seatCapToastTimer);
+          seatCapToastTimer = setTimeout(function () {
+            labelEl.textContent = '席位上限';
+            labelEl.style.color = '';
+          }, ms || 1800);
+        }
+
+        function closeCustomEditor() {
+          seatCapCustomEditing = false;
+          if (customWrap) customWrap.hidden = true;
+          syncDashSeatCapUI(currentSeatCapValue);
+        }
+
+        function submitSeatCap(nextCap) {
+          const allBtns = group.querySelectorAll('.seat-cap-btn');
+          seatCapCustomEditing = false;
+          if (customWrap) customWrap.hidden = true;
+          seatCapSaving = true;
+          allBtns.forEach(function (b) { b.disabled = true; });
+          if (customInput) customInput.disabled = true;
+          if (customApply) customApply.disabled = true;
+          syncDashSeatCapUI(nextCap);
+          const authVal = (document.getElementById('apiKeyInput').value || '').trim();
+          const headers = { 'Content-Type': 'application/json' };
+          if (authVal) headers['Authorization'] = 'Bearer ' + authVal;
+          fetch('/api/seats/limit', {
+            method: 'POST',
+            headers: headers,
+            body: JSON.stringify({ max_parallel_tabs: nextCap })
+          }).then(async function (res) {
+            const data = await res.json().catch(function () { return {}; });
+            if (!res.ok || !data.ok) {
+              throw new Error((data && data.detail) || ('HTTP ' + res.status));
+            }
+            syncDashSeatCapUI(data.max_parallel_tabs);
+            showSeatCapToast('已设 ' + data.max_parallel_tabs + ' 席 ✓', 'var(--ok)', 1600);
+          }).catch(function () {
+            showSeatCapToast('切换失败', 'var(--err)', 2000);
+          }).finally(function () {
+            seatCapSaving = false;
+            allBtns.forEach(function (b) { b.disabled = false; });
+            if (customInput) customInput.disabled = false;
+            if (customApply) customApply.disabled = false;
+            refreshStatus();
+          });
+        }
+
+        function confirmCustomSeatCap() {
+          if (!customInput) return;
+          const raw = (customInput.value || '').trim();
+          if (!/^\d+$/.test(raw)) {
+            showSeatCapToast('请输入 1~200 整数', 'var(--err)', 2200);
+            customInput.focus();
+            return;
+          }
+          const parsed = Number(raw);
+          if (!Number.isInteger(parsed) || parsed < 1 || parsed > 200) {
+            showSeatCapToast('范围应为 1~200', 'var(--err)', 2200);
+            customInput.focus();
+            return;
+          }
+          submitSeatCap(parsed);
+        }
+
+        group.addEventListener('click', function (ev) {
+          const btn = ev.target && ev.target.closest('.seat-cap-btn');
+          if (!btn || btn.disabled) return;
+          const rawCap = btn.getAttribute('data-cap');
+          if (!rawCap) return;
+          if (rawCap === 'custom') {
+            if (seatCapCustomEditing && customWrap && !customWrap.hidden) {
+              closeCustomEditor();
+              return;
+            }
+            seatCapCustomEditing = true;
+            if (customWrap) customWrap.hidden = false;
+            const isPreset = (currentSeatCapValue === 1 || currentSeatCapValue === 5 || currentSeatCapValue === 10);
+            if (customInput) {
+              customInput.value = isPreset ? '' : String(currentSeatCapValue);
+              customInput.focus();
+              if (!isPreset) customInput.select();
+            }
+            syncDashSeatCapUI(currentSeatCapValue);
+            return;
+          }
+          submitSeatCap(Number(rawCap));
+        });
+
+        if (customApply) {
+          customApply.addEventListener('click', function () { confirmCustomSeatCap(); });
+        }
+        if (customInput) {
+          customInput.addEventListener('keydown', function (ev) {
+            if (ev.key === 'Enter') { ev.preventDefault(); confirmCustomSeatCap(); }
+            else if (ev.key === 'Escape') { ev.preventDefault(); closeCustomEditor(); }
+          });
+        }
+      })();
 
       refreshStatus();
       setInterval(function () {

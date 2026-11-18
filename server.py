@@ -9,7 +9,7 @@ import logging
 import re
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, Optional, Sequence
 
@@ -82,11 +82,10 @@ from media_outputs import format_artifacts_markdown, generate_videos, persist_br
 from responses_api import (
     ResponseStore,
     ResponsesError,
-    extract_responses_thread_id,
     prepare_request,
     translate_response,
 )
-from streaming_utils import with_keepalive
+from streaming_utils import ClosingStreamingResponse, with_keepalive
 from usage_ledger import UsageLedger, estimate_attachment_input_tokens
 from tool_calling import (
     ToolStreamProcessor,
@@ -372,7 +371,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                     build_tool_system_instructions(request.tools or [], request.tool_choice, request.parallel_tool_calls),
                     build_response_format_instructions(request.response_format)]
         if (has_coding_tools(request.tools) and is_tool_generation_enabled(request.tools or [], request.tool_choice)
-                and CODING_WORKFLOW.strip() not in system_text):
+                and "[Coding workflow]" not in system_text):
             sections.append(CODING_WORKFLOW)
         return "\n\n".join(filter(None, sections))
 
@@ -410,6 +409,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
         ephemeral_probe: bool = False,
         ephemeral_compaction: bool = False,
         tenant_id: str = HOST_TENANT_ID,
+        strict_session_affinity: bool = False,
     ):
         sync_and_hydrate_idle_slots()
 
@@ -424,6 +424,8 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                 tenant_id=tenant_id,
             )
         )
+        if strict_session_affinity:
+            matching_slots = [k for k in matching_slots if hub._slots[k].pinned_session_id == explicit_session_id]
         aff_slot = None if (ephemeral_probe or ephemeral_compaction) else hub.get_affinity_slot_key(explicit_session_id)
         archived_match = None
         if not (ephemeral_probe or ephemeral_compaction) and aff_slot not in ready_keys and not matching_slots:
@@ -433,11 +435,14 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                 explicit_session_id=explicit_session_id,
                 tenant_id=tenant_id,
             )
+            if strict_session_affinity and archived_match and archived_match.explicit_session_id != explicit_session_id:
+                archived_match = None
 
         ephemeral_aux = bool(
             ephemeral_compaction
             or (
-                not tools_active
+                not strict_session_affinity
+                and not tools_active
                 and (
                     (aff_slot and context_builder.has_active_tool_session(aff_slot))
                     or any(context_builder.has_active_tool_session(k) for k in matching_slots)
@@ -461,7 +466,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
             or context_builder.has_compaction_summary(request_messages)
         )
         avoid_affinity_slot = bool(
-            not (ephemeral_probe or ephemeral_compaction or ephemeral_aux)
+            not (strict_session_affinity or ephemeral_probe or ephemeral_compaction or ephemeral_aux)
             and tools_active
             and aff_slot_obj is not None
             and aff_slot in ready_keys
@@ -482,6 +487,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
             ephemeral_probe=ephemeral_probe,
             tenant_id=tenant_id,
             avoid_affinity_slot=avoid_affinity_slot,
+            strict_session_affinity=strict_session_affinity and not (ephemeral_probe or ephemeral_compaction),
         ) as slot:
             slot.last_dispatch_submitted = False
             slot.last_dispatch_tab_reset = False
@@ -1048,6 +1054,36 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
         except RuntimeError as exc:
             return JSONResponse(status_code=409, content={"ok": False, "detail": str(exc)})
         return JSONResponse(status_code=200, content=result)
+
+    @app.post("/api/seats/limit", dependencies=[Depends(require_local_admin), Depends(verify_api_key)])
+    async def api_set_seats_limit(request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        raw_limit = (body or {}).get("max_parallel_tabs")
+        if raw_limit is None:
+            return JSONResponse(status_code=400, content={"ok": False, "detail": "缺少参数 max_parallel_tabs"})
+        if isinstance(raw_limit, bool):
+            return JSONResponse(status_code=400, content={"ok": False, "detail": "max_parallel_tabs 必须为 1~200 的整数"})
+        try:
+            if isinstance(raw_limit, str):
+                trimmed = raw_limit.strip()
+                if not trimmed or not trimmed.lstrip("-").isdigit():
+                    raise ValueError("not integer")
+                parsed = int(trimmed)
+            elif isinstance(raw_limit, int):
+                parsed = raw_limit
+            elif isinstance(raw_limit, float) and raw_limit.is_integer():
+                parsed = int(raw_limit)
+            else:
+                raise ValueError("not integer")
+        except (TypeError, ValueError):
+            return JSONResponse(status_code=400, content={"ok": False, "detail": "max_parallel_tabs 必须为 1~200 的整数"})
+        if parsed < 1 or parsed > 200:
+            return JSONResponse(status_code=400, content={"ok": False, "detail": "席位上限范围应为 1~200"})
+        result = await hub.set_max_parallel_tabs(parsed)
+        return JSONResponse(status_code=200, content={**result, "hub": hub.status_snapshot()})
 
     # ------------------------------------------------------------------
     # Public API Distribution & Multi-Client Admin Endpoints (Local Only)
@@ -1990,8 +2026,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
         except (ResponsesError, ValidationError) as exc:
             return _openai_error_response(400, str(exc), "invalid_request_error", "invalid_responses_request")
         try:
-            explicit_tid = extract_responses_thread_id(payload, headers=raw_request.headers)
-            forwarded_x_sid = None if explicit_tid else raw_request.headers.get("x-session-id")
+            forwarded_x_sid = None if request._bridge_thread_id else raw_request.headers.get("x-session-id")
             tok = _ledger_task_var.set("responses")
             cmp_in_tok = _consumed_compactions_var.set(
                 _extract_input_compaction_tokens(payload.get("input"))
@@ -2152,10 +2187,11 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
         )
         clean_x_sid = x_session_id.strip() if isinstance(x_session_id, str) and x_session_id.strip() else None
         clean_req_sid = request.session_id.strip() if isinstance(request.session_id, str) and request.session_id.strip() else None
+        verified_thread_id = request._bridge_thread_id or clean_thread_hdr
         raw_explicit_session_id = (
-            model_session_tag
+            verified_thread_id
+            or model_session_tag
             or clean_x_bridge
-            or clean_thread_hdr
             or clean_x_sid
             or clean_req_sid
         )
@@ -2473,6 +2509,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                         ephemeral_probe=is_probe_req,
                         ephemeral_compaction=is_compaction_req,
                         tenant_id=principal.tenant_id,
+                        strict_session_affinity=bool(verified_thread_id),
                     ) as (slot, effective_sid, resumed_from_archive),
                 ):
                     session_key = slot.slot_key
@@ -2691,6 +2728,11 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                 state="queued",
             )
 
+        async def close_browser_stream():
+            if not is_probe_req:
+                distribution.finish_live_task(completion_id)
+            await browser_stream_lease.close()
+
         async def browser_sse() -> AsyncIterator[str]:
             initial = build_chat_completion_chunk(
                 request_id=completion_id,
@@ -2715,16 +2757,20 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
             try:
                 handoff_cleanup_triggered = False
                 stream_compaction_rec: Optional[PendingCompactionCleanup] = None
-                async with conversation_slot(
-                    request_messages=request.messages,
-                    model_name=model_name,
-                    explicit_session_id=explicit_session_id,
-                    tools_active=tools_active,
-                    queue_timeout=cfg.queue_timeout_seconds,
-                    ephemeral_probe=is_probe_req,
-                    ephemeral_compaction=is_compaction_req,
-                    tenant_id=principal.tenant_id,
-                ) as (slot, effective_sid, resumed_from_archive):
+                async with (
+                    conversation_slot(
+                        request_messages=request.messages,
+                        model_name=model_name,
+                        explicit_session_id=explicit_session_id,
+                        tools_active=tools_active,
+                        queue_timeout=cfg.queue_timeout_seconds,
+                        ephemeral_probe=is_probe_req,
+                        ephemeral_compaction=is_compaction_req,
+                        tenant_id=principal.tenant_id,
+                        strict_session_affinity=bool(verified_thread_id),
+                    ) as (slot, effective_sid, resumed_from_archive),
+                    AsyncExitStack() as stream_cleanup,
+                ):
                     session_key = slot.slot_key
                     if not is_probe_req:
                         distribution.update_live_task(
@@ -2752,7 +2798,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                         context_diagnostics["resumed_archived_session"] = True
                     stream_out_images: list[dict[str, Any]] = []
                     stream_out_files: list[dict[str, Any]] = []
-                    async for delta in hub.dispatch_stream_on_slot(
+                    dispatch_stream = hub.dispatch_stream_on_slot(
                         slot=slot,
                         prompt=prepared.prompt,
                         target_model=target_web_model,
@@ -2762,7 +2808,9 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                         attachments=sent_attachments,
                         output_images=stream_out_images,
                         output_files=stream_out_files,
-                    ):
+                    )
+                    stream_cleanup.push_async_callback(dispatch_stream.aclose)
+                    async for delta in dispatch_stream:
                         if (
                             not handoff_cleanup_triggered
                             and superseded_compactions
@@ -2947,9 +2995,7 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
                 yield "data: " + json.dumps({"error": {"message": str(exc), "type": "bridge_error", "code": "browser_failed"}}, ensure_ascii=False) + "\n\n"
                 return
             finally:
-                if not is_probe_req:
-                    distribution.finish_live_task(completion_id)
-                await browser_stream_lease.close()
+                await close_browser_stream()
 
             stop_chunk = build_chat_completion_chunk(
                 request_id=completion_id,
@@ -2986,10 +3032,11 @@ def create_app(settings: Optional[BridgeSettings] = None) -> FastAPI:
         if client_visible_sid:
             sse_headers["X-Bridge-Session-Id"] = client_visible_sid
 
-        return StreamingResponse(
+        return ClosingStreamingResponse(
             with_keepalive(browser_sse()),
             media_type="text/event-stream",
             headers=sse_headers,
+            on_close=close_browser_stream,
         )
 
     return app

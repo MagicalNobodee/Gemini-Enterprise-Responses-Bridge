@@ -64,9 +64,14 @@ def render_local_bridge_profile(
         "[mcp_servers.gemini_bridge_images]\n"
         f"command = {json.dumps(py_exec, ensure_ascii=False)}\n"
         f"args = [{json.dumps(mcp_script, ensure_ascii=False)}]\n"
-        "tool_timeout_sec = 950\n\n"
-        "# This dedicated local image tool is explicitly enabled for the Gemini profile.\n"
+        "tool_timeout_sec = 1250\n"
+        'default_tools_approval_mode = "approve"\n\n'
+        "# Local multimodal bridge tools are pre-approved without per-call confirmation.\n"
         "[mcp_servers.gemini_bridge_images.tools.generate_image]\n"
+        'approval_mode = "approve"\n\n'
+        "[mcp_servers.gemini_bridge_images.tools.generate_video]\n"
+        'approval_mode = "approve"\n\n'
+        "[mcp_servers.gemini_bridge_images.tools.analyze_media]\n"
         'approval_mode = "approve"\n'
     )
 
@@ -75,7 +80,8 @@ def update_catalog(text: str) -> str:
     document = json.loads(text)
     changed = False
     for model in document.get('models', []):
-        if model.get('slug') not in {'gemini-4-carbon', 'gemini-4-argon'}:
+        slug = str(model.get('slug') or '')
+        if not slug.startswith('gemini-'):
             continue
         model.update(context_window=CARBON_CONTEXT_WINDOW, max_context_window=CARBON_CONTEXT_WINDOW,
                      auto_compact_token_limit=CARBON_AUTO_COMPACT_TOKENS,
@@ -94,6 +100,8 @@ def update_catalog(text: str) -> str:
         if isinstance(mm, dict):
             for incompatible_key in ('persistent_instructions', 'token_budget', 'guardian_v2', 'confirmation_policies'):
                 mm.pop(incompatible_key, None)
+            if isinstance(mm.get('multi_agent'), dict):
+                mm['multi_agent'] = None
             if not isinstance(mm.get('instructions_template'), str) or not mm['instructions_template'].strip():
                 mm['instructions_template'] = GEMINI_DESKTOP_BASE_INSTRUCTIONS
         for container, key in [(model, 'base_instructions'), (model.get('model_messages') or {}, 'instructions_template')]:
@@ -130,7 +138,7 @@ def update_stream_timeouts(text: str) -> str:
 
 def update_profile(text: str) -> str:
     document = tomllib.loads(text)
-    if document.get('model') not in {'gemini-4-carbon', 'gemini-4-argon'}:
+    if not str(document.get('model') or '').startswith('gemini-'):
         return text
     # Restrict replacements to the root table, preserving providers, plugins, and unrelated preferences.
     split = re.search(r'^\[', text, re.M)

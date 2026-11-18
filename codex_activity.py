@@ -449,7 +449,11 @@ def resolve_slot_activity(
     http_busy = bool(ws.get("busy"))
     waiting_count = int(ws.get("waiting_count") or 0)
     pending_tool_until = float(ws.get("pending_tool_call_until") or 0.0)
-    pinned_sid = str(ws.get("pinned_session_id") or fallback_session_id or "").strip()
+    pinned_sid = (
+        str(ws.get("pinned_session_id") or fallback_session_id or "").strip()
+        if ws.get("codex_activity_owner", True)
+        else ""
+    )
 
     codex_info = lookup_codex_thread_activity(
         pinned_sid,

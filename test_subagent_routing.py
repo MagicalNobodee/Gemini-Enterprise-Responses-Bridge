@@ -255,9 +255,10 @@ def test_codex_subagents_with_shared_prompt_cache_key_isolated_and_auto_spawn_ta
         ).json()
         assert s1_turn2["status"] == "completed"
 
-        # Subagent 2 Turn 2 omits headers to also verify `_bridge_thread_id` inheritance from `previous_response_id`!
+        # A shared session header must not override the thread inherited from previous_response_id.
         s2_turn2 = client.post(
             "/v1/responses",
+            headers={"x-session-id": root_sid, "x-bridge-session": root_sid},
             json={
                 "model": "gemini-4-carbon",
                 "prompt_cache_key": root_sid,

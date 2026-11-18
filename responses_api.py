@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from platform_compat import best_effort_chmod, configure_sqlite_connection
 from schemas import ChatCompletionRequest, ChatMessage
-from streaming_utils import with_keepalive
+from streaming_utils import ClosingStreamingResponse, with_keepalive
 
 
 class ResponsesError(ValueError):
@@ -431,6 +431,7 @@ def prepare_request(
         parallel_tool_calls=payload.get("parallel_tool_calls", True), response_format=response_format,
         max_completion_tokens=payload.get("max_output_tokens"), temperature=payload.get("temperature"), top_p=payload.get("top_p"),
         session_id=resolve_responses_session_id(payload, headers=headers, previous=previous))
+    req._bridge_thread_id = extract_responses_thread_id(payload, headers=headers) or _clean_sid_token(previous.get("_bridge_thread_id"))
     return req, mapping, [m.model_dump(exclude_none=True) for m in messages]
 
 
@@ -594,13 +595,19 @@ async def translate_response(
         snapshot = {key: response[key] for key in ("id", "object", "created_at", "model")}
         return event("response.in_progress", response={**snapshot, "status": "in_progress", "output": []})
 
+    async def close_upstream():
+        if isinstance(upstream, ClosingStreamingResponse):
+            await upstream.close()
+        else:
+            await upstream.body_iterator.aclose()
+
     async def events() -> AsyncIterator[str]:
-        yield event("response.created", response=response)
-        yield event("response.in_progress", response=response)
         message = None
         calls: dict[int, dict] = {}
         finished = False
         try:
+            yield event("response.created", response=response)
+            yield event("response.in_progress", response=response)
             async for packet in chat_packets(upstream.body_iterator):
                 if not packet:
                     yield progress()
@@ -682,9 +689,10 @@ async def translate_response(
             response.update(status="failed", error={"code": "bridge_error", "message": str(exc)})
             yield event("response.failed", response=response)
         finally:
-            await upstream.body_iterator.aclose()
-    return StreamingResponse(
+            await close_upstream()
+    return ClosingStreamingResponse(
         with_keepalive(events(), frame=progress),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        on_close=close_upstream,
     )

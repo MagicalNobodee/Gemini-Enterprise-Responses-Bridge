@@ -204,3 +204,47 @@ def test_catalog_workflow_is_not_duplicated_by_bridge():
     messages = [ChatMessage(role='developer', content=CODING_WORKFLOW), ChatMessage(role='user', content='Read a file')]
     prepared = ConversationContextBuilder().build(messages, tools=[shell_tool()])
     assert prepared.prompt.count('[Coding workflow]') == 1
+
+
+def test_subagent_prompt_sync_covers_all_gemini_models_and_tool_reminders():
+    from tool_calling import build_tool_delta_reminder
+    source = {
+        'models': [
+            {'slug': 'gpt-6.1-sol', 'model_messages': {'multi_agent': {'role': {'root': 'keep'}}}},
+            {
+                'slug': 'gemini-3.8-flash',
+                'base_instructions': 'You are Codex, an agent based on GPT-6.',
+                'model_messages': {
+                    'instructions_template': 'You are Codex, an agent based on GPT-6.',
+                    'multi_agent': {'role': {'root': 'encrypted_v2_only'}},
+                },
+            },
+        ]
+    }
+    updated = json.loads(update_catalog(json.dumps(source)))
+    assert updated['models'][0]['model_messages']['multi_agent'] == {'role': {'root': 'keep'}}
+    flash = updated['models'][1]
+    assert flash['model_messages']['multi_agent'] is None
+    assert '# Multi-agent coordination' in flash['base_instructions']
+    assert 'parallel sub-agent calls' in flash['base_instructions']
+
+    spawn_tool = {
+        'type': 'function',
+        'function': {
+            'name': 'multi_agent_v1.spawn_agent',
+            'description': (
+                'Spawn a sub-agent.\n'
+                'Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask.\n'
+                'Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn.\n'
+                'Agent-role guidance below only helps choose which agent to use after spawning is already authorized; it never authorizes spawning by itself.'
+            ),
+            'parameters': {'type': 'object', 'properties': {'message': {'type': 'string'}}},
+        },
+    }
+    rendered = build_tool_system_instructions([spawn_tool])
+    assert 'Do not spawn sub-agents unless' not in rendered
+    assert 'Follow user and AGENTS.md delegation rules' in rendered
+    assert 'Coordinator note:' in rendered
+
+    delta = build_tool_delta_reminder([spawn_tool], has_tool_results=True, parallel_tool_calls=True)
+    assert 'independent sub-agent calls' in delta
